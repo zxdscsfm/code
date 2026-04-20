@@ -60,14 +60,72 @@ def pseudo_label_generator_acdc(data, seed, beta=50.00, mode='bf', img_class='od
     return pseudo_label
 
 
+def infer_unlabeled_value_from_label(label, img_class):
+    label = np.asarray(label)
+    if img_class == 'odoc':
+        return 3 if np.any(label == 3) else None
+    if img_class in ['faz', 'polyp']:
+        return 2 if np.any(label == 2) else None
+    return None
+
+
+def compute_annotation_geometry_bin(label, img_class, near_radius=8.0, mid_radius=24.0):
+    label = np.asarray(label)
+    unlabeled_value = infer_unlabeled_value_from_label(label, img_class)
+    if unlabeled_value is None:
+        labeled_mask = np.ones_like(label, dtype=bool)
+    else:
+        labeled_mask = label != unlabeled_value
+
+    fg_mask = label == 1
+    bg_mask = np.logical_and(labeled_mask, label == 0)
+
+    raw_fill = float(max(mid_radius, near_radius, 1.0))
+    if fg_mask.any():
+        d_fg = ndimage.distance_transform_edt(~fg_mask).astype(np.float32)
+    else:
+        d_fg = np.full(label.shape, raw_fill, dtype=np.float32)
+    if bg_mask.any():
+        d_bg = ndimage.distance_transform_edt(~bg_mask).astype(np.float32)
+    else:
+        d_bg = np.full(label.shape, raw_fill, dtype=np.float32)
+
+    min_d = np.minimum(d_fg, d_bg)
+    geometry_bin = np.full(label.shape, 3, dtype=np.uint8)
+    near_mask = np.logical_and(~labeled_mask, min_d <= float(near_radius))
+    mid_mask = np.logical_and(~labeled_mask, np.logical_and(min_d > float(near_radius), min_d <= float(mid_radius)))
+    geometry_bin[labeled_mask] = 0
+    geometry_bin[near_mask] = 1
+    geometry_bin[mid_mask] = 2
+    return geometry_bin
+
+
 class BaseDataSets(Dataset):
-    def __init__(self, base_dir=None, split='train', transform=None, client="client1", sup_type="label",img_class='prostate'):
+    def __init__(
+        self,
+        base_dir=None,
+        split='train',
+        transform=None,
+        client="client1",
+        sup_type="label",
+        img_class='prostate',
+        geometry_guided=False,
+        geometry_near_radius=8.0,
+        geometry_mid_radius=24.0,
+        max_train_samples_per_client=0,
+        max_val_samples_per_client=0,
+    ):
         self._base_dir = base_dir
         self.sample_list = []
         self.split = split
         self.img_class=img_class
         self.sup_type = sup_type
         self.transform = transform
+        self.geometry_guided = bool(geometry_guided)
+        self.geometry_near_radius = float(geometry_near_radius)
+        self.geometry_mid_radius = float(geometry_mid_radius)
+        self.max_train_samples_per_client = int(max_train_samples_per_client)
+        self.max_val_samples_per_client = int(max_val_samples_per_client)
         if self.img_class == 'odoc' or self.img_class == 'faz':
             train_ids, val_ids = self._get_client_ids(client)
         elif self.img_class =='polyp':
@@ -97,6 +155,25 @@ class BaseDataSets(Dataset):
                 label = h5f['mask'][:]
             self.data_list.append({'image': image, 'label': label})
 
+    def _limit_case_list(self, case_list, max_samples):
+        if max_samples is None or int(max_samples) <= 0:
+            return case_list
+        case_list = list(case_list)
+        if len(case_list) <= int(max_samples):
+            return case_list
+        return sorted(case_list)[:int(max_samples)]
+
+    def _limit_client_split_lists(self, train_lists, val_lists):
+        limited_train = [
+            self._limit_case_list(case_list, self.max_train_samples_per_client)
+            for case_list in train_lists
+        ]
+        limited_val = [
+            self._limit_case_list(case_list, self.max_val_samples_per_client)
+            for case_list in val_lists
+        ]
+        return limited_train, limited_val
+
     def _get_client_ids(self, client):
         client1_test_set = 'Domain1/test/'+pd.Series(os.listdir( self._base_dir+"/Domain1/test"))
         client1_training_set = 'Domain1/train/'+pd.Series(os.listdir( self._base_dir+"/Domain1/train"))
@@ -118,6 +195,36 @@ class BaseDataSets(Dataset):
         client4_training_set = client4_training_set.tolist()
         client5_test_set = client5_test_set.tolist()
         client5_training_set = client5_training_set.tolist()
+        train_lists, val_lists = self._limit_client_split_lists(
+            [
+                client1_training_set,
+                client2_training_set,
+                client3_training_set,
+                client4_training_set,
+                client5_training_set,
+            ],
+            [
+                client1_test_set,
+                client2_test_set,
+                client3_test_set,
+                client4_test_set,
+                client5_test_set,
+            ],
+        )
+        (
+            client1_training_set,
+            client2_training_set,
+            client3_training_set,
+            client4_training_set,
+            client5_training_set,
+        ) = train_lists
+        (
+            client1_test_set,
+            client2_test_set,
+            client3_test_set,
+            client4_test_set,
+            client5_test_set,
+        ) = val_lists
         
         if client == "client1":
             return [client1_training_set, client1_test_set]
@@ -154,6 +261,32 @@ class BaseDataSets(Dataset):
         client3_training_set = client3_training_set.tolist()
         client4_test_set = client4_test_set.tolist()
         client4_training_set = client4_training_set.tolist()
+        train_lists, val_lists = self._limit_client_split_lists(
+            [
+                client1_training_set,
+                client2_training_set,
+                client3_training_set,
+                client4_training_set,
+            ],
+            [
+                client1_test_set,
+                client2_test_set,
+                client3_test_set,
+                client4_test_set,
+            ],
+        )
+        (
+            client1_training_set,
+            client2_training_set,
+            client3_training_set,
+            client4_training_set,
+        ) = train_lists
+        (
+            client1_test_set,
+            client2_test_set,
+            client3_test_set,
+            client4_test_set,
+        ) = val_lists
         
         if client == "client1":
             return [client1_training_set, client1_test_set]
@@ -196,6 +329,40 @@ class BaseDataSets(Dataset):
         client5_training_set = client5_training_set.tolist()
         client6_test_set = client6_test_set.tolist()
         client6_training_set = client6_training_set.tolist()
+        train_lists, val_lists = self._limit_client_split_lists(
+            [
+                client1_training_set,
+                client2_training_set,
+                client3_training_set,
+                client4_training_set,
+                client5_training_set,
+                client6_training_set,
+            ],
+            [
+                client1_test_set,
+                client2_test_set,
+                client3_test_set,
+                client4_test_set,
+                client5_test_set,
+                client6_test_set,
+            ],
+        )
+        (
+            client1_training_set,
+            client2_training_set,
+            client3_training_set,
+            client4_training_set,
+            client5_training_set,
+            client6_training_set,
+        ) = train_lists
+        (
+            client1_test_set,
+            client2_test_set,
+            client3_test_set,
+            client4_test_set,
+            client5_test_set,
+            client6_test_set,
+        ) = val_lists
         
         if client == "client1":
             return [client1_training_set, client1_test_set]
@@ -221,10 +388,21 @@ class BaseDataSets(Dataset):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        sample = self.data_list[idx]
+        sample = dict(self.data_list[idx])
         if self.split == "train":
             if self.transform:
                 sample = self.transform(sample)
+        if self.geometry_guided and 'geometry_bin' not in sample:
+            label_np = sample['label']
+            if torch.is_tensor(label_np):
+                label_np = label_np.cpu().numpy()
+            geometry_bin = compute_annotation_geometry_bin(
+                label_np,
+                self.img_class,
+                near_radius=self.geometry_near_radius,
+                mid_radius=self.geometry_mid_radius,
+            )
+            sample['geometry_bin'] = torch.from_numpy(geometry_bin.astype(np.uint8))
         sample["idx"] = idx
         # print('idx=',sample)
         return sample
@@ -271,9 +449,19 @@ def random_rotate(image, label,img_class='odoc'):
 
 
 class RandomGenerator(object):
-    def __init__(self, output_size,img_class='odoc'):
+    def __init__(
+        self,
+        output_size,
+        img_class='odoc',
+        geometry_guided=False,
+        geometry_near_radius=8.0,
+        geometry_mid_radius=24.0,
+    ):
         self.output_size = output_size
         self.img_class=img_class
+        self.geometry_guided = bool(geometry_guided)
+        self.geometry_near_radius = float(geometry_near_radius)
+        self.geometry_mid_radius = float(geometry_mid_radius)
         
 
     def __call__(self, sample):
@@ -290,11 +478,21 @@ class RandomGenerator(object):
         #     image, 1, order=3)
         # label = zoom(
         #     label, 1, order=3)
+        geometry_bin = None
+        if self.geometry_guided:
+            geometry_bin = compute_annotation_geometry_bin(
+                label,
+                self.img_class,
+                near_radius=self.geometry_near_radius,
+                mid_radius=self.geometry_mid_radius,
+            )
         image = torch.from_numpy(
             image.astype(np.float32))
         # print(image.shape)
         label = torch.from_numpy(label.astype(np.uint8))
         sample = {'image': image, 'label': label}
+        if geometry_bin is not None:
+            sample['geometry_bin'] = torch.from_numpy(geometry_bin.astype(np.uint8))
         return sample
 
 
