@@ -148,6 +148,12 @@ def compute_adaptive_pseudo_reliability(local_prob, global_prob, gamma_prob, gam
     }
 
 
+def compute_masked_class_prior(prob_map, valid_mask):
+    valid_weight = valid_mask.unsqueeze(1).float()
+    denom = valid_weight.sum().clamp_min(1.0)
+    return (prob_map * valid_weight).sum(dim=(0, 2, 3)) / denom
+
+
 def resize_long_mask(mask_tensor, size_hw):
     return F.interpolate(mask_tensor.unsqueeze(1).float(), size=size_hw, mode='nearest').squeeze(1).long()
 
@@ -245,6 +251,161 @@ def select_top_margin_mask(raw_encoder_feature, pseudo_probs, weak_label_batch, 
     return selected_mask, pred_low, probs_low, margin_mean, int(candidate_idx.numel()), int(k)
 
 
+def build_local_seed_bank(raw_encoder_feature, weak_label_batch, corrected_prob, score_map, ignore_index, reliable_score_min):
+    n, c, h, w = raw_encoder_feature.shape
+    weak_low = resize_long_mask(weak_label_batch, (h, w))
+    corrected_low = F.interpolate(corrected_prob, size=(h, w), mode='bilinear', align_corners=False)
+    score_low = F.interpolate(score_map.unsqueeze(1), size=(h, w), mode='bilinear', align_corners=False).squeeze(1)
+    pred_low = torch.argmax(corrected_low, dim=1)
+    conf_low = torch.max(corrected_low, dim=1).values
+    unlabeled_low = weak_low == ignore_index
+
+    feature_flat = F.normalize(raw_encoder_feature.permute(0, 2, 3, 1).reshape(-1, c), dim=1)
+    weak_flat = weak_low.reshape(-1)
+    pred_flat = pred_low.reshape(-1)
+    conf_flat = conf_low.reshape(-1)
+    score_flat = score_low.reshape(-1)
+    unlabeled_flat = unlabeled_low.reshape(-1)
+
+    prototype_list = []
+    seed_prob_low = corrected_low.new_zeros((n, corrected_low.shape[1] - 1, h, w))
+    reliable_seed_mask = {}
+    fg_seed_valid = torch.zeros(corrected_low.shape[1] - 1, device=corrected_low.device, dtype=torch.bool)
+
+    for class_idx in range(corrected_low.shape[1]):
+        class_mask = weak_flat == class_idx
+        if class_idx > 0:
+            reliable_mask = (
+                unlabeled_flat
+                & (pred_flat == class_idx)
+                & (conf_flat >= 0.75)
+                & (score_flat >= reliable_score_min)
+            )
+            class_mask = class_mask | reliable_mask
+            reliable_seed_mask[class_idx] = reliable_mask.view(n, h, w)
+        if class_mask.sum().item() <= 0 and class_idx > 0:
+            fallback_mask = (
+                unlabeled_flat
+                & (pred_flat == class_idx)
+                & (conf_flat >= 0.90)
+            )
+            class_mask = class_mask | fallback_mask
+            reliable_seed_mask[class_idx] = fallback_mask.view(n, h, w)
+        if class_mask.sum().item() <= 0:
+            prototype_list.append(None)
+            continue
+        class_proto = feature_flat[class_mask].mean(dim=0)
+        prototype_list.append(F.normalize(class_proto, dim=0))
+
+    if prototype_list[0] is None:
+        prototype_list[0] = F.normalize(feature_flat.mean(dim=0), dim=0)
+    for class_idx in range(1, corrected_low.shape[1]):
+        if prototype_list[class_idx] is None:
+            prototype_list[class_idx] = prototype_list[0].clone()
+        reliable_mask = reliable_seed_mask.get(class_idx, torch.zeros((n, h, w), device=corrected_low.device, dtype=torch.bool))
+        weak_seed_mask = weak_low == class_idx
+        seed_mask = weak_seed_mask | reliable_mask
+        fg_seed_valid[class_idx - 1] = bool(seed_mask.any().item())
+        seed_prob_low[:, class_idx - 1] = corrected_low[:, class_idx] * seed_mask.float()
+
+    proto_bank = torch.stack(prototype_list, dim=0).to(device=raw_encoder_feature.device, dtype=raw_encoder_feature.dtype)
+    return proto_bank, seed_prob_low, fg_seed_valid
+
+
+def propagate_local_seed_prob(raw_encoder_feature, seed_prob_low, kernel_size, affinity_temp):
+    if kernel_size <= 1:
+        return seed_prob_low
+    pad = kernel_size // 2
+    normalized_feature = F.normalize(raw_encoder_feature, dim=1)
+    b, c, h, w = normalized_feature.shape
+    feature_patch = F.unfold(normalized_feature, kernel_size=kernel_size, padding=pad).view(
+        b, c, kernel_size * kernel_size, h, w
+    )
+    center_feature = normalized_feature.unsqueeze(2)
+    affinity = (center_feature * feature_patch).sum(dim=1)
+    affinity = torch.relu(affinity)
+    affinity = torch.softmax(affinity * affinity_temp, dim=1)
+
+    seed_patch = F.unfold(seed_prob_low, kernel_size=kernel_size, padding=pad).view(
+        b, seed_prob_low.shape[1], kernel_size * kernel_size, h, w
+    )
+    propagated = (affinity.unsqueeze(1) * seed_patch).sum(dim=2)
+    norm = propagated.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return propagated / norm
+
+
+def build_seed_support_guided_prob(
+    raw_encoder_feature,
+    weak_label_batch,
+    corrected_prob,
+    score_map,
+    ignore_index,
+    reliable_score_min,
+    kernel_size,
+    affinity_temp,
+    blend_alpha,
+):
+    n, _, h, w = raw_encoder_feature.shape
+    proto_bank, seed_prob_low, fg_seed_valid = build_local_seed_bank(
+        raw_encoder_feature,
+        weak_label_batch,
+        corrected_prob,
+        score_map,
+        ignore_index,
+        reliable_score_min,
+    )
+    if not bool(fg_seed_valid.any().item()):
+        zero_support = corrected_prob.new_zeros(corrected_prob.shape[0], corrected_prob.shape[2], corrected_prob.shape[3])
+        return corrected_prob, zero_support, zero_support
+
+    feature_flat = F.normalize(raw_encoder_feature.permute(0, 2, 3, 1).reshape(-1, raw_encoder_feature.shape[1]), dim=1)
+    proto_bank = F.normalize(proto_bank, dim=1)
+    proto_sims = torch.matmul(feature_flat, proto_bank.t()).reshape(n, h, w, -1).permute(0, 3, 1, 2)
+    proto_fg_logits = proto_sims[:, 1:] - proto_sims[:, 0:1]
+    fg_valid_mask = fg_seed_valid.view(1, -1, 1, 1)
+    proto_fg_logits = proto_fg_logits.masked_fill(~fg_valid_mask, -1e4)
+    proto_fg_prob = torch.softmax(proto_fg_logits, dim=1) * fg_valid_mask.float()
+    proto_fg_prob = proto_fg_prob / proto_fg_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    proto_support_margin = torch.max(proto_fg_logits, dim=1).values
+    proto_support_strength = torch.sigmoid(4.0 * proto_support_margin)
+
+    propagated_fg_prob = propagate_local_seed_prob(
+        raw_encoder_feature,
+        seed_prob_low,
+        kernel_size=kernel_size,
+        affinity_temp=affinity_temp,
+    )
+    propagated_fg_strength = torch.max(propagated_fg_prob, dim=1).values
+    support_strength_low = torch.maximum(proto_support_strength, propagated_fg_strength)
+
+    fused_fg_low = 0.5 * proto_fg_prob + 0.5 * propagated_fg_prob
+    base_fg_low = F.interpolate(corrected_prob[:, 1:], size=(h, w), mode='bilinear', align_corners=False)
+    support_fg_low = fused_fg_low * support_strength_low.unsqueeze(1)
+    blended_fg_low = blend_alpha * base_fg_low + (1.0 - blend_alpha) * support_fg_low
+    blended_fg = F.interpolate(blended_fg_low, size=corrected_prob.shape[-2:], mode='bilinear', align_corners=False)
+    support_strength = F.interpolate(
+        support_strength_low.unsqueeze(1),
+        size=corrected_prob.shape[-2:],
+        mode='bilinear',
+        align_corners=False,
+    ).squeeze(1)
+    propagated_fg_strength = F.interpolate(
+        propagated_fg_strength.unsqueeze(1),
+        size=corrected_prob.shape[-2:],
+        mode='bilinear',
+        align_corners=False,
+    ).squeeze(1)
+
+    final_prob = corrected_prob.clone()
+    final_prob[:, 1:] = blended_fg.clamp_min(0.0)
+    fg_sum = final_prob[:, 1:].sum(dim=1, keepdim=True).clamp(max=1.0 - 1e-6)
+    bg_prob = (1.0 - fg_sum).clamp_min(1e-6)
+    final_prob = torch.cat([bg_prob, final_prob[:, 1:]], dim=1)
+    final_prob = final_prob / final_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    return final_prob, support_strength, propagated_fg_strength
+
+
 def compute_linear_cka(feature_a, feature_b, eps=1e-8):
     if feature_a.dim() > 2:
         feature_a = feature_a.reshape(feature_a.shape[0], -1)
@@ -320,8 +481,23 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_mean_prob_gap = 0.0
         self.adaptive_pl_last_mean_conf_gap = 0.0
         self.adaptive_pl_last_both_uncertain_ratio = 0.0
+        self.adaptive_pl_both_uncertain_ema = 0.0
         self.adaptive_pl_last_boundary_loss_oc = 0.0
         self.adaptive_pl_last_ring_valid_oc_ratio = 0.0
+        self.adaptive_pl_last_seed_support_mean = 0.0
+        self.adaptive_pl_last_seed_support_soft_ratio = 0.0
+        self.adaptive_pl_last_propagated_fg_mean = 0.0
+        self.adaptive_pl_prior_gap_ema = 0.0
+        self.adaptive_pl_last_prior_gap = 0.0
+        self.adaptive_pl_last_client_risk = 0.0
+        self.adaptive_pl_last_loss_risk = 0.0
+        self.adaptive_pl_release_score_ema = 0.0
+        self.adaptive_pl_correction_score_ema = 0.0
+        self.adaptive_pl_last_stage_progress = 0.0
+        self.adaptive_pl_last_release_score = 0.0
+        self.adaptive_pl_last_correction_score = 0.0
+        self.adaptive_pl_last_effective_correction = 0.0
+        self.adaptive_pl_last_regime_code = 1.0
 
     def _get_adaptive_pl_state_path(self, tag='latest'):
         return os.path.join(
@@ -375,11 +551,59 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_both_uncertain_ratio = float(
             state.get('adaptive_pl_last_both_uncertain_ratio', self.adaptive_pl_last_both_uncertain_ratio)
         )
+        self.adaptive_pl_both_uncertain_ema = float(
+            state.get('adaptive_pl_both_uncertain_ema', self.adaptive_pl_both_uncertain_ema)
+        )
         self.adaptive_pl_last_boundary_loss_oc = float(
             state.get('adaptive_pl_last_boundary_loss_oc', self.adaptive_pl_last_boundary_loss_oc)
         )
         self.adaptive_pl_last_ring_valid_oc_ratio = float(
             state.get('adaptive_pl_last_ring_valid_oc_ratio', self.adaptive_pl_last_ring_valid_oc_ratio)
+        )
+        self.adaptive_pl_last_seed_support_mean = float(
+            state.get('adaptive_pl_last_seed_support_mean', self.adaptive_pl_last_seed_support_mean)
+        )
+        self.adaptive_pl_last_seed_support_soft_ratio = float(
+            state.get(
+                'adaptive_pl_last_seed_support_soft_ratio',
+                state.get('adaptive_pl_last_seed_support_fg_ratio', self.adaptive_pl_last_seed_support_soft_ratio)
+            )
+        )
+        self.adaptive_pl_last_propagated_fg_mean = float(
+            state.get('adaptive_pl_last_propagated_fg_mean', self.adaptive_pl_last_propagated_fg_mean)
+        )
+        self.adaptive_pl_prior_gap_ema = float(
+            state.get('adaptive_pl_prior_gap_ema', self.adaptive_pl_prior_gap_ema)
+        )
+        self.adaptive_pl_last_prior_gap = float(
+            state.get('adaptive_pl_last_prior_gap', self.adaptive_pl_last_prior_gap)
+        )
+        self.adaptive_pl_last_client_risk = float(
+            state.get('adaptive_pl_last_client_risk', self.adaptive_pl_last_client_risk)
+        )
+        self.adaptive_pl_last_loss_risk = float(
+            state.get('adaptive_pl_last_loss_risk', self.adaptive_pl_last_loss_risk)
+        )
+        self.adaptive_pl_release_score_ema = float(
+            state.get('adaptive_pl_release_score_ema', self.adaptive_pl_release_score_ema)
+        )
+        self.adaptive_pl_correction_score_ema = float(
+            state.get('adaptive_pl_correction_score_ema', self.adaptive_pl_correction_score_ema)
+        )
+        self.adaptive_pl_last_stage_progress = float(
+            state.get('adaptive_pl_last_stage_progress', self.adaptive_pl_last_stage_progress)
+        )
+        self.adaptive_pl_last_release_score = float(
+            state.get('adaptive_pl_last_release_score', self.adaptive_pl_last_release_score)
+        )
+        self.adaptive_pl_last_correction_score = float(
+            state.get('adaptive_pl_last_correction_score', self.adaptive_pl_last_correction_score)
+        )
+        self.adaptive_pl_last_effective_correction = float(
+            state.get('adaptive_pl_last_effective_correction', self.adaptive_pl_last_effective_correction)
+        )
+        self.adaptive_pl_last_regime_code = float(
+            state.get('adaptive_pl_last_regime_code', self.adaptive_pl_last_regime_code)
         )
 
     def _save_adaptive_pl_state(self, tag='latest'):
@@ -401,8 +625,23 @@ class MyClient(BaseClient):
             'adaptive_pl_last_mean_prob_gap': float(self.adaptive_pl_last_mean_prob_gap),
             'adaptive_pl_last_mean_conf_gap': float(self.adaptive_pl_last_mean_conf_gap),
             'adaptive_pl_last_both_uncertain_ratio': float(self.adaptive_pl_last_both_uncertain_ratio),
+            'adaptive_pl_both_uncertain_ema': float(self.adaptive_pl_both_uncertain_ema),
             'adaptive_pl_last_boundary_loss_oc': float(self.adaptive_pl_last_boundary_loss_oc),
             'adaptive_pl_last_ring_valid_oc_ratio': float(self.adaptive_pl_last_ring_valid_oc_ratio),
+            'adaptive_pl_last_seed_support_mean': float(self.adaptive_pl_last_seed_support_mean),
+            'adaptive_pl_last_seed_support_soft_ratio': float(self.adaptive_pl_last_seed_support_soft_ratio),
+            'adaptive_pl_last_propagated_fg_mean': float(self.adaptive_pl_last_propagated_fg_mean),
+            'adaptive_pl_prior_gap_ema': float(self.adaptive_pl_prior_gap_ema),
+            'adaptive_pl_last_prior_gap': float(self.adaptive_pl_last_prior_gap),
+            'adaptive_pl_last_client_risk': float(self.adaptive_pl_last_client_risk),
+            'adaptive_pl_last_loss_risk': float(self.adaptive_pl_last_loss_risk),
+            'adaptive_pl_release_score_ema': float(self.adaptive_pl_release_score_ema),
+            'adaptive_pl_correction_score_ema': float(self.adaptive_pl_correction_score_ema),
+            'adaptive_pl_last_stage_progress': float(self.adaptive_pl_last_stage_progress),
+            'adaptive_pl_last_release_score': float(self.adaptive_pl_last_release_score),
+            'adaptive_pl_last_correction_score': float(self.adaptive_pl_last_correction_score),
+            'adaptive_pl_last_effective_correction': float(self.adaptive_pl_last_effective_correction),
+            'adaptive_pl_last_regime_code': float(self.adaptive_pl_last_regime_code),
         }
         torch.save(state, self._get_adaptive_pl_state_path(tag=tag))
 
@@ -420,11 +659,24 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/mean_conf_gap'.format(self.cid), float(self.adaptive_pl_last_mean_conf_gap), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/mean_conf_gap_ema'.format(self.cid), float(self.adaptive_pl_conf_gap_ema), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/both_uncertain_ratio'.format(self.cid), float(self.adaptive_pl_last_both_uncertain_ratio), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/both_uncertain_ema'.format(self.cid), float(self.adaptive_pl_both_uncertain_ema), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/hard_ratio'.format(self.cid), float(self.adaptive_pl_last_hard_ratio), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/loss_hard'.format(self.cid), float(self.adaptive_pl_last_loss_hard), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/loss_soft'.format(self.cid), float(self.adaptive_pl_last_loss_soft), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/boundary_loss_oc'.format(self.cid), float(self.adaptive_pl_last_boundary_loss_oc), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/ring_valid_oc_ratio'.format(self.cid), float(self.adaptive_pl_last_ring_valid_oc_ratio), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/seed_support_mean'.format(self.cid), float(self.adaptive_pl_last_seed_support_mean), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/seed_support_soft_ratio'.format(self.cid), float(self.adaptive_pl_last_seed_support_soft_ratio), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/propagated_fg_mean'.format(self.cid), float(self.adaptive_pl_last_propagated_fg_mean), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/prior_gap'.format(self.cid), float(self.adaptive_pl_last_prior_gap), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/prior_gap_ema'.format(self.cid), float(self.adaptive_pl_prior_gap_ema), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/client_risk'.format(self.cid), float(self.adaptive_pl_last_client_risk), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/loss_risk'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/stage_progress'.format(self.cid), float(self.adaptive_pl_last_stage_progress), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/release_score'.format(self.cid), float(self.adaptive_pl_last_release_score), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/effective_correction'.format(self.cid), float(self.adaptive_pl_last_effective_correction), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/regime_code'.format(self.cid), float(self.adaptive_pl_last_regime_code), self.current_iter)
         for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
             writer.add_scalar('client_{}/adaptive_pl/tau_bin_{}'.format(self.cid, bin_idx), float(tau_val), self.current_iter)
             observed_accept = self.adaptive_pl_last_observed_accept[bin_idx]
@@ -470,7 +722,8 @@ class MyClient(BaseClient):
                     )
 
     def _compute_adaptive_pl_loss(self, outputs, outputs_auxiliary, outputs_soft, outputs_soft_auxiliary,
-                                  pseudo_label_mix, global_pseudo_label_mix, geometry_bin_batch, label_batch):
+                                  pseudo_label_mix, global_pseudo_label_mix, geometry_bin_batch, label_batch,
+                                  raw_encoder_feature=None):
         if global_pseudo_label_mix is None:
             global_pseudo_label_mix = pseudo_label_mix.detach()
         reliability = compute_adaptive_pseudo_reliability(
@@ -506,6 +759,32 @@ class MyClient(BaseClient):
         boundary_lambda = float(getattr(self.args, 'adaptive_pl_boundary_lambda', 0.0))
         boundary_kernel_size = int(getattr(self.args, 'adaptive_pl_boundary_kernel_size', 3))
         boundary_warmup_iters = int(getattr(self.args, 'adaptive_pl_boundary_warmup_iters', warmup_iters))
+        seed_support_enabled = bool(getattr(self.args, 'seed_support_enabled', 0))
+        seed_support_warmup_iters = int(getattr(self.args, 'seed_support_warmup_iters', warmup_iters))
+        seed_support_reliable_score_min = float(getattr(self.args, 'seed_support_reliable_score_min', 0.7))
+        seed_support_kernel_size = int(getattr(self.args, 'seed_support_kernel_size', 5))
+        seed_support_affinity_temp = float(getattr(self.args, 'seed_support_affinity_temp', 8.0))
+        seed_support_blend_alpha = float(getattr(self.args, 'seed_support_blend_alpha', 0.5))
+        seed_support_soft_tau = float(getattr(self.args, 'seed_support_soft_tau', 0.20))
+        risk_calibration_enabled = bool(getattr(self.args, 'risk_calibration_enabled', 0))
+        risk_tau_lambda = float(getattr(self.args, 'risk_calibration_tau_lambda', 0.12))
+        risk_conf_lambda = float(getattr(self.args, 'risk_calibration_conf_lambda', 0.08))
+        risk_prior_power = float(getattr(self.args, 'risk_calibration_prior_power', 1.0))
+        risk_prior_clip_min = float(getattr(self.args, 'risk_calibration_prior_clip_min', 0.5))
+        risk_prior_clip_max = float(getattr(self.args, 'risk_calibration_prior_clip_max', 1.5))
+        risk_hard_dampen = float(getattr(self.args, 'risk_calibration_hard_dampen', 0.5))
+        risk_soft_boost = float(getattr(self.args, 'risk_calibration_soft_boost', 0.5))
+        risk_global_soft_lambda = float(getattr(self.args, 'risk_calibration_global_soft_lambda', 0.15))
+        stateful_release_enabled = bool(getattr(self.args, 'risk_calibration_stateful_release_enabled', 0))
+        release_start_iter = int(getattr(self.args, 'risk_calibration_release_start_iter', warmup_iters))
+        release_full_iter = int(getattr(self.args, 'risk_calibration_release_full_iter', max(warmup_iters + 1, warmup_iters + 1000)))
+        regime_ema_momentum = float(getattr(self.args, 'risk_calibration_regime_ema_momentum', 0.9))
+        release_risk_threshold = float(getattr(self.args, 'risk_calibration_release_risk_threshold', 0.35))
+        release_agreement_threshold = float(getattr(self.args, 'risk_calibration_release_agreement_threshold', 0.90))
+        release_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_release_prior_gap_threshold', 0.015))
+        correction_risk_threshold = float(getattr(self.args, 'risk_calibration_correction_risk_threshold', 0.55))
+        correction_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_correction_prior_gap_threshold', 0.03))
+        regime_hysteresis = float(getattr(self.args, 'risk_calibration_regime_hysteresis', 0.05))
         outer_beta = float(getattr(self.args, 'beta', 1.0))
 
         valid_mask = unlabeled_mask.bool()
@@ -519,10 +798,117 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_lg_class_agree_ratio = lg_agree_mean
             self.adaptive_pl_last_mean_prob_gap = prob_gap_mean
             self.adaptive_pl_last_mean_conf_gap = conf_gap_mean
+            local_prior = compute_masked_class_prior(local_prob, valid_mask)
+            global_prior = compute_masked_class_prior(global_prob, valid_mask)
+            prior_gap = float(torch.mean(torch.abs(local_prior[1:] - global_prior[1:])).item())
+            self.adaptive_pl_prior_gap_ema = (ema_momentum * self.adaptive_pl_prior_gap_ema) + ((1.0 - ema_momentum) * prior_gap)
+            self.adaptive_pl_last_prior_gap = prior_gap
         else:
             self.adaptive_pl_last_lg_class_agree_ratio = 0.0
             self.adaptive_pl_last_mean_prob_gap = 0.0
             self.adaptive_pl_last_mean_conf_gap = 0.0
+            local_prior = None
+            global_prior = None
+            self.adaptive_pl_last_prior_gap = 0.0
+
+        if risk_calibration_enabled and valid_mask.any():
+            risk_score = (
+                0.5 * min(self.adaptive_pl_prior_gap_ema / 0.05, 1.0)
+                + 0.25 * min(prob_gap_mean / 0.02, 1.0)
+                + 0.25 * min(conf_gap_mean / 0.02, 1.0)
+            )
+            risk_score = float(np.clip(risk_score, 0.0, 1.0))
+        else:
+            risk_score = 0.0
+        self.adaptive_pl_last_client_risk = risk_score
+
+        stage_progress = 0.0
+        release_score = 0.0
+        correction_score = 0.0
+        effective_correction = 0.0
+        regime_code = 1.0
+        if risk_calibration_enabled:
+            effective_correction = 1.0
+            regime_code = 0.0
+        if risk_calibration_enabled and stateful_release_enabled:
+            release_start_iter = max(warmup_iters, release_start_iter)
+            release_full_iter = max(release_start_iter + 1, release_full_iter)
+            release_risk_term = float(np.clip(
+                (release_risk_threshold - risk_score) / max(release_risk_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            release_agreement_term = float(np.clip(
+                (self.adaptive_pl_lg_agreement_ema - release_agreement_threshold) / max(1e-6, 1.0 - release_agreement_threshold),
+                0.0,
+                1.0,
+            ))
+            release_prior_term = float(np.clip(
+                (release_prior_gap_threshold - self.adaptive_pl_prior_gap_ema) / max(release_prior_gap_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            release_raw = min(release_risk_term, release_agreement_term, release_prior_term)
+            correction_risk_term = float(np.clip(
+                (risk_score - correction_risk_threshold) / max(1e-6, 1.0 - correction_risk_threshold),
+                0.0,
+                1.0,
+            ))
+            correction_prior_term = float(np.clip(
+                (self.adaptive_pl_prior_gap_ema - correction_prior_gap_threshold) / max(correction_prior_gap_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            correction_raw = max(correction_risk_term, correction_prior_term)
+            self.adaptive_pl_release_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_release_score_ema
+            ) + ((1.0 - regime_ema_momentum) * release_raw)
+            self.adaptive_pl_correction_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_correction_score_ema
+            ) + ((1.0 - regime_ema_momentum) * correction_raw)
+
+            if self.current_iter >= release_start_iter:
+                # W4: use early unified correction only before T1; after T1, move to state-based routing.
+                stage_progress = float(np.clip(
+                    (self.current_iter - release_start_iter) / float(release_full_iter - release_start_iter),
+                    0.0,
+                    1.0,
+                ))
+                release_drive = stage_progress * self.adaptive_pl_release_score_ema * (1.0 - self.adaptive_pl_correction_score_ema)
+                correction_drive = stage_progress * self.adaptive_pl_correction_score_ema * (1.0 - self.adaptive_pl_release_score_ema)
+                shared_anneal = 1.0 - stage_progress
+                release_score = float(np.clip(release_drive, 0.0, 1.0))
+                correction_score = float(np.clip(correction_drive, 0.0, 1.0))
+                effective_correction = float(np.clip(shared_anneal + correction_score, 0.0, 1.0))
+                # regime_code: 0 correction, 1 recovery, 2 release
+                if release_score > correction_score + regime_hysteresis:
+                    regime_code = 2.0
+                elif correction_score > release_score + regime_hysteresis:
+                    regime_code = 0.0
+                else:
+                    regime_code = 1.0
+            else:
+                release_score = 0.0
+                correction_score = 1.0
+                effective_correction = 1.0
+                regime_code = 0.0
+        elif risk_calibration_enabled:
+            self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
+            self.adaptive_pl_correction_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_correction_score_ema
+            ) + ((1.0 - regime_ema_momentum) * risk_score)
+            release_score = 0.0
+            correction_score = 1.0
+            effective_correction = 1.0
+            regime_code = 0.0
+        else:
+            self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
+            self.adaptive_pl_correction_score_ema = regime_ema_momentum * self.adaptive_pl_correction_score_ema
+        self.adaptive_pl_last_stage_progress = stage_progress
+        self.adaptive_pl_last_release_score = release_score
+        self.adaptive_pl_last_correction_score = correction_score
+        self.adaptive_pl_last_effective_correction = effective_correction
+        self.adaptive_pl_last_regime_code = regime_code
 
         self.adaptive_pl_last_observed_accept[:] = np.nan
         self.adaptive_pl_last_score_mean[:] = np.nan
@@ -543,33 +929,90 @@ class MyClient(BaseClient):
                 updated_tau = self.adaptive_pl_tau[bin_idx] + 0.01 * (observed_accept - target_accept)
                 self.adaptive_pl_tau[bin_idx] = float(np.clip(updated_tau, 0.3, 0.9))
 
+        lambda_dynamic = torch.exp(-blend_kappa * conf_gap).clamp(1e-6, 1.0)
+        corrected_prob = lambda_dynamic.unsqueeze(1) * local_prob + (1.0 - lambda_dynamic).unsqueeze(1) * global_prob
+        if risk_calibration_enabled and valid_mask.any():
+            prior_scale = ((global_prior + 1e-6) / (local_prior + 1e-6)).clamp(
+                min=risk_prior_clip_min,
+                max=risk_prior_clip_max,
+            )
+            prior_scale = torch.pow(prior_scale, risk_prior_power * risk_score * effective_correction)
+            corrected_prob = corrected_prob * prior_scale.view(1, -1, 1, 1)
+            corrected_prob = corrected_prob / corrected_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        corrected_prob_soft = corrected_prob
+        seed_support_map = score.new_zeros(score.shape)
+        propagated_fg_map = score.new_zeros(score.shape)
+        soft_assist_mask = torch.zeros_like(score, dtype=torch.bool)
+        seed_support_active = (
+            seed_support_enabled
+            and raw_encoder_feature is not None
+            and self.current_iter >= seed_support_warmup_iters
+        )
+        if seed_support_active:
+            seed_guided_prob, seed_support_map, propagated_fg_map = build_seed_support_guided_prob(
+                raw_encoder_feature=raw_encoder_feature,
+                weak_label_batch=label_batch,
+                corrected_prob=corrected_prob,
+                score_map=score,
+                ignore_index=self.args.num_classes,
+                reliable_score_min=seed_support_reliable_score_min,
+                kernel_size=seed_support_kernel_size,
+                affinity_temp=seed_support_affinity_temp,
+                blend_alpha=seed_support_blend_alpha,
+            )
+            if not bool((seed_support_map > 0).any().item()):
+                seed_support_active = False
+
+        tau_map_effective = tau_map
+        conf_global_cutoff = tau_global_min
+        hard_client_scale = 1.0
+        soft_client_scale = 1.0
+        if risk_calibration_enabled and adaptive_active:
+            tau_map_effective = (tau_map + (risk_tau_lambda * risk_score * effective_correction)).clamp(0.3, 0.95)
+            conf_global_cutoff = min(0.95, tau_global_min + (risk_conf_lambda * risk_score * effective_correction))
+            hard_client_scale = max(0.0, 1.0 - (risk_hard_dampen * risk_score * effective_correction))
+            soft_client_scale = 1.0 + (risk_soft_boost * risk_score * effective_correction)
+
         if adaptive_active:
-            both_uncertain = valid_mask & (score < tau_map) & (conf_global < tau_global_min)
-            hard_mask = valid_mask & (~both_uncertain) & (score >= tau_map)
-            soft_mask = valid_mask & (~both_uncertain) & (score < tau_map)
+            both_uncertain = valid_mask & (score < tau_map_effective) & (conf_global < conf_global_cutoff)
+            hard_mask = valid_mask & (~both_uncertain) & (score >= tau_map_effective)
+            soft_mask = valid_mask & (~both_uncertain) & (score < tau_map_effective)
         else:
             both_uncertain = torch.zeros_like(score, dtype=torch.bool)
             hard_mask = valid_mask
             soft_mask = torch.zeros_like(score, dtype=torch.bool)
-        lambda_dynamic = torch.exp(-blend_kappa * conf_gap).clamp(1e-6, 1.0)
-        corrected_prob = lambda_dynamic.unsqueeze(1) * local_prob + (1.0 - lambda_dynamic).unsqueeze(1) * global_prob
+
+        if seed_support_active:
+            # Keep W1' gating intact; seed support is only allowed to refine soft targets.
+            soft_assist_mask = soft_mask & (seed_support_map >= seed_support_soft_tau)
+            if bool(soft_assist_mask.any().item()):
+                corrected_prob_soft = torch.where(soft_assist_mask.unsqueeze(1), seed_guided_prob, corrected_prob_soft)
+            else:
+                seed_support_active = False
+
         hard_target = torch.argmax(corrected_prob, dim=1)
 
         hard_weight = geometry_weight_map * hard_mask.float() * valid_mask.float()
         soft_weight = geometry_weight_map * soft_mask.float() * valid_mask.float()
+        risk_weight = geometry_weight_map * both_uncertain.float() * valid_mask.float()
         loss_hard_1 = weighted_pseudo_dice_loss(outputs_soft, hard_target, hard_weight)
         loss_hard_2 = weighted_pseudo_dice_loss(outputs_soft_auxiliary, hard_target, hard_weight)
-        loss_soft_1 = weighted_reverse_kl_loss(outputs, corrected_prob, soft_weight)
-        loss_soft_2 = weighted_reverse_kl_loss(outputs_auxiliary, corrected_prob, soft_weight)
-        loss_hard = 0.5 * (loss_hard_1 + loss_hard_2)
-        loss_soft = 0.5 * (loss_soft_1 + loss_soft_2)
+        loss_soft_1 = weighted_reverse_kl_loss(outputs, corrected_prob_soft, soft_weight)
+        loss_soft_2 = weighted_reverse_kl_loss(outputs_auxiliary, corrected_prob_soft, soft_weight)
+        loss_risk_1 = weighted_reverse_kl_loss(outputs, global_prob, risk_weight)
+        loss_risk_2 = weighted_reverse_kl_loss(outputs_auxiliary, global_prob, risk_weight)
+        loss_hard = hard_client_scale * 0.5 * (loss_hard_1 + loss_hard_2)
+        loss_soft = soft_client_scale * 0.5 * (loss_soft_1 + loss_soft_2)
+        loss_risk = risk_score * 0.5 * (loss_risk_1 + loss_risk_2)
         total_loss = loss_hard + float(getattr(self.args, 'adaptive_pl_soft_lambda', 0.2)) * loss_soft
+        if risk_calibration_enabled and adaptive_active:
+            total_loss = total_loss + (risk_global_soft_lambda * effective_correction * loss_risk)
         valid_count = float(valid_mask.float().sum().item())
 
         loss_boundary_oc = outputs.new_tensor(0.0)
         if self.current_iter >= boundary_warmup_iters and boundary_lambda > 0.0:
             with torch.no_grad():
-                pl_target = torch.argmax(corrected_prob.detach(), dim=1)
+                pl_target = torch.argmax(corrected_prob_soft.detach(), dim=1)
                 target_mask_oc = pl_target == 1
                 ring_oc = morphology_boundary(target_mask_oc, kernel_size=boundary_kernel_size)
                 ring_valid_oc = ring_oc & (geometry_bin_batch <= 2) & valid_mask
@@ -598,22 +1041,41 @@ class MyClient(BaseClient):
         if valid_count > 0:
             self.adaptive_pl_last_hard_ratio = float(hard_mask.float().sum().item() / valid_count)
             self.adaptive_pl_last_both_uncertain_ratio = float(both_uncertain.float().sum().item() / valid_count)
+            self.adaptive_pl_both_uncertain_ema = (
+                regime_ema_momentum * self.adaptive_pl_both_uncertain_ema
+            ) + ((1.0 - regime_ema_momentum) * self.adaptive_pl_last_both_uncertain_ratio)
+            if seed_support_active:
+                self.adaptive_pl_last_seed_support_mean = float(seed_support_map[valid_mask].mean().item())
+                self.adaptive_pl_last_seed_support_soft_ratio = float(soft_assist_mask.float().sum().item() / valid_count)
+                self.adaptive_pl_last_propagated_fg_mean = float(propagated_fg_map[valid_mask].mean().item())
+            else:
+                self.adaptive_pl_last_seed_support_mean = 0.0
+                self.adaptive_pl_last_seed_support_soft_ratio = 0.0
+                self.adaptive_pl_last_propagated_fg_mean = 0.0
         else:
             self.adaptive_pl_last_hard_ratio = 0.0
             self.adaptive_pl_last_both_uncertain_ratio = 0.0
+            self.adaptive_pl_both_uncertain_ema = regime_ema_momentum * self.adaptive_pl_both_uncertain_ema
+            self.adaptive_pl_last_seed_support_mean = 0.0
+            self.adaptive_pl_last_seed_support_soft_ratio = 0.0
+            self.adaptive_pl_last_propagated_fg_mean = 0.0
         self.adaptive_pl_last_loss_hard = float(loss_hard.detach().item())
         self.adaptive_pl_last_loss_soft = float(loss_soft.detach().item())
+        self.adaptive_pl_last_loss_risk = float(loss_risk.detach().item())
         self.adaptive_pl_last_boundary_loss_oc = float(loss_boundary_oc.detach().item())
 
         return {
             'loss_total': total_loss,
             'loss_hard': loss_hard,
             'loss_soft': loss_soft,
+            'loss_risk': loss_risk,
             'loss_boundary_oc': loss_boundary_oc,
             'hard_target': hard_target,
-            'mixed_prob': corrected_prob,
+            'mixed_prob': corrected_prob_soft,
             'score': score,
+            'seed_support_map': seed_support_map,
             'hard_ratio': self.adaptive_pl_last_hard_ratio,
+            'client_risk': self.adaptive_pl_last_client_risk,
         }
 
     def _build_optimizer(self, target_model, lr=None):
@@ -818,6 +1280,7 @@ class MyClient(BaseClient):
                 uni_prompts = prompts[self.args.cid].unsqueeze(0)
             else:
                 raise NotImplementedError('student_teacher_teacher_track only supports FedUniV2/FedUniV2.1 UNet Univ models.')
+            raw_encoder_feature = fuse_feature[:, : (fuse_feature.shape[1] - prompts[self.args.cid].shape[1])]
 
             outputs_soft = torch.softmax(outputs, dim=1)
             outputs_soft_auxiliary = torch.softmax(outputs_auxiliary, dim=1)
@@ -913,6 +1376,7 @@ class MyClient(BaseClient):
                         global_pseudo_label_mix=global_pseudo_label_mix,
                         geometry_bin_batch=geometry_bin_batch,
                         label_batch=label_batch,
+                        raw_encoder_feature=raw_encoder_feature,
                     )
                     loss_pls = adaptive_pl_result['loss_total']
                     pseudo_label = adaptive_pl_result['hard_target']
@@ -1360,6 +1824,9 @@ class MyClient(BaseClient):
                     outputs, feature, de1, de2, de3, de4, prompts, fuse_feature, outputs_auxiliary, distribution_prompts, uni_prompts = out
                 else:
                     outputs, feature, de1, de2, de3, de4 = out
+                raw_encoder_feature = None
+                if self.args.model in ['unet_univ2', 'unet_univ3', 'unet_univ4', 'unet_univ5']:
+                    raw_encoder_feature = fuse_feature[:, : (fuse_feature.shape[1] - prompts[self.args.cid].shape[1])]
 
                 outputs_soft = torch.softmax(outputs, dim=1)
                 loss_ce_seg = ce_loss(outputs, label_batch[:].long())
@@ -1540,6 +2007,7 @@ class MyClient(BaseClient):
                                     global_pseudo_label_mix=global_pseudo_label_mix,
                                     geometry_bin_batch=geometry_bin_batch,
                                     label_batch=label_batch,
+                                    raw_encoder_feature=raw_encoder_feature,
                                 )
                                 loss_pls = adaptive_pl_result['loss_total']
                                 adaptive_pl_loss_hard = adaptive_pl_result['loss_hard'].detach()
@@ -1689,8 +2157,17 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_mean_prob_gap'.format(self.cid)] = float(self.adaptive_pl_last_mean_prob_gap)
                 metrics_['client_{}_adaptive_pl_mean_conf_gap'.format(self.cid)] = float(self.adaptive_pl_last_mean_conf_gap)
                 metrics_['client_{}_adaptive_pl_both_uncertain_ratio'.format(self.cid)] = float(self.adaptive_pl_last_both_uncertain_ratio)
+                metrics_['client_{}_adaptive_pl_both_uncertain_ema'.format(self.cid)] = float(self.adaptive_pl_both_uncertain_ema)
                 metrics_['client_{}_adaptive_pl_boundary_loss_oc'.format(self.cid)] = float(self.adaptive_pl_last_boundary_loss_oc)
                 metrics_['client_{}_adaptive_pl_ring_valid_oc_ratio'.format(self.cid)] = float(self.adaptive_pl_last_ring_valid_oc_ratio)
+                metrics_['client_{}_adaptive_pl_prior_gap'.format(self.cid)] = float(self.adaptive_pl_last_prior_gap)
+                metrics_['client_{}_adaptive_pl_client_risk'.format(self.cid)] = float(self.adaptive_pl_last_client_risk)
+                metrics_['client_{}_adaptive_pl_loss_risk'.format(self.cid)] = float(self.adaptive_pl_last_loss_risk)
+                metrics_['client_{}_adaptive_pl_stage_progress'.format(self.cid)] = float(self.adaptive_pl_last_stage_progress)
+                metrics_['client_{}_adaptive_pl_release_score'.format(self.cid)] = float(self.adaptive_pl_last_release_score)
+                metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
+                metrics_['client_{}_adaptive_pl_effective_correction'.format(self.cid)] = float(self.adaptive_pl_last_effective_correction)
+                metrics_['client_{}_adaptive_pl_regime_code'.format(self.cid)] = float(self.adaptive_pl_last_regime_code)
                 for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
                     metrics_['client_{}_adaptive_pl_tau_bin_{}'.format(self.cid, bin_idx)] = float(tau_val)
                     metrics_['client_{}_adaptive_pl_bin_count_{}'.format(self.cid, bin_idx)] = int(self.adaptive_pl_last_bin_counts[bin_idx])
@@ -1935,6 +2412,60 @@ def main():
                         help='Kernel size used to build the OC boundary ring.')
     parser.add_argument('--adaptive_pl_boundary_warmup_iters', type=int, default=800,
                         help='Warmup iterations before OC boundary supervision becomes active.')
+    parser.add_argument('--seed_support_enabled', type=int, default=0,
+                        help='Enable local seed support and feature-affinity propagation on top of adaptive PL.')
+    parser.add_argument('--seed_support_warmup_iters', type=int, default=800,
+                        help='Warmup iterations before seed-support-guided adaptive PL becomes active.')
+    parser.add_argument('--seed_support_reliable_score_min', type=float, default=0.7,
+                        help='Minimum adaptive PL score required before unlabeled pseudo-seeds can enter the local seed bank.')
+    parser.add_argument('--seed_support_kernel_size', type=int, default=5,
+                        help='Neighborhood kernel size used by feature-affinity seed propagation.')
+    parser.add_argument('--seed_support_affinity_temp', type=float, default=8.0,
+                        help='Softmax temperature for local feature-affinity propagation.')
+    parser.add_argument('--seed_support_blend_alpha', type=float, default=0.5,
+                        help='Blend ratio between corrected local-global PL and propagated local seed support.')
+    parser.add_argument('--seed_support_hard_tau', type=float, default=0.35,
+                        help='Reserved compatibility threshold from the earlier W2_mid design; unused in the current W2_lite gating.')
+    parser.add_argument('--seed_support_soft_tau', type=float, default=0.20,
+                        help='Minimum seed-support strength required before a pixel can receive soft PL.')
+    parser.add_argument('--risk_calibration_enabled', type=int, default=0,
+                        help='Enable client-risk-aware prior correction, stricter gating, and global-anchor soft supervision.')
+    parser.add_argument('--risk_calibration_tau_lambda', type=float, default=0.12,
+                        help='Additional tau margin applied to higher-risk clients.')
+    parser.add_argument('--risk_calibration_conf_lambda', type=float, default=0.08,
+                        help='Additional minimum global-confidence margin for both-uncertain filtering on higher-risk clients.')
+    parser.add_argument('--risk_calibration_prior_power', type=float, default=1.0,
+                        help='Exponent applied to class-prior correction strength under client risk.')
+    parser.add_argument('--risk_calibration_prior_clip_min', type=float, default=0.5,
+                        help='Minimum class-prior correction multiplier.')
+    parser.add_argument('--risk_calibration_prior_clip_max', type=float, default=1.5,
+                        help='Maximum class-prior correction multiplier.')
+    parser.add_argument('--risk_calibration_hard_dampen', type=float, default=0.5,
+                        help='How strongly hard pseudo-label weights are damped for higher-risk clients.')
+    parser.add_argument('--risk_calibration_soft_boost', type=float, default=0.5,
+                        help='How strongly soft pseudo-label weights are boosted for higher-risk clients.')
+    parser.add_argument('--risk_calibration_global_soft_lambda', type=float, default=0.15,
+                        help='Weight of conservative global-anchor soft supervision on both-uncertain pixels.')
+    parser.add_argument('--risk_calibration_stateful_release_enabled', type=int, default=0,
+                        help='Enable W4 staged release: early unified correction, late state-based release/correction routing.')
+    parser.add_argument('--risk_calibration_release_start_iter', type=int, default=800,
+                        help='Global iteration where W4 release routing starts annealing away from W3-style unified correction.')
+    parser.add_argument('--risk_calibration_release_full_iter', type=int, default=1800,
+                        help='Global iteration where W4 release annealing reaches full strength.')
+    parser.add_argument('--risk_calibration_regime_ema_momentum', type=float, default=0.9,
+                        help='EMA momentum used to smooth W4 release/correction regime scores.')
+    parser.add_argument('--risk_calibration_release_risk_threshold', type=float, default=0.35,
+                        help='Clients below this risk level become eligible for the W4 release regime.')
+    parser.add_argument('--risk_calibration_release_agreement_threshold', type=float, default=0.90,
+                        help='Clients above this local-global agreement become eligible for the W4 release regime.')
+    parser.add_argument('--risk_calibration_release_prior_gap_threshold', type=float, default=0.015,
+                        help='Clients below this prior-gap EMA become eligible for the W4 release regime.')
+    parser.add_argument('--risk_calibration_correction_risk_threshold', type=float, default=0.55,
+                        help='Clients above this risk level stay in the W4 correction regime.')
+    parser.add_argument('--risk_calibration_correction_prior_gap_threshold', type=float, default=0.03,
+                        help='Clients above this prior-gap EMA stay in the W4 correction regime.')
+    parser.add_argument('--risk_calibration_regime_hysteresis', type=float, default=0.05,
+                        help='Margin used when mapping continuous W4 scores to correction/recovery/release regime codes.')
     parser.add_argument('--max_train_samples_per_client', type=int, default=0,
                         help='Cap the number of training samples loaded per client. 0 keeps the full dataset.')
     parser.add_argument('--max_val_samples_per_client', type=int, default=0,
@@ -2062,8 +2593,37 @@ def main():
     assert args.adaptive_pl_gamma_conf >= 0.0
     assert args.adaptive_pl_blend_kappa >= 0.0
     assert 0.0 <= args.adaptive_pl_global_min_conf <= 1.0
+    assert args.seed_support_enabled in [0, 1]
+    assert args.seed_support_warmup_iters >= 0
+    assert 0.0 <= args.seed_support_reliable_score_min <= 1.0
+    assert args.seed_support_kernel_size > 0 and (args.seed_support_kernel_size % 2 == 1)
+    assert args.seed_support_affinity_temp > 0.0
+    assert 0.0 <= args.seed_support_blend_alpha <= 1.0
+    assert 0.0 <= args.seed_support_hard_tau <= 1.0
+    assert 0.0 <= args.seed_support_soft_tau <= 1.0
+    assert args.seed_support_hard_tau >= args.seed_support_soft_tau
+    assert args.risk_calibration_enabled in [0, 1]
+    assert args.risk_calibration_tau_lambda >= 0.0
+    assert args.risk_calibration_conf_lambda >= 0.0
+    assert args.risk_calibration_prior_power >= 0.0
+    assert 0.0 < args.risk_calibration_prior_clip_min <= args.risk_calibration_prior_clip_max
+    assert args.risk_calibration_hard_dampen >= 0.0
+    assert args.risk_calibration_soft_boost >= 0.0
+    assert args.risk_calibration_global_soft_lambda >= 0.0
+    assert args.risk_calibration_stateful_release_enabled in [0, 1]
+    assert args.risk_calibration_release_start_iter >= 0
+    assert args.risk_calibration_release_full_iter > args.risk_calibration_release_start_iter
+    assert 0.0 <= args.risk_calibration_regime_ema_momentum < 1.0
+    assert 0.0 <= args.risk_calibration_release_risk_threshold <= 1.0
+    assert 0.0 <= args.risk_calibration_release_agreement_threshold <= 1.0
+    assert args.risk_calibration_release_prior_gap_threshold >= 0.0
+    assert 0.0 <= args.risk_calibration_correction_risk_threshold <= 1.0
+    assert args.risk_calibration_correction_prior_gap_threshold >= 0.0
+    assert args.risk_calibration_regime_hysteresis >= 0.0
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1
+    if args.seed_support_enabled == 1:
+        assert args.adaptive_pl_enabled == 1
     assert args.ala_num_pre_loss > 0
     assert args.ala_max_init_epochs > 0
     assert args.max_train_samples_per_client >= 0
