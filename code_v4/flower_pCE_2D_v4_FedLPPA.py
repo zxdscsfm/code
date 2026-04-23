@@ -499,6 +499,8 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_preserve_score = 0.0
         self.adaptive_pl_last_correction_score = 0.0
         self.adaptive_pl_last_effective_correction = 0.0
+        self.adaptive_pl_last_hard_control = 0.0
+        self.adaptive_pl_last_calibration_control = 0.0
         self.adaptive_pl_last_regime_code = 0.0
         self.adaptive_pl_release_streak = 0.0
         self.adaptive_pl_last_release_ready = 0.0
@@ -614,6 +616,12 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_effective_correction = float(
             state.get('adaptive_pl_last_effective_correction', self.adaptive_pl_last_effective_correction)
         )
+        self.adaptive_pl_last_hard_control = float(
+            state.get('adaptive_pl_last_hard_control', self.adaptive_pl_last_hard_control)
+        )
+        self.adaptive_pl_last_calibration_control = float(
+            state.get('adaptive_pl_last_calibration_control', self.adaptive_pl_last_calibration_control)
+        )
         self.adaptive_pl_last_regime_code = float(
             state.get('adaptive_pl_last_regime_code', self.adaptive_pl_last_regime_code)
         )
@@ -667,6 +675,8 @@ class MyClient(BaseClient):
             'adaptive_pl_last_preserve_score': float(self.adaptive_pl_last_preserve_score),
             'adaptive_pl_last_correction_score': float(self.adaptive_pl_last_correction_score),
             'adaptive_pl_last_effective_correction': float(self.adaptive_pl_last_effective_correction),
+            'adaptive_pl_last_hard_control': float(self.adaptive_pl_last_hard_control),
+            'adaptive_pl_last_calibration_control': float(self.adaptive_pl_last_calibration_control),
             'adaptive_pl_last_regime_code': float(self.adaptive_pl_last_regime_code),
             'adaptive_pl_release_streak': float(self.adaptive_pl_release_streak),
             'adaptive_pl_last_release_ready': float(self.adaptive_pl_last_release_ready),
@@ -679,6 +689,7 @@ class MyClient(BaseClient):
         global writer
         if writer is None or not self._adaptive_pl_is_enabled():
             return
+        w5_soft_only_enabled = bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0))
         log_interval = int(getattr(self.args, 'adaptive_pl_log_interval', 50))
         if log_interval <= 0 or self.current_iter % log_interval != 0:
             return
@@ -703,15 +714,13 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/client_risk'.format(self.cid), float(self.adaptive_pl_last_client_risk), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/loss_risk'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/stage_progress'.format(self.cid), float(self.adaptive_pl_last_stage_progress), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/release_score'.format(self.cid), float(self.adaptive_pl_last_release_score), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/preserve_score'.format(self.cid), float(self.adaptive_pl_last_preserve_score), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
+        if not w5_soft_only_enabled:
+            writer.add_scalar('client_{}/adaptive_pl/release_score'.format(self.cid), float(self.adaptive_pl_last_release_score), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/preserve_score'.format(self.cid), float(self.adaptive_pl_last_preserve_score), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/effective_correction'.format(self.cid), float(self.adaptive_pl_last_effective_correction), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/regime_code'.format(self.cid), float(self.adaptive_pl_last_regime_code), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/release_streak'.format(self.cid), float(self.adaptive_pl_release_streak), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/release_ready'.format(self.cid), float(self.adaptive_pl_last_release_ready), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/high_risk_flag'.format(self.cid), float(self.adaptive_pl_last_high_risk), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/gate_release_armed'.format(self.cid), float(self.adaptive_pl_gate_release_armed), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/hard_control'.format(self.cid), float(self.adaptive_pl_last_hard_control), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/calibration_control'.format(self.cid), float(self.adaptive_pl_last_calibration_control), self.current_iter)
         for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
             writer.add_scalar('client_{}/adaptive_pl/tau_bin_{}'.format(self.cid, bin_idx), float(tau_val), self.current_iter)
             observed_accept = self.adaptive_pl_last_observed_accept[bin_idx]
@@ -823,7 +832,7 @@ class MyClient(BaseClient):
         preserve_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_preserve_prior_gap_threshold', 0.025))
         preserve_uncertain_threshold = float(getattr(self.args, 'risk_calibration_preserve_uncertain_threshold', 0.04))
         preserve_hard_ratio_threshold = float(getattr(self.args, 'risk_calibration_preserve_hard_ratio_threshold', 0.60))
-        correction_risk_threshold = float(getattr(self.args, 'risk_calibration_correction_risk_threshold', 0.55))
+        correction_risk_threshold = float(getattr(self.args, 'risk_calibration_correction_risk_threshold', 0.75))
         correction_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_correction_prior_gap_threshold', 0.03))
         correction_agreement_threshold = float(getattr(self.args, 'risk_calibration_correction_agreement_threshold', 0.88))
         correction_uncertain_threshold = float(getattr(self.args, 'risk_calibration_correction_uncertain_threshold', 0.06))
@@ -834,11 +843,17 @@ class MyClient(BaseClient):
         preserve_max_correction = float(getattr(self.args, 'risk_calibration_preserve_max_correction', 0.55))
         correction_min_correction = float(getattr(self.args, 'risk_calibration_correction_min_correction', 0.75))
         regime_hysteresis = float(getattr(self.args, 'risk_calibration_regime_hysteresis', 0.05))
-        routing_mode = str(getattr(self.args, 'risk_calibration_routing_mode', 'score')).lower()
-        gate_release_start_iter = int(getattr(self.args, 'risk_calibration_gate_release_start_iter', max(release_start_iter, warmup_iters + 400)))
-        release_streak_required = int(getattr(self.args, 'risk_calibration_release_streak_required', 3))
-        release_streak_decay = int(getattr(self.args, 'risk_calibration_release_streak_decay', 1))
-        release_hard_ratio_threshold = float(getattr(self.args, 'risk_calibration_release_hard_ratio_threshold', preserve_hard_ratio_threshold))
+        anneal_end_iter = int(getattr(self.args, 'risk_calibration_anneal_end_iter', -1))
+        hard_min_correction = float(getattr(self.args, 'risk_calibration_hard_min_correction', 0.05))
+        hard_risk_scale = float(getattr(self.args, 'risk_calibration_hard_risk_scale', 0.15))
+        calibration_min_correction = float(getattr(self.args, 'risk_calibration_calibration_min_correction', 0.10))
+        calibration_risk_scale = float(getattr(self.args, 'risk_calibration_calibration_risk_scale', 0.40))
+        w5_soft_only_enabled = bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0))
+        w5_start_iter = int(getattr(self.args, 'risk_calibration_w5_start_iter', warmup_iters))
+        w5_peak_iter = int(getattr(self.args, 'risk_calibration_w5_peak_iter', max(warmup_iters + 1, warmup_iters + 600)))
+        w5_end_iter = int(getattr(self.args, 'risk_calibration_w5_end_iter', max(warmup_iters + 2, warmup_iters + 1800)))
+        w5_min_correction = float(getattr(self.args, 'risk_calibration_w5_min_correction', 0.10))
+        w5_risk_scale = float(getattr(self.args, 'risk_calibration_w5_risk_scale', 0.40))
         outer_beta = float(getattr(self.args, 'beta', 1.0))
 
         valid_mask = unlabeled_mask.bool()
@@ -898,221 +913,84 @@ class MyClient(BaseClient):
         preserve_score = 0.0
         correction_score = 0.0
         effective_correction = 0.0
+        hard_control = 0.0
+        calibration_control = 0.0
         regime_code = 0.0
         release_ready_flag = 0.0
         high_risk_flag = 0.0
         if risk_calibration_enabled:
             effective_correction = 1.0
             regime_code = 0.0
-        if risk_calibration_enabled and stateful_release_enabled:
-            release_start_iter = max(warmup_iters, release_start_iter)
-            gate_release_start_iter = max(release_start_iter, gate_release_start_iter)
-            release_full_iter = max(release_start_iter + 1, release_full_iter)
-            release_streak_required = max(1, release_streak_required)
-            release_streak_decay = max(1, release_streak_decay)
-            release_uncertain_term = float(np.clip(
-                (release_uncertain_threshold - self.adaptive_pl_both_uncertain_ema) / max(release_uncertain_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            release_risk_term = float(np.clip(
-                (release_risk_threshold - risk_score) / max(release_risk_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            release_agreement_term = float(np.clip(
-                (self.adaptive_pl_lg_agreement_ema - release_agreement_threshold) / max(1e-6, 1.0 - release_agreement_threshold),
-                0.0,
-                1.0,
-            ))
-            release_prior_term = float(np.clip(
-                (release_prior_gap_threshold - self.adaptive_pl_prior_gap_ema) / max(release_prior_gap_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            release_raw = min(release_risk_term, release_agreement_term, release_prior_term, release_uncertain_term)
-            preserve_risk_term = float(np.clip(
-                (preserve_risk_threshold - risk_score) / max(preserve_risk_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            preserve_agreement_term = float(np.clip(
-                (self.adaptive_pl_lg_agreement_ema - preserve_agreement_threshold) / max(1e-6, 1.0 - preserve_agreement_threshold),
-                0.0,
-                1.0,
-            ))
-            preserve_prior_term = float(np.clip(
-                (preserve_prior_gap_threshold - self.adaptive_pl_prior_gap_ema) / max(preserve_prior_gap_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            preserve_uncertain_term = float(np.clip(
-                (preserve_uncertain_threshold - self.adaptive_pl_both_uncertain_ema) / max(preserve_uncertain_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            preserve_hard_term = float(np.clip(
-                (self.adaptive_pl_last_hard_ratio - preserve_hard_ratio_threshold) / max(1e-6, 1.0 - preserve_hard_ratio_threshold),
-                0.0,
-                1.0,
-            ))
-            preserve_raw = min(
-                preserve_risk_term,
-                preserve_agreement_term,
-                preserve_prior_term,
-                preserve_uncertain_term,
-                preserve_hard_term,
-            )
-            correction_risk_term = float(np.clip(
-                (risk_score - correction_risk_threshold) / max(1e-6, 1.0 - correction_risk_threshold),
-                0.0,
-                1.0,
-            ))
-            correction_prior_term = float(np.clip(
-                (self.adaptive_pl_prior_gap_ema - correction_prior_gap_threshold) / max(correction_prior_gap_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            correction_agreement_term = float(np.clip(
-                (correction_agreement_threshold - self.adaptive_pl_lg_agreement_ema) / max(correction_agreement_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            correction_uncertain_term = float(np.clip(
-                (self.adaptive_pl_both_uncertain_ema - correction_uncertain_threshold) / max(correction_uncertain_threshold, 1e-6),
-                0.0,
-                1.0,
-            ))
-            correction_raw = max(
-                correction_risk_term,
-                correction_prior_term,
-                correction_agreement_term,
-                correction_uncertain_term,
-            )
-            self.adaptive_pl_release_score_ema = (
-                regime_ema_momentum * self.adaptive_pl_release_score_ema
-            ) + ((1.0 - regime_ema_momentum) * release_raw)
+        if risk_calibration_enabled and w5_soft_only_enabled:
+            w5_start_iter = max(warmup_iters, w5_start_iter)
+            w5_peak_iter = max(w5_start_iter + 1, w5_peak_iter)
+            w5_end_iter = max(w5_peak_iter + 1, w5_end_iter)
+            if self.current_iter < w5_start_iter:
+                stage_progress = 0.0
+            elif self.current_iter < w5_peak_iter:
+                stage_progress = float(np.clip(
+                    (self.current_iter - w5_start_iter) / float(w5_peak_iter - w5_start_iter),
+                    0.0,
+                    1.0,
+                ))
+            elif self.current_iter < w5_end_iter:
+                stage_progress = float(np.clip(
+                    (w5_end_iter - self.current_iter) / float(w5_end_iter - w5_peak_iter),
+                    0.0,
+                    1.0,
+                ))
+            else:
+                stage_progress = 0.0
+            soft_target = float(np.clip(w5_min_correction + (w5_risk_scale * risk_score), 0.0, 1.0))
+            calibration_control = float(np.clip(stage_progress * soft_target, 0.0, 1.0))
+            hard_control = 0.0
+            release_score = 0.0
+            preserve_score = calibration_control
+            correction_score = risk_score
+            effective_correction = calibration_control
+            self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
             self.adaptive_pl_preserve_score_ema = (
                 regime_ema_momentum * self.adaptive_pl_preserve_score_ema
-            ) + ((1.0 - regime_ema_momentum) * preserve_raw)
+            ) + ((1.0 - regime_ema_momentum) * calibration_control)
             self.adaptive_pl_correction_score_ema = (
                 regime_ema_momentum * self.adaptive_pl_correction_score_ema
-            ) + ((1.0 - regime_ema_momentum) * correction_raw)
-
-            if self.current_iter >= release_start_iter:
-                # W4.1: early unified correction before T1, then route clients into
-                # correction / preserve / release instead of keeping a single conservative path.
+            ) + ((1.0 - regime_ema_momentum) * risk_score)
+            regime_code = 0.0
+            self.adaptive_pl_release_streak = 0.0
+            self.adaptive_pl_gate_release_armed = 0.0
+        elif risk_calibration_enabled and stateful_release_enabled:
+            anneal_start_iter = max(warmup_iters, release_start_iter)
+            if anneal_end_iter < 0:
+                anneal_end_iter = release_full_iter
+            anneal_end_iter = max(anneal_start_iter + 1, anneal_end_iter)
+            if self.current_iter >= anneal_start_iter:
+                # Replace discrete W4.2 routing with continuous late-stage annealing.
                 stage_progress = float(np.clip(
-                    (self.current_iter - release_start_iter) / float(release_full_iter - release_start_iter),
+                    (self.current_iter - anneal_start_iter) / float(anneal_end_iter - anneal_start_iter),
                     0.0,
                     1.0,
                 ))
-                release_score = float(np.clip(stage_progress * self.adaptive_pl_release_score_ema, 0.0, 1.0))
-                preserve_score = float(np.clip(stage_progress * self.adaptive_pl_preserve_score_ema, 0.0, 1.0))
-                correction_score = float(np.clip(stage_progress * self.adaptive_pl_correction_score_ema, 0.0, 1.0))
-                prev_regime = int(np.clip(round(self.adaptive_pl_last_regime_code), 0, 2))
-                correction_target = float(np.clip(max(correction_min_correction, correction_score), 0.0, 1.0))
-                preserve_target = float(np.clip(
-                    preserve_min_correction + (1.0 - preserve_score) * (preserve_max_correction - preserve_min_correction),
-                    0.0,
-                    1.0,
-                ))
-                release_target = float(np.clip(
-                    release_min_correction + (1.0 - release_score) * (release_max_correction - release_min_correction),
-                    0.0,
-                    1.0,
-                ))
-
-                if routing_mode != 'gated' or self.current_iter < gate_release_start_iter:
-                    # Keep W4.1 behavior before post-1200 W4.2 gate.
-                    candidate_scores = [correction_score, preserve_score, release_score]
-                    best_regime = int(np.argmax(candidate_scores))
-                    if candidate_scores[prev_regime] + regime_hysteresis >= candidate_scores[best_regime]:
-                        regime_code = float(prev_regime)
-                    else:
-                        regime_code = float(best_regime)
-                    regime_target = correction_target
-                    if int(regime_code) == 1:
-                        regime_target = preserve_target
-                    elif int(regime_code) == 2:
-                        regime_target = release_target
-                    effective_correction = float(np.clip(
-                        ((1.0 - stage_progress) * 1.0) + (stage_progress * regime_target),
-                        0.0,
-                        1.0,
-                    ))
-                    self.adaptive_pl_release_streak = max(
-                        0.0,
-                        self.adaptive_pl_release_streak - float(release_streak_decay),
-                    )
-                    self.adaptive_pl_gate_release_armed = 0.0
-                else:
-                    # W4.2: gated sequential routing (correction -> release -> preserve)
-                    high_risk = bool(
-                        (risk_score >= correction_risk_threshold)
-                        or (self.adaptive_pl_prior_gap_ema >= correction_prior_gap_threshold)
-                        or (self.adaptive_pl_lg_agreement_ema <= correction_agreement_threshold)
-                        or (self.adaptive_pl_both_uncertain_ema >= correction_uncertain_threshold)
-                    )
-                    release_ready = bool(
-                        (risk_score <= release_risk_threshold)
-                        and (self.adaptive_pl_lg_agreement_ema >= release_agreement_threshold)
-                        and (self.adaptive_pl_prior_gap_ema <= release_prior_gap_threshold)
-                        and (self.adaptive_pl_both_uncertain_ema <= release_uncertain_threshold)
-                        and (self.adaptive_pl_last_hard_ratio >= release_hard_ratio_threshold)
-                    )
-                    release_keep_ready = bool(
-                        (risk_score <= preserve_risk_threshold)
-                        and (self.adaptive_pl_lg_agreement_ema >= preserve_agreement_threshold)
-                        and (self.adaptive_pl_prior_gap_ema <= preserve_prior_gap_threshold)
-                        and (self.adaptive_pl_both_uncertain_ema <= preserve_uncertain_threshold)
-                        and (self.adaptive_pl_last_hard_ratio >= preserve_hard_ratio_threshold)
-                    )
-                    high_risk_flag = 1.0 if high_risk else 0.0
-                    release_ready_flag = 1.0 if release_ready else 0.0
-
-                    if high_risk:
-                        self.adaptive_pl_release_streak = 0.0
-                        self.adaptive_pl_gate_release_armed = 0.0
-                        regime_code = 0.0
-                    else:
-                        if release_ready:
-                            self.adaptive_pl_release_streak = min(
-                                float(release_streak_required + 8),
-                                self.adaptive_pl_release_streak + 1.0,
-                            )
-                        elif self.adaptive_pl_gate_release_armed >= 1.0 and prev_regime == 2 and release_keep_ready:
-                            self.adaptive_pl_release_streak = max(
-                                self.adaptive_pl_release_streak,
-                                float(max(0, release_streak_required - 1)),
-                            )
-                        else:
-                            self.adaptive_pl_release_streak = max(
-                                0.0,
-                                self.adaptive_pl_release_streak - float(release_streak_decay),
-                            )
-
-                        release_triggered = self.adaptive_pl_release_streak >= float(release_streak_required)
-                        if (not release_triggered) and self.adaptive_pl_gate_release_armed >= 1.0 and prev_regime == 2 and release_keep_ready:
-                            release_triggered = self.adaptive_pl_release_streak >= float(max(0, release_streak_required - 1))
-                        regime_code = 2.0 if release_triggered else 1.0
-                        if release_triggered:
-                            self.adaptive_pl_gate_release_armed = 1.0
-
-                    regime_target = correction_target
-                    if int(regime_code) == 1:
-                        regime_target = preserve_target
-                    elif int(regime_code) == 2:
-                        regime_target = release_target
-                    effective_correction = regime_target
-            else:
-                release_score = 0.0
-                preserve_score = 0.0
-                correction_score = 1.0
-                effective_correction = 1.0
-                regime_code = 0.0
-                self.adaptive_pl_release_streak = 0.0
-                self.adaptive_pl_gate_release_armed = 0.0
+            hard_target = float(np.clip(hard_min_correction + (hard_risk_scale * risk_score), 0.0, 1.0))
+            calibration_target = float(np.clip(calibration_min_correction + (calibration_risk_scale * risk_score), 0.0, 1.0))
+            # Keep strong correction before anneal starts, then gradually inject risk-aware late controls.
+            hard_control = float(np.clip(((1.0 - stage_progress) * 1.0) + (stage_progress * hard_target), 0.0, 1.0))
+            calibration_control = float(np.clip(((1.0 - stage_progress) * 1.0) + (stage_progress * calibration_target), 0.0, 1.0))
+            release_score = hard_control
+            preserve_score = calibration_control
+            correction_score = risk_score
+            effective_correction = calibration_control
+            self.adaptive_pl_release_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_release_score_ema
+            ) + ((1.0 - regime_ema_momentum) * hard_control)
+            self.adaptive_pl_preserve_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_preserve_score_ema
+            ) + ((1.0 - regime_ema_momentum) * calibration_control)
+            self.adaptive_pl_correction_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_correction_score_ema
+            ) + ((1.0 - regime_ema_momentum) * risk_score)
+            regime_code = 0.0
+            self.adaptive_pl_release_streak = 0.0
+            self.adaptive_pl_gate_release_armed = 0.0
         elif risk_calibration_enabled:
             self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
             self.adaptive_pl_preserve_score_ema = regime_ema_momentum * self.adaptive_pl_preserve_score_ema
@@ -1123,6 +1001,8 @@ class MyClient(BaseClient):
             preserve_score = 0.0
             correction_score = 1.0
             effective_correction = 1.0
+            hard_control = 1.0
+            calibration_control = 1.0
             regime_code = 0.0
             self.adaptive_pl_release_streak = 0.0
             self.adaptive_pl_gate_release_armed = 0.0
@@ -1137,6 +1017,8 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_preserve_score = preserve_score
         self.adaptive_pl_last_correction_score = correction_score
         self.adaptive_pl_last_effective_correction = effective_correction
+        self.adaptive_pl_last_hard_control = hard_control
+        self.adaptive_pl_last_calibration_control = calibration_control
         self.adaptive_pl_last_regime_code = regime_code
         self.adaptive_pl_last_release_ready = release_ready_flag
         self.adaptive_pl_last_high_risk = high_risk_flag
@@ -1162,15 +1044,20 @@ class MyClient(BaseClient):
 
         lambda_dynamic = torch.exp(-blend_kappa * conf_gap).clamp(1e-6, 1.0)
         corrected_prob = lambda_dynamic.unsqueeze(1) * local_prob + (1.0 - lambda_dynamic).unsqueeze(1) * global_prob
+        corrected_prob_soft = corrected_prob
         if risk_calibration_enabled and valid_mask.any():
             prior_scale = ((global_prior + 1e-6) / (local_prior + 1e-6)).clamp(
                 min=risk_prior_clip_min,
                 max=risk_prior_clip_max,
             )
-            prior_scale = torch.pow(prior_scale, risk_prior_power * risk_score * effective_correction)
-            corrected_prob = corrected_prob * prior_scale.view(1, -1, 1, 1)
-            corrected_prob = corrected_prob / corrected_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        corrected_prob_soft = corrected_prob
+            prior_scale = torch.pow(prior_scale, risk_prior_power * calibration_control)
+            if w5_soft_only_enabled:
+                corrected_prob_soft = corrected_prob_soft * prior_scale.view(1, -1, 1, 1)
+                corrected_prob_soft = corrected_prob_soft / corrected_prob_soft.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            else:
+                corrected_prob = corrected_prob * prior_scale.view(1, -1, 1, 1)
+                corrected_prob = corrected_prob / corrected_prob.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                corrected_prob_soft = corrected_prob
         seed_support_map = score.new_zeros(score.shape)
         propagated_fg_map = score.new_zeros(score.shape)
         soft_assist_mask = torch.zeros_like(score, dtype=torch.bool)
@@ -1183,7 +1070,7 @@ class MyClient(BaseClient):
             seed_guided_prob, seed_support_map, propagated_fg_map = build_seed_support_guided_prob(
                 raw_encoder_feature=raw_encoder_feature,
                 weak_label_batch=label_batch,
-                corrected_prob=corrected_prob,
+                corrected_prob=corrected_prob_soft if w5_soft_only_enabled else corrected_prob,
                 score_map=score,
                 ignore_index=self.args.num_classes,
                 reliable_score_min=seed_support_reliable_score_min,
@@ -1199,10 +1086,10 @@ class MyClient(BaseClient):
         hard_client_scale = 1.0
         soft_client_scale = 1.0
         if risk_calibration_enabled and adaptive_active:
-            tau_map_effective = (tau_map + (risk_tau_lambda * risk_score * effective_correction)).clamp(0.3, 0.95)
-            conf_global_cutoff = min(0.95, tau_global_min + (risk_conf_lambda * risk_score * effective_correction))
-            hard_client_scale = max(0.0, 1.0 - (risk_hard_dampen * risk_score * effective_correction))
-            soft_client_scale = 1.0 + (risk_soft_boost * risk_score * effective_correction)
+            tau_map_effective = (tau_map + (risk_tau_lambda * hard_control)).clamp(0.3, 0.95)
+            conf_global_cutoff = min(0.95, tau_global_min + (risk_conf_lambda * hard_control))
+            hard_client_scale = max(0.0, 1.0 - (risk_hard_dampen * hard_control))
+            soft_client_scale = 1.0 + (risk_soft_boost * calibration_control)
 
         if adaptive_active:
             both_uncertain = valid_mask & (score < tau_map_effective) & (conf_global < conf_global_cutoff)
@@ -1237,7 +1124,7 @@ class MyClient(BaseClient):
         loss_risk = risk_score * 0.5 * (loss_risk_1 + loss_risk_2)
         total_loss = loss_hard + float(getattr(self.args, 'adaptive_pl_soft_lambda', 0.2)) * loss_soft
         if risk_calibration_enabled and adaptive_active:
-            total_loss = total_loss + (risk_global_soft_lambda * effective_correction * loss_risk)
+            total_loss = total_loss + (risk_global_soft_lambda * calibration_control * loss_risk)
         valid_count = float(valid_mask.float().sum().item())
 
         loss_boundary_oc = outputs.new_tensor(0.0)
@@ -2380,6 +2267,7 @@ class MyClient(BaseClient):
             metrics_['client_{}_loss_uni'.format(self.cid)] = loss_uni.item()
             metrics_['client_{}_loss_pls'.format(self.cid)] = loss_pls.item()
             if self._adaptive_pl_is_enabled():
+                w5_soft_only_enabled = bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0))
                 metrics_['client_{}_adaptive_pl_loss_hard'.format(self.cid)] = float(adaptive_pl_loss_hard.item())
                 metrics_['client_{}_adaptive_pl_loss_soft'.format(self.cid)] = float(adaptive_pl_loss_soft.item())
                 metrics_['client_{}_adaptive_pl_hard_ratio'.format(self.cid)] = float(adaptive_pl_hard_ratio)
@@ -2395,15 +2283,13 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_client_risk'.format(self.cid)] = float(self.adaptive_pl_last_client_risk)
                 metrics_['client_{}_adaptive_pl_loss_risk'.format(self.cid)] = float(self.adaptive_pl_last_loss_risk)
                 metrics_['client_{}_adaptive_pl_stage_progress'.format(self.cid)] = float(self.adaptive_pl_last_stage_progress)
-                metrics_['client_{}_adaptive_pl_release_score'.format(self.cid)] = float(self.adaptive_pl_last_release_score)
-                metrics_['client_{}_adaptive_pl_preserve_score'.format(self.cid)] = float(self.adaptive_pl_last_preserve_score)
-                metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
+                if not w5_soft_only_enabled:
+                    metrics_['client_{}_adaptive_pl_release_score'.format(self.cid)] = float(self.adaptive_pl_last_release_score)
+                    metrics_['client_{}_adaptive_pl_preserve_score'.format(self.cid)] = float(self.adaptive_pl_last_preserve_score)
+                    metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
                 metrics_['client_{}_adaptive_pl_effective_correction'.format(self.cid)] = float(self.adaptive_pl_last_effective_correction)
-                metrics_['client_{}_adaptive_pl_regime_code'.format(self.cid)] = float(self.adaptive_pl_last_regime_code)
-                metrics_['client_{}_adaptive_pl_release_streak'.format(self.cid)] = float(self.adaptive_pl_release_streak)
-                metrics_['client_{}_adaptive_pl_release_ready'.format(self.cid)] = float(self.adaptive_pl_last_release_ready)
-                metrics_['client_{}_adaptive_pl_high_risk_flag'.format(self.cid)] = float(self.adaptive_pl_last_high_risk)
-                metrics_['client_{}_adaptive_pl_gate_release_armed'.format(self.cid)] = float(self.adaptive_pl_gate_release_armed)
+                metrics_['client_{}_adaptive_pl_hard_control'.format(self.cid)] = float(self.adaptive_pl_last_hard_control)
+                metrics_['client_{}_adaptive_pl_calibration_control'.format(self.cid)] = float(self.adaptive_pl_last_calibration_control)
                 for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
                     metrics_['client_{}_adaptive_pl_tau_bin_{}'.format(self.cid, bin_idx)] = float(tau_val)
                     metrics_['client_{}_adaptive_pl_bin_count_{}'.format(self.cid, bin_idx)] = int(self.adaptive_pl_last_bin_counts[bin_idx])
@@ -2708,7 +2594,7 @@ def main():
                         help='Clients below this both-uncertain EMA can enter the W4 preserve regime.')
     parser.add_argument('--risk_calibration_preserve_hard_ratio_threshold', type=float, default=0.60,
                         help='Clients above this hard-ratio can enter the W4 preserve regime.')
-    parser.add_argument('--risk_calibration_correction_risk_threshold', type=float, default=0.55,
+    parser.add_argument('--risk_calibration_correction_risk_threshold', type=float, default=0.75,
                         help='Clients above this risk level stay in the W4 correction regime.')
     parser.add_argument('--risk_calibration_correction_prior_gap_threshold', type=float, default=0.03,
                         help='Clients above this prior-gap EMA stay in the W4 correction regime.')
@@ -2730,6 +2616,16 @@ def main():
                         help='Minimum correction strength kept for clients in correction after release starts.')
     parser.add_argument('--risk_calibration_regime_hysteresis', type=float, default=0.05,
                         help='Margin used when mapping continuous W4 scores to correction/preserve/release regime codes.')
+    parser.add_argument('--risk_calibration_anneal_end_iter', type=int, default=-1,
+                        help='End iter of the late-stage continuous annealing. <0 falls back to risk_calibration_release_full_iter.')
+    parser.add_argument('--risk_calibration_hard_min_correction', type=float, default=0.05,
+                        help='Late-stage floor for the hard-expansion control channel before multiplying client risk.')
+    parser.add_argument('--risk_calibration_hard_risk_scale', type=float, default=0.15,
+                        help='Late-stage risk scale for the hard-expansion control channel.')
+    parser.add_argument('--risk_calibration_calibration_min_correction', type=float, default=0.10,
+                        help='Late-stage floor for the calibration channel before multiplying client risk.')
+    parser.add_argument('--risk_calibration_calibration_risk_scale', type=float, default=0.40,
+                        help='Late-stage risk scale for the calibration channel.')
     parser.add_argument('--risk_calibration_routing_mode', type=str, default='score',
                         help='W4 routing mode: score keeps W4.1 score competition; gated enables W4.2 sequential gate.')
     parser.add_argument('--risk_calibration_gate_release_start_iter', type=int, default=1200,
@@ -2740,6 +2636,18 @@ def main():
                         help='How much release streak decays per step when release-ready condition is not satisfied.')
     parser.add_argument('--risk_calibration_release_hard_ratio_threshold', type=float, default=0.60,
                         help='Additional hard-ratio gate for W4.2 release trigger.')
+    parser.add_argument('--risk_calibration_w5_soft_only_enabled', type=int, default=0,
+                        help='Enable W5 mode: keep W1 hard branch untouched and apply risk calibration only on soft/uncertain branch.')
+    parser.add_argument('--risk_calibration_w5_start_iter', type=int, default=800,
+                        help='W5 soft-only calibration start iteration.')
+    parser.add_argument('--risk_calibration_w5_peak_iter', type=int, default=1400,
+                        help='W5 soft-only calibration peak iteration.')
+    parser.add_argument('--risk_calibration_w5_end_iter', type=int, default=2400,
+                        help='W5 soft-only calibration end iteration.')
+    parser.add_argument('--risk_calibration_w5_min_correction', type=float, default=0.10,
+                        help='W5 floor for soft-branch calibration intensity before multiplying client risk.')
+    parser.add_argument('--risk_calibration_w5_risk_scale', type=float, default=0.40,
+                        help='W5 soft-branch risk scale.')
     parser.add_argument('--max_train_samples_per_client', type=int, default=0,
                         help='Cap the number of training samples loaded per client. 0 keeps the full dataset.')
     parser.add_argument('--max_val_samples_per_client', type=int, default=0,
@@ -2885,8 +2793,6 @@ def main():
     assert args.risk_calibration_soft_boost >= 0.0
     assert args.risk_calibration_global_soft_lambda >= 0.0
     assert args.risk_calibration_stateful_release_enabled in [0, 1]
-    assert args.risk_calibration_release_start_iter >= 0
-    assert args.risk_calibration_release_full_iter > args.risk_calibration_release_start_iter
     assert 0.0 <= args.risk_calibration_regime_ema_momentum < 1.0
     assert 0.0 <= args.risk_calibration_release_risk_threshold <= 1.0
     assert 0.0 <= args.risk_calibration_release_agreement_threshold <= 1.0
@@ -2905,19 +2811,36 @@ def main():
     assert 0.0 <= args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= 1.0
     assert 0.0 <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= 1.0
     assert 0.0 <= args.risk_calibration_correction_min_correction <= 1.0
-    assert args.risk_calibration_release_risk_threshold <= args.risk_calibration_preserve_risk_threshold <= args.risk_calibration_correction_risk_threshold
-    assert args.risk_calibration_release_agreement_threshold >= args.risk_calibration_preserve_agreement_threshold >= args.risk_calibration_correction_agreement_threshold
-    assert args.risk_calibration_release_prior_gap_threshold <= args.risk_calibration_preserve_prior_gap_threshold <= args.risk_calibration_correction_prior_gap_threshold
-    assert args.risk_calibration_release_uncertain_threshold <= args.risk_calibration_preserve_uncertain_threshold <= args.risk_calibration_correction_uncertain_threshold
-    assert args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= args.risk_calibration_correction_min_correction
     assert args.risk_calibration_regime_hysteresis >= 0.0
-    assert args.risk_calibration_routing_mode.lower() in ['score', 'gated']
-    assert args.risk_calibration_gate_release_start_iter >= 0
-    if args.risk_calibration_routing_mode.lower() == 'gated':
-        assert args.risk_calibration_gate_release_start_iter >= args.risk_calibration_release_start_iter
-    assert args.risk_calibration_release_streak_required >= 1
-    assert args.risk_calibration_release_streak_decay >= 1
-    assert 0.0 <= args.risk_calibration_release_hard_ratio_threshold <= 1.0
+    assert 0.0 <= args.risk_calibration_hard_min_correction <= 1.0
+    assert args.risk_calibration_hard_risk_scale >= 0.0
+    assert 0.0 <= args.risk_calibration_calibration_min_correction <= 1.0
+    assert args.risk_calibration_calibration_risk_scale >= 0.0
+    if args.risk_calibration_stateful_release_enabled == 1:
+        assert args.risk_calibration_release_start_iter >= 0
+        assert args.risk_calibration_release_full_iter > args.risk_calibration_release_start_iter
+        assert args.risk_calibration_release_risk_threshold <= args.risk_calibration_preserve_risk_threshold <= args.risk_calibration_correction_risk_threshold
+        assert args.risk_calibration_release_agreement_threshold >= args.risk_calibration_preserve_agreement_threshold >= args.risk_calibration_correction_agreement_threshold
+        assert args.risk_calibration_release_prior_gap_threshold <= args.risk_calibration_preserve_prior_gap_threshold <= args.risk_calibration_correction_prior_gap_threshold
+        assert args.risk_calibration_release_uncertain_threshold <= args.risk_calibration_preserve_uncertain_threshold <= args.risk_calibration_correction_uncertain_threshold
+        assert args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= args.risk_calibration_correction_min_correction
+        assert args.risk_calibration_anneal_end_iter == -1 or args.risk_calibration_anneal_end_iter > args.risk_calibration_release_start_iter
+        assert args.risk_calibration_routing_mode.lower() in ['score', 'gated']
+        assert args.risk_calibration_gate_release_start_iter >= 0
+        if args.risk_calibration_routing_mode.lower() == 'gated':
+            assert args.risk_calibration_gate_release_start_iter >= args.risk_calibration_release_start_iter
+        assert args.risk_calibration_release_streak_required >= 1
+        assert args.risk_calibration_release_streak_decay >= 1
+        assert 0.0 <= args.risk_calibration_release_hard_ratio_threshold <= 1.0
+    assert args.risk_calibration_w5_soft_only_enabled in [0, 1]
+    assert args.risk_calibration_w5_start_iter >= 0
+    assert args.risk_calibration_w5_peak_iter > args.risk_calibration_w5_start_iter
+    assert args.risk_calibration_w5_end_iter > args.risk_calibration_w5_peak_iter
+    assert 0.0 <= args.risk_calibration_w5_min_correction <= 1.0
+    assert args.risk_calibration_w5_risk_scale >= 0.0
+    if args.risk_calibration_w5_soft_only_enabled == 1:
+        assert args.risk_calibration_enabled == 1
+        assert args.risk_calibration_stateful_release_enabled == 0
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1
     if args.seed_support_enabled == 1:
