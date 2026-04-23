@@ -492,12 +492,14 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_client_risk = 0.0
         self.adaptive_pl_last_loss_risk = 0.0
         self.adaptive_pl_release_score_ema = 0.0
+        self.adaptive_pl_preserve_score_ema = 0.0
         self.adaptive_pl_correction_score_ema = 0.0
         self.adaptive_pl_last_stage_progress = 0.0
         self.adaptive_pl_last_release_score = 0.0
+        self.adaptive_pl_last_preserve_score = 0.0
         self.adaptive_pl_last_correction_score = 0.0
         self.adaptive_pl_last_effective_correction = 0.0
-        self.adaptive_pl_last_regime_code = 1.0
+        self.adaptive_pl_last_regime_code = 0.0
 
     def _get_adaptive_pl_state_path(self, tag='latest'):
         return os.path.join(
@@ -587,6 +589,9 @@ class MyClient(BaseClient):
         self.adaptive_pl_release_score_ema = float(
             state.get('adaptive_pl_release_score_ema', self.adaptive_pl_release_score_ema)
         )
+        self.adaptive_pl_preserve_score_ema = float(
+            state.get('adaptive_pl_preserve_score_ema', self.adaptive_pl_preserve_score_ema)
+        )
         self.adaptive_pl_correction_score_ema = float(
             state.get('adaptive_pl_correction_score_ema', self.adaptive_pl_correction_score_ema)
         )
@@ -595,6 +600,9 @@ class MyClient(BaseClient):
         )
         self.adaptive_pl_last_release_score = float(
             state.get('adaptive_pl_last_release_score', self.adaptive_pl_last_release_score)
+        )
+        self.adaptive_pl_last_preserve_score = float(
+            state.get('adaptive_pl_last_preserve_score', self.adaptive_pl_last_preserve_score)
         )
         self.adaptive_pl_last_correction_score = float(
             state.get('adaptive_pl_last_correction_score', self.adaptive_pl_last_correction_score)
@@ -636,9 +644,11 @@ class MyClient(BaseClient):
             'adaptive_pl_last_client_risk': float(self.adaptive_pl_last_client_risk),
             'adaptive_pl_last_loss_risk': float(self.adaptive_pl_last_loss_risk),
             'adaptive_pl_release_score_ema': float(self.adaptive_pl_release_score_ema),
+            'adaptive_pl_preserve_score_ema': float(self.adaptive_pl_preserve_score_ema),
             'adaptive_pl_correction_score_ema': float(self.adaptive_pl_correction_score_ema),
             'adaptive_pl_last_stage_progress': float(self.adaptive_pl_last_stage_progress),
             'adaptive_pl_last_release_score': float(self.adaptive_pl_last_release_score),
+            'adaptive_pl_last_preserve_score': float(self.adaptive_pl_last_preserve_score),
             'adaptive_pl_last_correction_score': float(self.adaptive_pl_last_correction_score),
             'adaptive_pl_last_effective_correction': float(self.adaptive_pl_last_effective_correction),
             'adaptive_pl_last_regime_code': float(self.adaptive_pl_last_regime_code),
@@ -674,6 +684,7 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/loss_risk'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/stage_progress'.format(self.cid), float(self.adaptive_pl_last_stage_progress), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/release_score'.format(self.cid), float(self.adaptive_pl_last_release_score), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/preserve_score'.format(self.cid), float(self.adaptive_pl_last_preserve_score), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/effective_correction'.format(self.cid), float(self.adaptive_pl_last_effective_correction), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/regime_code'.format(self.cid), float(self.adaptive_pl_last_regime_code), self.current_iter)
@@ -782,8 +793,22 @@ class MyClient(BaseClient):
         release_risk_threshold = float(getattr(self.args, 'risk_calibration_release_risk_threshold', 0.35))
         release_agreement_threshold = float(getattr(self.args, 'risk_calibration_release_agreement_threshold', 0.90))
         release_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_release_prior_gap_threshold', 0.015))
+        release_uncertain_threshold = float(getattr(self.args, 'risk_calibration_release_uncertain_threshold', 0.02))
+        preserve_risk_threshold = float(getattr(self.args, 'risk_calibration_preserve_risk_threshold', 0.65))
+        preserve_agreement_threshold = float(getattr(self.args, 'risk_calibration_preserve_agreement_threshold', 0.92))
+        preserve_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_preserve_prior_gap_threshold', 0.025))
+        preserve_uncertain_threshold = float(getattr(self.args, 'risk_calibration_preserve_uncertain_threshold', 0.04))
+        preserve_hard_ratio_threshold = float(getattr(self.args, 'risk_calibration_preserve_hard_ratio_threshold', 0.60))
         correction_risk_threshold = float(getattr(self.args, 'risk_calibration_correction_risk_threshold', 0.55))
         correction_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_correction_prior_gap_threshold', 0.03))
+        correction_agreement_threshold = float(getattr(self.args, 'risk_calibration_correction_agreement_threshold', 0.88))
+        correction_uncertain_threshold = float(getattr(self.args, 'risk_calibration_correction_uncertain_threshold', 0.06))
+        risk_agreement_credit = float(getattr(self.args, 'risk_calibration_risk_agreement_credit', 0.20))
+        release_min_correction = float(getattr(self.args, 'risk_calibration_release_min_correction', 0.02))
+        release_max_correction = float(getattr(self.args, 'risk_calibration_release_max_correction', 0.12))
+        preserve_min_correction = float(getattr(self.args, 'risk_calibration_preserve_min_correction', 0.25))
+        preserve_max_correction = float(getattr(self.args, 'risk_calibration_preserve_max_correction', 0.55))
+        correction_min_correction = float(getattr(self.args, 'risk_calibration_correction_min_correction', 0.75))
         regime_hysteresis = float(getattr(self.args, 'risk_calibration_regime_hysteresis', 0.05))
         outer_beta = float(getattr(self.args, 'beta', 1.0))
 
@@ -812,10 +837,27 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_prior_gap = 0.0
 
         if risk_calibration_enabled and valid_mask.any():
+            prior_risk_term = float(np.clip(self.adaptive_pl_prior_gap_ema / 0.05, 0.0, 1.0))
+            prob_risk_term = float(np.clip(self.adaptive_pl_prob_gap_ema / 0.03, 0.0, 1.0))
+            conf_risk_term = float(np.clip(self.adaptive_pl_conf_gap_ema / 0.03, 0.0, 1.0))
+            disagree_risk_term = float(np.clip(
+                (1.0 - self.adaptive_pl_lg_agreement_ema) / max(1e-6, 1.0 - correction_agreement_threshold),
+                0.0,
+                1.0,
+            ))
+            agreement_credit = float(np.clip(
+                (self.adaptive_pl_lg_agreement_ema - preserve_agreement_threshold) / max(1e-6, 1.0 - preserve_agreement_threshold),
+                0.0,
+                1.0,
+            ))
+            # Keep prior-gap as the main risk source, use probability/confidence gaps as auxiliaries,
+            # and explicitly reward high agreement so recovered clients can leave strict correction.
             risk_score = (
-                0.5 * min(self.adaptive_pl_prior_gap_ema / 0.05, 1.0)
-                + 0.25 * min(prob_gap_mean / 0.02, 1.0)
-                + 0.25 * min(conf_gap_mean / 0.02, 1.0)
+                0.40 * prior_risk_term
+                + 0.20 * prob_risk_term
+                + 0.10 * conf_risk_term
+                + 0.30 * disagree_risk_term
+                - (risk_agreement_credit * agreement_credit)
             )
             risk_score = float(np.clip(risk_score, 0.0, 1.0))
         else:
@@ -824,15 +866,21 @@ class MyClient(BaseClient):
 
         stage_progress = 0.0
         release_score = 0.0
+        preserve_score = 0.0
         correction_score = 0.0
         effective_correction = 0.0
-        regime_code = 1.0
+        regime_code = 0.0
         if risk_calibration_enabled:
             effective_correction = 1.0
             regime_code = 0.0
         if risk_calibration_enabled and stateful_release_enabled:
             release_start_iter = max(warmup_iters, release_start_iter)
             release_full_iter = max(release_start_iter + 1, release_full_iter)
+            release_uncertain_term = float(np.clip(
+                (release_uncertain_threshold - self.adaptive_pl_both_uncertain_ema) / max(release_uncertain_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
             release_risk_term = float(np.clip(
                 (release_risk_threshold - risk_score) / max(release_risk_threshold, 1e-6),
                 0.0,
@@ -848,7 +896,39 @@ class MyClient(BaseClient):
                 0.0,
                 1.0,
             ))
-            release_raw = min(release_risk_term, release_agreement_term, release_prior_term)
+            release_raw = min(release_risk_term, release_agreement_term, release_prior_term, release_uncertain_term)
+            preserve_risk_term = float(np.clip(
+                (preserve_risk_threshold - risk_score) / max(preserve_risk_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            preserve_agreement_term = float(np.clip(
+                (self.adaptive_pl_lg_agreement_ema - preserve_agreement_threshold) / max(1e-6, 1.0 - preserve_agreement_threshold),
+                0.0,
+                1.0,
+            ))
+            preserve_prior_term = float(np.clip(
+                (preserve_prior_gap_threshold - self.adaptive_pl_prior_gap_ema) / max(preserve_prior_gap_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            preserve_uncertain_term = float(np.clip(
+                (preserve_uncertain_threshold - self.adaptive_pl_both_uncertain_ema) / max(preserve_uncertain_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            preserve_hard_term = float(np.clip(
+                (self.adaptive_pl_last_hard_ratio - preserve_hard_ratio_threshold) / max(1e-6, 1.0 - preserve_hard_ratio_threshold),
+                0.0,
+                1.0,
+            ))
+            preserve_raw = min(
+                preserve_risk_term,
+                preserve_agreement_term,
+                preserve_prior_term,
+                preserve_uncertain_term,
+                preserve_hard_term,
+            )
             correction_risk_term = float(np.clip(
                 (risk_score - correction_risk_threshold) / max(1e-6, 1.0 - correction_risk_threshold),
                 0.0,
@@ -859,53 +939,96 @@ class MyClient(BaseClient):
                 0.0,
                 1.0,
             ))
-            correction_raw = max(correction_risk_term, correction_prior_term)
+            correction_agreement_term = float(np.clip(
+                (correction_agreement_threshold - self.adaptive_pl_lg_agreement_ema) / max(correction_agreement_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            correction_uncertain_term = float(np.clip(
+                (self.adaptive_pl_both_uncertain_ema - correction_uncertain_threshold) / max(correction_uncertain_threshold, 1e-6),
+                0.0,
+                1.0,
+            ))
+            correction_raw = max(
+                correction_risk_term,
+                correction_prior_term,
+                correction_agreement_term,
+                correction_uncertain_term,
+            )
             self.adaptive_pl_release_score_ema = (
                 regime_ema_momentum * self.adaptive_pl_release_score_ema
             ) + ((1.0 - regime_ema_momentum) * release_raw)
+            self.adaptive_pl_preserve_score_ema = (
+                regime_ema_momentum * self.adaptive_pl_preserve_score_ema
+            ) + ((1.0 - regime_ema_momentum) * preserve_raw)
             self.adaptive_pl_correction_score_ema = (
                 regime_ema_momentum * self.adaptive_pl_correction_score_ema
             ) + ((1.0 - regime_ema_momentum) * correction_raw)
 
             if self.current_iter >= release_start_iter:
-                # W4: use early unified correction only before T1; after T1, move to state-based routing.
+                # W4.1: early unified correction before T1, then route clients into
+                # correction / preserve / release instead of keeping a single conservative path.
                 stage_progress = float(np.clip(
                     (self.current_iter - release_start_iter) / float(release_full_iter - release_start_iter),
                     0.0,
                     1.0,
                 ))
-                release_drive = stage_progress * self.adaptive_pl_release_score_ema * (1.0 - self.adaptive_pl_correction_score_ema)
-                correction_drive = stage_progress * self.adaptive_pl_correction_score_ema * (1.0 - self.adaptive_pl_release_score_ema)
-                shared_anneal = 1.0 - stage_progress
-                release_score = float(np.clip(release_drive, 0.0, 1.0))
-                correction_score = float(np.clip(correction_drive, 0.0, 1.0))
-                effective_correction = float(np.clip(shared_anneal + correction_score, 0.0, 1.0))
-                # regime_code: 0 correction, 1 recovery, 2 release
-                if release_score > correction_score + regime_hysteresis:
-                    regime_code = 2.0
-                elif correction_score > release_score + regime_hysteresis:
-                    regime_code = 0.0
+                release_score = float(np.clip(stage_progress * self.adaptive_pl_release_score_ema, 0.0, 1.0))
+                preserve_score = float(np.clip(stage_progress * self.adaptive_pl_preserve_score_ema, 0.0, 1.0))
+                correction_score = float(np.clip(stage_progress * self.adaptive_pl_correction_score_ema, 0.0, 1.0))
+                candidate_scores = [correction_score, preserve_score, release_score]
+                best_regime = int(np.argmax(candidate_scores))
+                prev_regime = int(np.clip(round(self.adaptive_pl_last_regime_code), 0, 2))
+                if candidate_scores[prev_regime] + regime_hysteresis >= candidate_scores[best_regime]:
+                    regime_code = float(prev_regime)
                 else:
-                    regime_code = 1.0
+                    regime_code = float(best_regime)
+
+                correction_target = float(np.clip(max(correction_min_correction, correction_score), 0.0, 1.0))
+                preserve_target = float(np.clip(
+                    preserve_min_correction + (1.0 - preserve_score) * (preserve_max_correction - preserve_min_correction),
+                    0.0,
+                    1.0,
+                ))
+                release_target = float(np.clip(
+                    release_min_correction + (1.0 - release_score) * (release_max_correction - release_min_correction),
+                    0.0,
+                    1.0,
+                ))
+                regime_target = correction_target
+                if int(regime_code) == 1:
+                    regime_target = preserve_target
+                elif int(regime_code) == 2:
+                    regime_target = release_target
+                effective_correction = float(np.clip(
+                    ((1.0 - stage_progress) * 1.0) + (stage_progress * regime_target),
+                    0.0,
+                    1.0,
+                ))
             else:
                 release_score = 0.0
+                preserve_score = 0.0
                 correction_score = 1.0
                 effective_correction = 1.0
                 regime_code = 0.0
         elif risk_calibration_enabled:
             self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
+            self.adaptive_pl_preserve_score_ema = regime_ema_momentum * self.adaptive_pl_preserve_score_ema
             self.adaptive_pl_correction_score_ema = (
                 regime_ema_momentum * self.adaptive_pl_correction_score_ema
             ) + ((1.0 - regime_ema_momentum) * risk_score)
             release_score = 0.0
+            preserve_score = 0.0
             correction_score = 1.0
             effective_correction = 1.0
             regime_code = 0.0
         else:
             self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
+            self.adaptive_pl_preserve_score_ema = regime_ema_momentum * self.adaptive_pl_preserve_score_ema
             self.adaptive_pl_correction_score_ema = regime_ema_momentum * self.adaptive_pl_correction_score_ema
         self.adaptive_pl_last_stage_progress = stage_progress
         self.adaptive_pl_last_release_score = release_score
+        self.adaptive_pl_last_preserve_score = preserve_score
         self.adaptive_pl_last_correction_score = correction_score
         self.adaptive_pl_last_effective_correction = effective_correction
         self.adaptive_pl_last_regime_code = regime_code
@@ -2165,6 +2288,7 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_loss_risk'.format(self.cid)] = float(self.adaptive_pl_last_loss_risk)
                 metrics_['client_{}_adaptive_pl_stage_progress'.format(self.cid)] = float(self.adaptive_pl_last_stage_progress)
                 metrics_['client_{}_adaptive_pl_release_score'.format(self.cid)] = float(self.adaptive_pl_last_release_score)
+                metrics_['client_{}_adaptive_pl_preserve_score'.format(self.cid)] = float(self.adaptive_pl_last_preserve_score)
                 metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
                 metrics_['client_{}_adaptive_pl_effective_correction'.format(self.cid)] = float(self.adaptive_pl_last_effective_correction)
                 metrics_['client_{}_adaptive_pl_regime_code'.format(self.cid)] = float(self.adaptive_pl_last_regime_code)
@@ -2460,12 +2584,40 @@ def main():
                         help='Clients above this local-global agreement become eligible for the W4 release regime.')
     parser.add_argument('--risk_calibration_release_prior_gap_threshold', type=float, default=0.015,
                         help='Clients below this prior-gap EMA become eligible for the W4 release regime.')
+    parser.add_argument('--risk_calibration_release_uncertain_threshold', type=float, default=0.02,
+                        help='Clients below this both-uncertain EMA become eligible for the W4 release regime.')
+    parser.add_argument('--risk_calibration_preserve_risk_threshold', type=float, default=0.65,
+                        help='Clients below this risk level can leave strict correction and enter preserve.')
+    parser.add_argument('--risk_calibration_preserve_agreement_threshold', type=float, default=0.92,
+                        help='Clients above this agreement can enter the W4 preserve regime.')
+    parser.add_argument('--risk_calibration_preserve_prior_gap_threshold', type=float, default=0.025,
+                        help='Clients below this prior-gap EMA can enter the W4 preserve regime.')
+    parser.add_argument('--risk_calibration_preserve_uncertain_threshold', type=float, default=0.04,
+                        help='Clients below this both-uncertain EMA can enter the W4 preserve regime.')
+    parser.add_argument('--risk_calibration_preserve_hard_ratio_threshold', type=float, default=0.60,
+                        help='Clients above this hard-ratio can enter the W4 preserve regime.')
     parser.add_argument('--risk_calibration_correction_risk_threshold', type=float, default=0.55,
                         help='Clients above this risk level stay in the W4 correction regime.')
     parser.add_argument('--risk_calibration_correction_prior_gap_threshold', type=float, default=0.03,
                         help='Clients above this prior-gap EMA stay in the W4 correction regime.')
+    parser.add_argument('--risk_calibration_correction_agreement_threshold', type=float, default=0.88,
+                        help='Clients below this agreement are pushed toward the W4 correction regime.')
+    parser.add_argument('--risk_calibration_correction_uncertain_threshold', type=float, default=0.06,
+                        help='Clients above this both-uncertain EMA are pushed toward the W4 correction regime.')
+    parser.add_argument('--risk_calibration_risk_agreement_credit', type=float, default=0.20,
+                        help='Amount of risk reduction granted to clients with persistently high agreement.')
+    parser.add_argument('--risk_calibration_release_min_correction', type=float, default=0.02,
+                        help='Minimum correction strength kept for clients in release.')
+    parser.add_argument('--risk_calibration_release_max_correction', type=float, default=0.12,
+                        help='Maximum correction strength kept for clients in release.')
+    parser.add_argument('--risk_calibration_preserve_min_correction', type=float, default=0.25,
+                        help='Minimum correction strength kept for clients in preserve.')
+    parser.add_argument('--risk_calibration_preserve_max_correction', type=float, default=0.55,
+                        help='Maximum correction strength kept for clients in preserve.')
+    parser.add_argument('--risk_calibration_correction_min_correction', type=float, default=0.75,
+                        help='Minimum correction strength kept for clients in correction after release starts.')
     parser.add_argument('--risk_calibration_regime_hysteresis', type=float, default=0.05,
-                        help='Margin used when mapping continuous W4 scores to correction/recovery/release regime codes.')
+                        help='Margin used when mapping continuous W4 scores to correction/preserve/release regime codes.')
     parser.add_argument('--max_train_samples_per_client', type=int, default=0,
                         help='Cap the number of training samples loaded per client. 0 keeps the full dataset.')
     parser.add_argument('--max_val_samples_per_client', type=int, default=0,
@@ -2617,8 +2769,25 @@ def main():
     assert 0.0 <= args.risk_calibration_release_risk_threshold <= 1.0
     assert 0.0 <= args.risk_calibration_release_agreement_threshold <= 1.0
     assert args.risk_calibration_release_prior_gap_threshold >= 0.0
+    assert args.risk_calibration_release_uncertain_threshold >= 0.0
+    assert 0.0 <= args.risk_calibration_preserve_risk_threshold <= 1.0
+    assert 0.0 <= args.risk_calibration_preserve_agreement_threshold <= 1.0
+    assert args.risk_calibration_preserve_prior_gap_threshold >= 0.0
+    assert args.risk_calibration_preserve_uncertain_threshold >= 0.0
+    assert 0.0 <= args.risk_calibration_preserve_hard_ratio_threshold <= 1.0
     assert 0.0 <= args.risk_calibration_correction_risk_threshold <= 1.0
     assert args.risk_calibration_correction_prior_gap_threshold >= 0.0
+    assert 0.0 <= args.risk_calibration_correction_agreement_threshold <= 1.0
+    assert args.risk_calibration_correction_uncertain_threshold >= 0.0
+    assert args.risk_calibration_risk_agreement_credit >= 0.0
+    assert 0.0 <= args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= 1.0
+    assert 0.0 <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= 1.0
+    assert 0.0 <= args.risk_calibration_correction_min_correction <= 1.0
+    assert args.risk_calibration_release_risk_threshold <= args.risk_calibration_preserve_risk_threshold <= args.risk_calibration_correction_risk_threshold
+    assert args.risk_calibration_release_agreement_threshold >= args.risk_calibration_preserve_agreement_threshold >= args.risk_calibration_correction_agreement_threshold
+    assert args.risk_calibration_release_prior_gap_threshold <= args.risk_calibration_preserve_prior_gap_threshold <= args.risk_calibration_correction_prior_gap_threshold
+    assert args.risk_calibration_release_uncertain_threshold <= args.risk_calibration_preserve_uncertain_threshold <= args.risk_calibration_correction_uncertain_threshold
+    assert args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= args.risk_calibration_correction_min_correction
     assert args.risk_calibration_regime_hysteresis >= 0.0
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1

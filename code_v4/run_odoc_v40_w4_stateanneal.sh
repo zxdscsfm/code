@@ -1,6 +1,6 @@
 #!/bin/bash
-# ODOC W4:
-# W1' backbone + early unified correction + late state-based release/correction routing
+# ODOC W4.1:
+# W1' backbone + early unified correction + late correction/preserve/release routing
 # paper-aligned schedule: global 5000 / local 10
 
 #SBATCH --job-name=FedLPPA_ODOC_W4
@@ -20,7 +20,7 @@ export PYTHONUNBUFFERED=1
 
 cd /data/jianbingshen/yanghongji/FedLPPA/code_v4
 
-METHOD_TAG="${METHOD_TAG:-v40_w4_stateanneal_paper_r500_l10}"
+METHOD_TAG="${METHOD_TAG:-v41_w4_tristate_paper_r500_l10}"
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8174}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
@@ -97,11 +97,25 @@ BASE_ARGS="\
 --risk_calibration_release_start_iter 800 \
 --risk_calibration_release_full_iter 1800 \
 --risk_calibration_regime_ema_momentum 0.9 \
---risk_calibration_release_risk_threshold 0.35 \
---risk_calibration_release_agreement_threshold 0.90 \
+--risk_calibration_release_risk_threshold 0.50 \
+--risk_calibration_release_agreement_threshold 0.95 \
 --risk_calibration_release_prior_gap_threshold 0.015 \
---risk_calibration_correction_risk_threshold 0.55 \
---risk_calibration_correction_prior_gap_threshold 0.03 \
+--risk_calibration_release_uncertain_threshold 0.02 \
+--risk_calibration_preserve_risk_threshold 0.72 \
+--risk_calibration_preserve_agreement_threshold 0.92 \
+--risk_calibration_preserve_prior_gap_threshold 0.025 \
+--risk_calibration_preserve_uncertain_threshold 0.05 \
+--risk_calibration_preserve_hard_ratio_threshold 0.55 \
+--risk_calibration_correction_risk_threshold 0.75 \
+--risk_calibration_correction_prior_gap_threshold 0.035 \
+--risk_calibration_correction_agreement_threshold 0.86 \
+--risk_calibration_correction_uncertain_threshold 0.08 \
+--risk_calibration_risk_agreement_credit 0.25 \
+--risk_calibration_release_min_correction 0.02 \
+--risk_calibration_release_max_correction 0.10 \
+--risk_calibration_preserve_min_correction 0.25 \
+--risk_calibration_preserve_max_correction 0.50 \
+--risk_calibration_correction_min_correction 0.70 \
 --risk_calibration_regime_hysteresis 0.05"
 
 echo "Starting ODOC W4 staged client-state-aware adaptive PL run"
