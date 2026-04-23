@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 import timeit
 import copy
+import shutil
 from functools import reduce
 import math
 from torch.cuda.amp import autocast, GradScaler
@@ -38,6 +39,27 @@ from matplotlib import rcParams
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+
+PROTOTYPE_CLASS_NAMES = ('bg', 'fg1', 'fg2')
+
+
+def inject_prototype_bank_into_config(config, prototype_bank_state):
+    config = dict(config)
+    if not prototype_bank_state:
+        config['proto_bank_ready'] = 0
+        return config
+
+    ready = 1
+    for class_name in PROTOTYPE_CLASS_NAMES:
+        proto_value = prototype_bank_state.get(class_name)
+        if proto_value is None:
+            ready = 0
+            continue
+        config[f'proto_bank_{class_name}'] = fl.common.ndarray_to_bytes(
+            np.asarray(proto_value, dtype=np.float32)
+        )
+    config['proto_bank_ready'] = ready
+    return config
 
 
 class BaseClient(fl.client.Client):
@@ -293,7 +315,7 @@ def evaluate_uncertainty(args, model, dataloader, amp=False):
 
 class MyServer(Server):
 
-    def __init__(self, args, writer, state_dict_keys, train_scalar_metrics, train_image_metrics, val_metrics, client_manager, strategy):
+    def __init__(self, args, writer, state_dict_keys, train_scalar_metrics, train_image_metrics, val_metrics, client_manager, strategy, prototype_bank_state=None):
         super(MyServer, self).__init__(client_manager=client_manager, strategy=strategy)
         self.args = args
         self.writer = writer
@@ -301,6 +323,7 @@ class MyServer(Server):
         self.train_scalar_metrics = train_scalar_metrics
         self.train_image_metrics = train_image_metrics
         self.val_metrics = val_metrics
+        self.prototype_bank_state = {} if prototype_bank_state is None else prototype_bank_state
 
     # pylint: disable=too-many-locals
     def fit(self, num_rounds, timeout):
@@ -540,6 +563,10 @@ class MyServer(Server):
                                                                 client_id, self.args.model))
                                 torch.save(client_state_dict, client_save_mode_path)
                                 torch.save(client_state_dict, client_save_best)
+                                adaptive_state_latest = os.path.join(snapshot_path, 'client_{}_adaptive_pl_latest.pth'.format(client_id))
+                                adaptive_state_best = os.path.join(snapshot_path, 'client_{}_adaptive_pl_best.pth'.format(client_id))
+                                if os.path.exists(adaptive_state_latest):
+                                    shutil.copyfile(adaptive_state_latest, adaptive_state_best)
                                 log(INFO, 'save model to {}'.format(client_save_mode_path))
 
             if iter_num > 0 and iter_num % 3000 == 0:
