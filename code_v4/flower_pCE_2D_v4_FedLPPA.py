@@ -500,6 +500,10 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_correction_score = 0.0
         self.adaptive_pl_last_effective_correction = 0.0
         self.adaptive_pl_last_regime_code = 0.0
+        self.adaptive_pl_release_streak = 0.0
+        self.adaptive_pl_last_release_ready = 0.0
+        self.adaptive_pl_last_high_risk = 0.0
+        self.adaptive_pl_gate_release_armed = 0.0
 
     def _get_adaptive_pl_state_path(self, tag='latest'):
         return os.path.join(
@@ -613,6 +617,18 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_regime_code = float(
             state.get('adaptive_pl_last_regime_code', self.adaptive_pl_last_regime_code)
         )
+        self.adaptive_pl_release_streak = float(
+            state.get('adaptive_pl_release_streak', self.adaptive_pl_release_streak)
+        )
+        self.adaptive_pl_last_release_ready = float(
+            state.get('adaptive_pl_last_release_ready', self.adaptive_pl_last_release_ready)
+        )
+        self.adaptive_pl_last_high_risk = float(
+            state.get('adaptive_pl_last_high_risk', self.adaptive_pl_last_high_risk)
+        )
+        self.adaptive_pl_gate_release_armed = float(
+            state.get('adaptive_pl_gate_release_armed', self.adaptive_pl_gate_release_armed)
+        )
 
     def _save_adaptive_pl_state(self, tag='latest'):
         if not self._adaptive_pl_is_enabled():
@@ -652,6 +668,10 @@ class MyClient(BaseClient):
             'adaptive_pl_last_correction_score': float(self.adaptive_pl_last_correction_score),
             'adaptive_pl_last_effective_correction': float(self.adaptive_pl_last_effective_correction),
             'adaptive_pl_last_regime_code': float(self.adaptive_pl_last_regime_code),
+            'adaptive_pl_release_streak': float(self.adaptive_pl_release_streak),
+            'adaptive_pl_last_release_ready': float(self.adaptive_pl_last_release_ready),
+            'adaptive_pl_last_high_risk': float(self.adaptive_pl_last_high_risk),
+            'adaptive_pl_gate_release_armed': float(self.adaptive_pl_gate_release_armed),
         }
         torch.save(state, self._get_adaptive_pl_state_path(tag=tag))
 
@@ -688,6 +708,10 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/effective_correction'.format(self.cid), float(self.adaptive_pl_last_effective_correction), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/regime_code'.format(self.cid), float(self.adaptive_pl_last_regime_code), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/release_streak'.format(self.cid), float(self.adaptive_pl_release_streak), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/release_ready'.format(self.cid), float(self.adaptive_pl_last_release_ready), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/high_risk_flag'.format(self.cid), float(self.adaptive_pl_last_high_risk), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/gate_release_armed'.format(self.cid), float(self.adaptive_pl_gate_release_armed), self.current_iter)
         for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
             writer.add_scalar('client_{}/adaptive_pl/tau_bin_{}'.format(self.cid, bin_idx), float(tau_val), self.current_iter)
             observed_accept = self.adaptive_pl_last_observed_accept[bin_idx]
@@ -810,6 +834,11 @@ class MyClient(BaseClient):
         preserve_max_correction = float(getattr(self.args, 'risk_calibration_preserve_max_correction', 0.55))
         correction_min_correction = float(getattr(self.args, 'risk_calibration_correction_min_correction', 0.75))
         regime_hysteresis = float(getattr(self.args, 'risk_calibration_regime_hysteresis', 0.05))
+        routing_mode = str(getattr(self.args, 'risk_calibration_routing_mode', 'score')).lower()
+        gate_release_start_iter = int(getattr(self.args, 'risk_calibration_gate_release_start_iter', max(release_start_iter, warmup_iters + 400)))
+        release_streak_required = int(getattr(self.args, 'risk_calibration_release_streak_required', 3))
+        release_streak_decay = int(getattr(self.args, 'risk_calibration_release_streak_decay', 1))
+        release_hard_ratio_threshold = float(getattr(self.args, 'risk_calibration_release_hard_ratio_threshold', preserve_hard_ratio_threshold))
         outer_beta = float(getattr(self.args, 'beta', 1.0))
 
         valid_mask = unlabeled_mask.bool()
@@ -870,12 +899,17 @@ class MyClient(BaseClient):
         correction_score = 0.0
         effective_correction = 0.0
         regime_code = 0.0
+        release_ready_flag = 0.0
+        high_risk_flag = 0.0
         if risk_calibration_enabled:
             effective_correction = 1.0
             regime_code = 0.0
         if risk_calibration_enabled and stateful_release_enabled:
             release_start_iter = max(warmup_iters, release_start_iter)
+            gate_release_start_iter = max(release_start_iter, gate_release_start_iter)
             release_full_iter = max(release_start_iter + 1, release_full_iter)
+            release_streak_required = max(1, release_streak_required)
+            release_streak_decay = max(1, release_streak_decay)
             release_uncertain_term = float(np.clip(
                 (release_uncertain_threshold - self.adaptive_pl_both_uncertain_ema) / max(release_uncertain_threshold, 1e-6),
                 0.0,
@@ -976,14 +1010,7 @@ class MyClient(BaseClient):
                 release_score = float(np.clip(stage_progress * self.adaptive_pl_release_score_ema, 0.0, 1.0))
                 preserve_score = float(np.clip(stage_progress * self.adaptive_pl_preserve_score_ema, 0.0, 1.0))
                 correction_score = float(np.clip(stage_progress * self.adaptive_pl_correction_score_ema, 0.0, 1.0))
-                candidate_scores = [correction_score, preserve_score, release_score]
-                best_regime = int(np.argmax(candidate_scores))
                 prev_regime = int(np.clip(round(self.adaptive_pl_last_regime_code), 0, 2))
-                if candidate_scores[prev_regime] + regime_hysteresis >= candidate_scores[best_regime]:
-                    regime_code = float(prev_regime)
-                else:
-                    regime_code = float(best_regime)
-
                 correction_target = float(np.clip(max(correction_min_correction, correction_score), 0.0, 1.0))
                 preserve_target = float(np.clip(
                     preserve_min_correction + (1.0 - preserve_score) * (preserve_max_correction - preserve_min_correction),
@@ -995,22 +1022,97 @@ class MyClient(BaseClient):
                     0.0,
                     1.0,
                 ))
-                regime_target = correction_target
-                if int(regime_code) == 1:
-                    regime_target = preserve_target
-                elif int(regime_code) == 2:
-                    regime_target = release_target
-                effective_correction = float(np.clip(
-                    ((1.0 - stage_progress) * 1.0) + (stage_progress * regime_target),
-                    0.0,
-                    1.0,
-                ))
+
+                if routing_mode != 'gated' or self.current_iter < gate_release_start_iter:
+                    # Keep W4.1 behavior before post-1200 W4.2 gate.
+                    candidate_scores = [correction_score, preserve_score, release_score]
+                    best_regime = int(np.argmax(candidate_scores))
+                    if candidate_scores[prev_regime] + regime_hysteresis >= candidate_scores[best_regime]:
+                        regime_code = float(prev_regime)
+                    else:
+                        regime_code = float(best_regime)
+                    regime_target = correction_target
+                    if int(regime_code) == 1:
+                        regime_target = preserve_target
+                    elif int(regime_code) == 2:
+                        regime_target = release_target
+                    effective_correction = float(np.clip(
+                        ((1.0 - stage_progress) * 1.0) + (stage_progress * regime_target),
+                        0.0,
+                        1.0,
+                    ))
+                    self.adaptive_pl_release_streak = max(
+                        0.0,
+                        self.adaptive_pl_release_streak - float(release_streak_decay),
+                    )
+                    self.adaptive_pl_gate_release_armed = 0.0
+                else:
+                    # W4.2: gated sequential routing (correction -> release -> preserve)
+                    high_risk = bool(
+                        (risk_score >= correction_risk_threshold)
+                        or (self.adaptive_pl_prior_gap_ema >= correction_prior_gap_threshold)
+                        or (self.adaptive_pl_lg_agreement_ema <= correction_agreement_threshold)
+                        or (self.adaptive_pl_both_uncertain_ema >= correction_uncertain_threshold)
+                    )
+                    release_ready = bool(
+                        (risk_score <= release_risk_threshold)
+                        and (self.adaptive_pl_lg_agreement_ema >= release_agreement_threshold)
+                        and (self.adaptive_pl_prior_gap_ema <= release_prior_gap_threshold)
+                        and (self.adaptive_pl_both_uncertain_ema <= release_uncertain_threshold)
+                        and (self.adaptive_pl_last_hard_ratio >= release_hard_ratio_threshold)
+                    )
+                    release_keep_ready = bool(
+                        (risk_score <= preserve_risk_threshold)
+                        and (self.adaptive_pl_lg_agreement_ema >= preserve_agreement_threshold)
+                        and (self.adaptive_pl_prior_gap_ema <= preserve_prior_gap_threshold)
+                        and (self.adaptive_pl_both_uncertain_ema <= preserve_uncertain_threshold)
+                        and (self.adaptive_pl_last_hard_ratio >= preserve_hard_ratio_threshold)
+                    )
+                    high_risk_flag = 1.0 if high_risk else 0.0
+                    release_ready_flag = 1.0 if release_ready else 0.0
+
+                    if high_risk:
+                        self.adaptive_pl_release_streak = 0.0
+                        self.adaptive_pl_gate_release_armed = 0.0
+                        regime_code = 0.0
+                    else:
+                        if release_ready:
+                            self.adaptive_pl_release_streak = min(
+                                float(release_streak_required + 8),
+                                self.adaptive_pl_release_streak + 1.0,
+                            )
+                        elif self.adaptive_pl_gate_release_armed >= 1.0 and prev_regime == 2 and release_keep_ready:
+                            self.adaptive_pl_release_streak = max(
+                                self.adaptive_pl_release_streak,
+                                float(max(0, release_streak_required - 1)),
+                            )
+                        else:
+                            self.adaptive_pl_release_streak = max(
+                                0.0,
+                                self.adaptive_pl_release_streak - float(release_streak_decay),
+                            )
+
+                        release_triggered = self.adaptive_pl_release_streak >= float(release_streak_required)
+                        if (not release_triggered) and self.adaptive_pl_gate_release_armed >= 1.0 and prev_regime == 2 and release_keep_ready:
+                            release_triggered = self.adaptive_pl_release_streak >= float(max(0, release_streak_required - 1))
+                        regime_code = 2.0 if release_triggered else 1.0
+                        if release_triggered:
+                            self.adaptive_pl_gate_release_armed = 1.0
+
+                    regime_target = correction_target
+                    if int(regime_code) == 1:
+                        regime_target = preserve_target
+                    elif int(regime_code) == 2:
+                        regime_target = release_target
+                    effective_correction = regime_target
             else:
                 release_score = 0.0
                 preserve_score = 0.0
                 correction_score = 1.0
                 effective_correction = 1.0
                 regime_code = 0.0
+                self.adaptive_pl_release_streak = 0.0
+                self.adaptive_pl_gate_release_armed = 0.0
         elif risk_calibration_enabled:
             self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
             self.adaptive_pl_preserve_score_ema = regime_ema_momentum * self.adaptive_pl_preserve_score_ema
@@ -1022,16 +1124,22 @@ class MyClient(BaseClient):
             correction_score = 1.0
             effective_correction = 1.0
             regime_code = 0.0
+            self.adaptive_pl_release_streak = 0.0
+            self.adaptive_pl_gate_release_armed = 0.0
         else:
             self.adaptive_pl_release_score_ema = regime_ema_momentum * self.adaptive_pl_release_score_ema
             self.adaptive_pl_preserve_score_ema = regime_ema_momentum * self.adaptive_pl_preserve_score_ema
             self.adaptive_pl_correction_score_ema = regime_ema_momentum * self.adaptive_pl_correction_score_ema
+            self.adaptive_pl_release_streak = 0.0
+            self.adaptive_pl_gate_release_armed = 0.0
         self.adaptive_pl_last_stage_progress = stage_progress
         self.adaptive_pl_last_release_score = release_score
         self.adaptive_pl_last_preserve_score = preserve_score
         self.adaptive_pl_last_correction_score = correction_score
         self.adaptive_pl_last_effective_correction = effective_correction
         self.adaptive_pl_last_regime_code = regime_code
+        self.adaptive_pl_last_release_ready = release_ready_flag
+        self.adaptive_pl_last_high_risk = high_risk_flag
 
         self.adaptive_pl_last_observed_accept[:] = np.nan
         self.adaptive_pl_last_score_mean[:] = np.nan
@@ -2292,6 +2400,10 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
                 metrics_['client_{}_adaptive_pl_effective_correction'.format(self.cid)] = float(self.adaptive_pl_last_effective_correction)
                 metrics_['client_{}_adaptive_pl_regime_code'.format(self.cid)] = float(self.adaptive_pl_last_regime_code)
+                metrics_['client_{}_adaptive_pl_release_streak'.format(self.cid)] = float(self.adaptive_pl_release_streak)
+                metrics_['client_{}_adaptive_pl_release_ready'.format(self.cid)] = float(self.adaptive_pl_last_release_ready)
+                metrics_['client_{}_adaptive_pl_high_risk_flag'.format(self.cid)] = float(self.adaptive_pl_last_high_risk)
+                metrics_['client_{}_adaptive_pl_gate_release_armed'.format(self.cid)] = float(self.adaptive_pl_gate_release_armed)
                 for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
                     metrics_['client_{}_adaptive_pl_tau_bin_{}'.format(self.cid, bin_idx)] = float(tau_val)
                     metrics_['client_{}_adaptive_pl_bin_count_{}'.format(self.cid, bin_idx)] = int(self.adaptive_pl_last_bin_counts[bin_idx])
@@ -2618,6 +2730,16 @@ def main():
                         help='Minimum correction strength kept for clients in correction after release starts.')
     parser.add_argument('--risk_calibration_regime_hysteresis', type=float, default=0.05,
                         help='Margin used when mapping continuous W4 scores to correction/preserve/release regime codes.')
+    parser.add_argument('--risk_calibration_routing_mode', type=str, default='score',
+                        help='W4 routing mode: score keeps W4.1 score competition; gated enables W4.2 sequential gate.')
+    parser.add_argument('--risk_calibration_gate_release_start_iter', type=int, default=1200,
+                        help='W4.2 post-mid-stage gate start. Before this iter keep W4.1-style score routing; after this iter use gated sequential routing.')
+    parser.add_argument('--risk_calibration_release_streak_required', type=int, default=3,
+                        help='Minimum consecutive release-ready checks required before entering release in W4.2.')
+    parser.add_argument('--risk_calibration_release_streak_decay', type=int, default=1,
+                        help='How much release streak decays per step when release-ready condition is not satisfied.')
+    parser.add_argument('--risk_calibration_release_hard_ratio_threshold', type=float, default=0.60,
+                        help='Additional hard-ratio gate for W4.2 release trigger.')
     parser.add_argument('--max_train_samples_per_client', type=int, default=0,
                         help='Cap the number of training samples loaded per client. 0 keeps the full dataset.')
     parser.add_argument('--max_val_samples_per_client', type=int, default=0,
@@ -2789,6 +2911,13 @@ def main():
     assert args.risk_calibration_release_uncertain_threshold <= args.risk_calibration_preserve_uncertain_threshold <= args.risk_calibration_correction_uncertain_threshold
     assert args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= args.risk_calibration_correction_min_correction
     assert args.risk_calibration_regime_hysteresis >= 0.0
+    assert args.risk_calibration_routing_mode.lower() in ['score', 'gated']
+    assert args.risk_calibration_gate_release_start_iter >= 0
+    if args.risk_calibration_routing_mode.lower() == 'gated':
+        assert args.risk_calibration_gate_release_start_iter >= args.risk_calibration_release_start_iter
+    assert args.risk_calibration_release_streak_required >= 1
+    assert args.risk_calibration_release_streak_decay >= 1
+    assert 0.0 <= args.risk_calibration_release_hard_ratio_threshold <= 1.0
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1
     if args.seed_support_enabled == 1:
