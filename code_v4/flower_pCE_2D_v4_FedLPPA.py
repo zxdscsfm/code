@@ -506,6 +506,10 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_release_ready = 0.0
         self.adaptive_pl_last_high_risk = 0.0
         self.adaptive_pl_gate_release_armed = 0.0
+        self.adaptive_pl_hard_ratio_ema = 1.0
+        self.adaptive_pl_last_w6_tail_active = 0.0
+        self.adaptive_pl_last_w6_tail_strength = 0.0
+        self.adaptive_pl_last_w6_tail_votes = 0.0
 
     def _get_adaptive_pl_state_path(self, tag='latest'):
         return os.path.join(
@@ -637,6 +641,18 @@ class MyClient(BaseClient):
         self.adaptive_pl_gate_release_armed = float(
             state.get('adaptive_pl_gate_release_armed', self.adaptive_pl_gate_release_armed)
         )
+        self.adaptive_pl_hard_ratio_ema = float(
+            state.get('adaptive_pl_hard_ratio_ema', self.adaptive_pl_hard_ratio_ema)
+        )
+        self.adaptive_pl_last_w6_tail_active = float(
+            state.get('adaptive_pl_last_w6_tail_active', self.adaptive_pl_last_w6_tail_active)
+        )
+        self.adaptive_pl_last_w6_tail_strength = float(
+            state.get('adaptive_pl_last_w6_tail_strength', self.adaptive_pl_last_w6_tail_strength)
+        )
+        self.adaptive_pl_last_w6_tail_votes = float(
+            state.get('adaptive_pl_last_w6_tail_votes', self.adaptive_pl_last_w6_tail_votes)
+        )
 
     def _save_adaptive_pl_state(self, tag='latest'):
         if not self._adaptive_pl_is_enabled():
@@ -682,6 +698,10 @@ class MyClient(BaseClient):
             'adaptive_pl_last_release_ready': float(self.adaptive_pl_last_release_ready),
             'adaptive_pl_last_high_risk': float(self.adaptive_pl_last_high_risk),
             'adaptive_pl_gate_release_armed': float(self.adaptive_pl_gate_release_armed),
+            'adaptive_pl_hard_ratio_ema': float(self.adaptive_pl_hard_ratio_ema),
+            'adaptive_pl_last_w6_tail_active': float(self.adaptive_pl_last_w6_tail_active),
+            'adaptive_pl_last_w6_tail_strength': float(self.adaptive_pl_last_w6_tail_strength),
+            'adaptive_pl_last_w6_tail_votes': float(self.adaptive_pl_last_w6_tail_votes),
         }
         torch.save(state, self._get_adaptive_pl_state_path(tag=tag))
 
@@ -721,6 +741,10 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/effective_correction'.format(self.cid), float(self.adaptive_pl_last_effective_correction), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/hard_control'.format(self.cid), float(self.adaptive_pl_last_hard_control), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/calibration_control'.format(self.cid), float(self.adaptive_pl_last_calibration_control), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/hard_ratio_ema'.format(self.cid), float(self.adaptive_pl_hard_ratio_ema), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/w6_tail_active'.format(self.cid), float(self.adaptive_pl_last_w6_tail_active), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/w6_tail_strength'.format(self.cid), float(self.adaptive_pl_last_w6_tail_strength), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/w6_tail_votes'.format(self.cid), float(self.adaptive_pl_last_w6_tail_votes), self.current_iter)
         for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
             writer.add_scalar('client_{}/adaptive_pl/tau_bin_{}'.format(self.cid, bin_idx), float(tau_val), self.current_iter)
             observed_accept = self.adaptive_pl_last_observed_accept[bin_idx]
@@ -818,6 +842,15 @@ class MyClient(BaseClient):
         w5_end_iter = int(getattr(self.args, 'risk_calibration_w5_end_iter', max(warmup_iters + 2, warmup_iters + 1800)))
         w5_min_correction = float(getattr(self.args, 'risk_calibration_w5_min_correction', 0.10))
         w5_risk_scale = float(getattr(self.args, 'risk_calibration_w5_risk_scale', 0.40))
+        w6_late_tail_enabled = bool(getattr(self.args, 'risk_calibration_w6_late_tail_enabled', 0))
+        w6_tail_start_iter = int(getattr(self.args, 'risk_calibration_w6_tail_start_iter', -1))
+        w6_tail_min_votes = int(getattr(self.args, 'risk_calibration_w6_tail_min_votes', 2))
+        w6_tail_risk_threshold = float(getattr(self.args, 'risk_calibration_w6_tail_risk_threshold', 0.55))
+        w6_tail_prior_gap_threshold = float(getattr(self.args, 'risk_calibration_w6_tail_prior_gap_threshold', 0.025))
+        w6_tail_hard_ratio_threshold = float(getattr(self.args, 'risk_calibration_w6_tail_hard_ratio_threshold', 0.50))
+        w6_tail_peak_fraction = float(getattr(self.args, 'risk_calibration_w6_tail_peak_fraction', 0.30))
+        w6_tail_min_correction = float(getattr(self.args, 'risk_calibration_w6_tail_min_correction', 0.03))
+        w6_tail_risk_scale = float(getattr(self.args, 'risk_calibration_w6_tail_risk_scale', 0.12))
 
         valid_mask = unlabeled_mask.bool()
         if valid_mask.any():
@@ -890,27 +923,11 @@ class MyClient(BaseClient):
             stage_progress = 0.0
         calibration_target = float(np.clip(w5_min_correction + (w5_risk_scale * risk_score), 0.0, 1.0))
         calibration_control = float(np.clip(stage_progress * calibration_target, 0.0, 1.0))
+        tail_start_iter = w5_end_iter if w6_tail_start_iter < 0 else w6_tail_start_iter
+        tail_strength = 0.0
+        tail_active = 0.0
+        weak_votes = 0
         hard_control = 0.0
-
-        self.adaptive_pl_last_stage_progress = stage_progress
-        self.adaptive_pl_last_release_score = 0.0
-        self.adaptive_pl_last_preserve_score = calibration_control
-        self.adaptive_pl_last_correction_score = risk_score
-        self.adaptive_pl_last_effective_correction = calibration_control
-        self.adaptive_pl_last_hard_control = hard_control
-        self.adaptive_pl_last_calibration_control = calibration_control
-        self.adaptive_pl_last_regime_code = 0.0
-        self.adaptive_pl_release_streak = 0.0
-        self.adaptive_pl_last_release_ready = 0.0
-        self.adaptive_pl_last_high_risk = 0.0
-        self.adaptive_pl_gate_release_armed = 0.0
-        self.adaptive_pl_release_score_ema = ema_momentum * self.adaptive_pl_release_score_ema
-        self.adaptive_pl_preserve_score_ema = (
-            ema_momentum * self.adaptive_pl_preserve_score_ema
-        ) + ((1.0 - ema_momentum) * calibration_control)
-        self.adaptive_pl_correction_score_ema = (
-            ema_momentum * self.adaptive_pl_correction_score_ema
-        ) + ((1.0 - ema_momentum) * risk_score)
 
         self.adaptive_pl_last_observed_accept[:] = np.nan
         self.adaptive_pl_last_score_mean[:] = np.nan
@@ -939,6 +956,59 @@ class MyClient(BaseClient):
             both_uncertain = torch.zeros_like(score, dtype=torch.bool)
             hard_mask = valid_mask
             soft_mask = torch.zeros_like(score, dtype=torch.bool)
+
+        valid_count = float(valid_mask.float().sum().item())
+        if valid_count > 0:
+            hard_ratio_current = float(hard_mask.float().sum().item() / valid_count)
+            hard_ratio_gate = (
+                ema_momentum * self.adaptive_pl_hard_ratio_ema
+            ) + ((1.0 - ema_momentum) * hard_ratio_current)
+        else:
+            hard_ratio_current = 0.0
+            hard_ratio_gate = ema_momentum * self.adaptive_pl_hard_ratio_ema
+
+        if valid_count > 0:
+            if risk_score >= w6_tail_risk_threshold:
+                weak_votes += 1
+            if self.adaptive_pl_prior_gap_ema >= w6_tail_prior_gap_threshold:
+                weak_votes += 1
+            if hard_ratio_gate <= w6_tail_hard_ratio_threshold:
+                weak_votes += 1
+
+            if (
+                w6_late_tail_enabled
+                and self.current_iter >= tail_start_iter
+                and weak_votes >= w6_tail_min_votes
+            ):
+                tail_active = 1.0
+                tail_floor = float(np.clip(w6_tail_min_correction + (w6_tail_risk_scale * risk_score), 0.0, 1.0))
+                tail_cap = float(np.clip(w6_tail_peak_fraction * calibration_target, 0.0, 1.0))
+                tail_strength = min(tail_floor, tail_cap)
+                calibration_control = max(calibration_control, tail_strength)
+
+        self.adaptive_pl_last_stage_progress = stage_progress
+        self.adaptive_pl_last_release_score = 0.0
+        self.adaptive_pl_last_preserve_score = calibration_control
+        self.adaptive_pl_last_correction_score = risk_score
+        self.adaptive_pl_last_effective_correction = calibration_control
+        self.adaptive_pl_last_hard_control = hard_control
+        self.adaptive_pl_last_calibration_control = calibration_control
+        self.adaptive_pl_last_regime_code = 0.0
+        self.adaptive_pl_release_streak = 0.0
+        self.adaptive_pl_last_release_ready = 0.0
+        self.adaptive_pl_last_high_risk = 0.0
+        self.adaptive_pl_gate_release_armed = 0.0
+        self.adaptive_pl_last_w6_tail_active = tail_active
+        self.adaptive_pl_last_w6_tail_strength = tail_strength
+        self.adaptive_pl_last_w6_tail_votes = float(weak_votes)
+        self.adaptive_pl_release_score_ema = ema_momentum * self.adaptive_pl_release_score_ema
+        self.adaptive_pl_preserve_score_ema = (
+            ema_momentum * self.adaptive_pl_preserve_score_ema
+        ) + ((1.0 - ema_momentum) * calibration_control)
+        self.adaptive_pl_correction_score_ema = (
+            ema_momentum * self.adaptive_pl_correction_score_ema
+        ) + ((1.0 - ema_momentum) * risk_score)
+
         lambda_dynamic = torch.exp(-blend_kappa * conf_gap).clamp(1e-6, 1.0)
         corrected_prob = lambda_dynamic.unsqueeze(1) * local_prob + (1.0 - lambda_dynamic).unsqueeze(1) * global_prob
         corrected_prob_soft = corrected_prob
@@ -967,7 +1037,6 @@ class MyClient(BaseClient):
         total_loss = loss_hard + float(getattr(self.args, 'adaptive_pl_soft_lambda', 0.2)) * loss_soft
         if risk_calibration_enabled and adaptive_active:
             total_loss = total_loss + (risk_global_soft_lambda * calibration_control * loss_risk)
-        valid_count = float(valid_mask.float().sum().item())
 
         loss_boundary_oc = outputs.new_tensor(0.0)
         if self.current_iter >= boundary_warmup_iters and boundary_lambda > 0.0:
@@ -997,13 +1066,15 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_ring_valid_oc_ratio = 0.0
 
         if valid_count > 0:
-            self.adaptive_pl_last_hard_ratio = float(hard_mask.float().sum().item() / valid_count)
+            self.adaptive_pl_last_hard_ratio = hard_ratio_current
+            self.adaptive_pl_hard_ratio_ema = hard_ratio_gate
             self.adaptive_pl_last_both_uncertain_ratio = float(both_uncertain.float().sum().item() / valid_count)
             self.adaptive_pl_both_uncertain_ema = (
                 ema_momentum * self.adaptive_pl_both_uncertain_ema
             ) + ((1.0 - ema_momentum) * self.adaptive_pl_last_both_uncertain_ratio)
         else:
             self.adaptive_pl_last_hard_ratio = 0.0
+            self.adaptive_pl_hard_ratio_ema = ema_momentum * self.adaptive_pl_hard_ratio_ema
             self.adaptive_pl_last_both_uncertain_ratio = 0.0
             self.adaptive_pl_both_uncertain_ema = ema_momentum * self.adaptive_pl_both_uncertain_ema
         self.adaptive_pl_last_seed_support_mean = 0.0
@@ -2564,6 +2635,10 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_effective_correction'.format(self.cid)] = float(self.adaptive_pl_last_effective_correction)
                 metrics_['client_{}_adaptive_pl_hard_control'.format(self.cid)] = float(self.adaptive_pl_last_hard_control)
                 metrics_['client_{}_adaptive_pl_calibration_control'.format(self.cid)] = float(self.adaptive_pl_last_calibration_control)
+                metrics_['client_{}_adaptive_pl_hard_ratio_ema'.format(self.cid)] = float(self.adaptive_pl_hard_ratio_ema)
+                metrics_['client_{}_adaptive_pl_w6_tail_active'.format(self.cid)] = float(self.adaptive_pl_last_w6_tail_active)
+                metrics_['client_{}_adaptive_pl_w6_tail_strength'.format(self.cid)] = float(self.adaptive_pl_last_w6_tail_strength)
+                metrics_['client_{}_adaptive_pl_w6_tail_votes'.format(self.cid)] = float(self.adaptive_pl_last_w6_tail_votes)
                 for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
                     metrics_['client_{}_adaptive_pl_tau_bin_{}'.format(self.cid, bin_idx)] = float(tau_val)
                     metrics_['client_{}_adaptive_pl_bin_count_{}'.format(self.cid, bin_idx)] = int(self.adaptive_pl_last_bin_counts[bin_idx])
@@ -2922,6 +2997,24 @@ def main():
                         help='W5 floor for soft-branch calibration intensity before multiplying client risk.')
     parser.add_argument('--risk_calibration_w5_risk_scale', type=float, default=0.40,
                         help='W5 soft-branch risk scale.')
+    parser.add_argument('--risk_calibration_w6_late_tail_enabled', type=int, default=0,
+                        help='Enable W6 late-tail retention: after W5 window, keep weak-state clients on a light soft calibration tail.')
+    parser.add_argument('--risk_calibration_w6_tail_start_iter', type=int, default=-1,
+                        help='W6 late-tail start iter. -1 means start at risk_calibration_w5_end_iter.')
+    parser.add_argument('--risk_calibration_w6_tail_min_votes', type=int, default=2,
+                        help='W6 weak-state vote threshold across {risk, prior-gap, hard-ratio} indicators.')
+    parser.add_argument('--risk_calibration_w6_tail_risk_threshold', type=float, default=0.55,
+                        help='W6 weak-state risk threshold (>=).')
+    parser.add_argument('--risk_calibration_w6_tail_prior_gap_threshold', type=float, default=0.025,
+                        help='W6 weak-state prior-gap threshold (>=).')
+    parser.add_argument('--risk_calibration_w6_tail_hard_ratio_threshold', type=float, default=0.50,
+                        help='W6 weak-state hard-ratio threshold (<=).')
+    parser.add_argument('--risk_calibration_w6_tail_peak_fraction', type=float, default=0.30,
+                        help='W6 max tail strength as a fraction of W5 calibration_target.')
+    parser.add_argument('--risk_calibration_w6_tail_min_correction', type=float, default=0.03,
+                        help='W6 tail floor before risk scaling.')
+    parser.add_argument('--risk_calibration_w6_tail_risk_scale', type=float, default=0.12,
+                        help='W6 tail risk scaling factor.')
     parser.add_argument('--max_train_samples_per_client', type=int, default=0,
                         help='Cap the number of training samples loaded per client. 0 keeps the full dataset.')
     parser.add_argument('--max_val_samples_per_client', type=int, default=0,
@@ -3112,6 +3205,16 @@ def main():
     assert args.risk_calibration_w5_end_iter > args.risk_calibration_w5_peak_iter
     assert 0.0 <= args.risk_calibration_w5_min_correction <= 1.0
     assert args.risk_calibration_w5_risk_scale >= 0.0
+    assert args.risk_calibration_w6_late_tail_enabled in [0, 1]
+    assert args.risk_calibration_w6_tail_start_iter >= -1
+    assert args.risk_calibration_w6_tail_min_votes >= 1
+    assert args.risk_calibration_w6_tail_min_votes <= 3
+    assert 0.0 <= args.risk_calibration_w6_tail_risk_threshold <= 1.0
+    assert args.risk_calibration_w6_tail_prior_gap_threshold >= 0.0
+    assert 0.0 <= args.risk_calibration_w6_tail_hard_ratio_threshold <= 1.0
+    assert 0.0 <= args.risk_calibration_w6_tail_peak_fraction <= 1.0
+    assert 0.0 <= args.risk_calibration_w6_tail_min_correction <= 1.0
+    assert args.risk_calibration_w6_tail_risk_scale >= 0.0
     if args.risk_calibration_w5_soft_only_enabled == 1:
         assert args.risk_calibration_enabled == 1
         assert args.risk_calibration_stateful_release_enabled == 0
@@ -3119,6 +3222,10 @@ def main():
         assert args.risk_calibration_tau_lambda == 0.0
         assert args.risk_calibration_conf_lambda == 0.0
         assert args.risk_calibration_hard_dampen == 0.0
+    if args.risk_calibration_w6_late_tail_enabled == 1:
+        assert args.risk_calibration_w5_soft_only_enabled == 1
+        if args.risk_calibration_w6_tail_start_iter >= 0:
+            assert args.risk_calibration_w6_tail_start_iter >= args.risk_calibration_w5_end_iter
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1
     if args.seed_support_enabled == 1:
