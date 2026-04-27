@@ -43,7 +43,7 @@ def pseudo_label_generator_acdc(data, seed, beta=50.00, mode='bf', img_class='od
                                     out_range=(-1, 1))
             segmentation = random_walker(data, markers, beta, mode = 'bf', channel_axis=0)
             pseudo_label = segmentation - 1
-    if img_class=='faz' or img_class == 'polyp':
+    if img_class in ['faz', 'prostate']:
         if 1 not in np.unique(seed):
             pseudo_label = np.zeros_like(seed)
         else:
@@ -56,15 +56,32 @@ def pseudo_label_generator_acdc(data, seed, beta=50.00, mode='bf', img_class='od
                                     out_range=(-1, 1))
             segmentation = random_walker(data, markers, beta, mode)
             pseudo_label = segmentation - 1
+    if img_class == 'polyp':
+        if 1 not in np.unique(seed) or 2 not in np.unique(seed):
+            pseudo_label = np.zeros_like(seed)
+        else:
+            markers = np.ones_like(seed)
+            markers[seed == 2] = 0
+            markers[seed == 0] = 1
+            markers[seed == 1] = 2
+            sigma = 0.35
+            data = rescale_intensity(data, in_range=(-sigma, 1 + sigma),
+                                    out_range=(-1, 1))
+            segmentation = random_walker(data, markers, beta, mode, channel_axis=0)
+            pseudo_label = segmentation - 1
         # print("mask=",np.unique(pseudo_label))
     return pseudo_label
+
+
+def should_use_rw_pseudo_label(img_class, sup_type):
+    return img_class == 'polyp' and sup_type == 'box'
 
 
 def infer_unlabeled_value_from_label(label, img_class):
     label = np.asarray(label)
     if img_class == 'odoc':
         return 3 if np.any(label == 3) else None
-    if img_class in ['faz', 'polyp']:
+    if img_class in ['faz', 'polyp', 'prostate']:
         return 2 if np.any(label == 2) else None
     return None
 
@@ -114,6 +131,10 @@ class BaseDataSets(Dataset):
         geometry_mid_radius=24.0,
         max_train_samples_per_client=0,
         max_val_samples_per_client=0,
+        train_sample_ratio=0.0,
+        val_sample_ratio=0.0,
+        train_sample_floor=0,
+        val_sample_floor=0,
     ):
         self._base_dir = base_dir
         self.sample_list = []
@@ -126,6 +147,10 @@ class BaseDataSets(Dataset):
         self.geometry_mid_radius = float(geometry_mid_radius)
         self.max_train_samples_per_client = int(max_train_samples_per_client)
         self.max_val_samples_per_client = int(max_val_samples_per_client)
+        self.train_sample_ratio = float(train_sample_ratio)
+        self.val_sample_ratio = float(val_sample_ratio)
+        self.train_sample_floor = int(train_sample_floor)
+        self.val_sample_floor = int(val_sample_floor)
         if self.img_class == 'odoc' or self.img_class == 'faz':
             train_ids, val_ids = self._get_client_ids(client)
         elif self.img_class =='polyp':
@@ -147,7 +172,13 @@ class BaseDataSets(Dataset):
             if self.split == "train":
                 image = h5f['image'][:]
                 if self.sup_type == "random_walker":
-                    label = pseudo_label_generator_acdc(image, h5f[self.sup_type][:], self.img_class)
+                    label = pseudo_label_generator_acdc(
+                        image, h5f[self.sup_type][:], img_class=self.img_class
+                    )
+                elif should_use_rw_pseudo_label(self.img_class, self.sup_type):
+                    label = pseudo_label_generator_acdc(
+                        image, h5f[self.sup_type][:], img_class=self.img_class
+                    )
                 else:
                     label = h5f[self.sup_type][:]
             else:
@@ -155,21 +186,37 @@ class BaseDataSets(Dataset):
                 label = h5f['mask'][:]
             self.data_list.append({'image': image, 'label': label})
 
-    def _limit_case_list(self, case_list, max_samples):
-        if max_samples is None or int(max_samples) <= 0:
-            return case_list
+    def _limit_case_list(self, case_list, max_samples, sample_ratio=0.0, sample_floor=0):
         case_list = list(case_list)
-        if len(case_list) <= int(max_samples):
+        keep_count = len(case_list)
+        if max_samples is not None and int(max_samples) > 0:
+            keep_count = min(keep_count, int(max_samples))
+        if sample_ratio is not None and float(sample_ratio) > 0.0:
+            ratio_count = int(np.floor(len(case_list) * float(sample_ratio)))
+            ratio_count = max(int(sample_floor), ratio_count)
+            ratio_count = min(len(case_list), ratio_count)
+            keep_count = min(keep_count, ratio_count)
+        if keep_count >= len(case_list):
             return case_list
-        return sorted(case_list)[:int(max_samples)]
+        return sorted(case_list)[:keep_count]
 
     def _limit_client_split_lists(self, train_lists, val_lists):
         limited_train = [
-            self._limit_case_list(case_list, self.max_train_samples_per_client)
+            self._limit_case_list(
+                case_list,
+                self.max_train_samples_per_client,
+                sample_ratio=self.train_sample_ratio,
+                sample_floor=self.train_sample_floor,
+            )
             for case_list in train_lists
         ]
         limited_val = [
-            self._limit_case_list(case_list, self.max_val_samples_per_client)
+            self._limit_case_list(
+                case_list,
+                self.max_val_samples_per_client,
+                sample_ratio=self.val_sample_ratio,
+                sample_floor=self.val_sample_floor,
+            )
             for case_list in val_lists
         ]
         return limited_train, limited_val

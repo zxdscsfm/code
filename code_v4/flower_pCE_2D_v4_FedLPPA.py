@@ -184,7 +184,7 @@ def compute_local_weak_prototypes(model_wrapper, batches, args):
 
     with torch.no_grad():
         for sampled_batch in batches:
-            if args.img_class == 'faz':
+            if args.img_class in ['faz', 'prostate']:
                 volume_batch = sampled_batch['image'].unsqueeze(1).cuda()
                 label_batch = sampled_batch['label'].cuda()
             else:
@@ -477,6 +477,9 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_hard_ratio = 1.0
         self.adaptive_pl_last_loss_hard = 0.0
         self.adaptive_pl_last_loss_soft = 0.0
+        self.adaptive_pl_last_loss_total = 0.0
+        self.adaptive_pl_last_loss_total_backbone = 0.0
+        self.adaptive_pl_last_loss_aux = 0.0
         self.adaptive_pl_last_lg_class_agree_ratio = 1.0
         self.adaptive_pl_last_mean_prob_gap = 0.0
         self.adaptive_pl_last_mean_conf_gap = 0.0
@@ -510,6 +513,22 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_w6_tail_active = 0.0
         self.adaptive_pl_last_w6_tail_strength = 0.0
         self.adaptive_pl_last_w6_tail_votes = 0.0
+        self.adaptive_pl_prior_gap_ref_ema = 0.0
+        self.adaptive_pl_prior_gap_ref_dev_ema = 0.01
+        self.adaptive_pl_prob_gap_ref_ema = 0.0
+        self.adaptive_pl_prob_gap_ref_dev_ema = 0.01
+        self.adaptive_pl_conf_gap_ref_ema = 0.0
+        self.adaptive_pl_conf_gap_ref_dev_ema = 0.01
+        self.adaptive_pl_agreement_ref_ema = 1.0
+        self.adaptive_pl_agreement_ref_dev_ema = 0.01
+        self.adaptive_pl_hard_ratio_ref_ema = 1.0
+        self.adaptive_pl_hard_ratio_ref_dev_ema = 0.01
+        self.adaptive_pl_last_risk_term_prior = 0.0
+        self.adaptive_pl_last_risk_term_prob = 0.0
+        self.adaptive_pl_last_risk_term_conf = 0.0
+        self.adaptive_pl_last_risk_term_disagree = 0.0
+        self.adaptive_pl_last_risk_term_hard = 0.0
+        self.adaptive_pl_last_risk_term_credit = 0.0
 
     def _get_adaptive_pl_state_path(self, tag='latest'):
         return os.path.join(
@@ -551,6 +570,9 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_hard_ratio = float(state.get('adaptive_pl_last_hard_ratio', self.adaptive_pl_last_hard_ratio))
         self.adaptive_pl_last_loss_hard = float(state.get('adaptive_pl_last_loss_hard', self.adaptive_pl_last_loss_hard))
         self.adaptive_pl_last_loss_soft = float(state.get('adaptive_pl_last_loss_soft', self.adaptive_pl_last_loss_soft))
+        self.adaptive_pl_last_loss_total = float(state.get('adaptive_pl_last_loss_total', self.adaptive_pl_last_loss_total))
+        self.adaptive_pl_last_loss_total_backbone = float(state.get('adaptive_pl_last_loss_total_backbone', self.adaptive_pl_last_loss_total_backbone))
+        self.adaptive_pl_last_loss_aux = float(state.get('adaptive_pl_last_loss_aux', self.adaptive_pl_last_loss_aux))
         self.adaptive_pl_last_lg_class_agree_ratio = float(
             state.get('adaptive_pl_last_lg_class_agree_ratio', self.adaptive_pl_last_lg_class_agree_ratio)
         )
@@ -653,6 +675,54 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_w6_tail_votes = float(
             state.get('adaptive_pl_last_w6_tail_votes', self.adaptive_pl_last_w6_tail_votes)
         )
+        self.adaptive_pl_prior_gap_ref_ema = float(
+            state.get('adaptive_pl_prior_gap_ref_ema', self.adaptive_pl_prior_gap_ref_ema)
+        )
+        self.adaptive_pl_prior_gap_ref_dev_ema = float(
+            state.get('adaptive_pl_prior_gap_ref_dev_ema', self.adaptive_pl_prior_gap_ref_dev_ema)
+        )
+        self.adaptive_pl_prob_gap_ref_ema = float(
+            state.get('adaptive_pl_prob_gap_ref_ema', self.adaptive_pl_prob_gap_ref_ema)
+        )
+        self.adaptive_pl_prob_gap_ref_dev_ema = float(
+            state.get('adaptive_pl_prob_gap_ref_dev_ema', self.adaptive_pl_prob_gap_ref_dev_ema)
+        )
+        self.adaptive_pl_conf_gap_ref_ema = float(
+            state.get('adaptive_pl_conf_gap_ref_ema', self.adaptive_pl_conf_gap_ref_ema)
+        )
+        self.adaptive_pl_conf_gap_ref_dev_ema = float(
+            state.get('adaptive_pl_conf_gap_ref_dev_ema', self.adaptive_pl_conf_gap_ref_dev_ema)
+        )
+        self.adaptive_pl_agreement_ref_ema = float(
+            state.get('adaptive_pl_agreement_ref_ema', self.adaptive_pl_agreement_ref_ema)
+        )
+        self.adaptive_pl_agreement_ref_dev_ema = float(
+            state.get('adaptive_pl_agreement_ref_dev_ema', self.adaptive_pl_agreement_ref_dev_ema)
+        )
+        self.adaptive_pl_hard_ratio_ref_ema = float(
+            state.get('adaptive_pl_hard_ratio_ref_ema', self.adaptive_pl_hard_ratio_ref_ema)
+        )
+        self.adaptive_pl_hard_ratio_ref_dev_ema = float(
+            state.get('adaptive_pl_hard_ratio_ref_dev_ema', self.adaptive_pl_hard_ratio_ref_dev_ema)
+        )
+        self.adaptive_pl_last_risk_term_prior = float(
+            state.get('adaptive_pl_last_risk_term_prior', self.adaptive_pl_last_risk_term_prior)
+        )
+        self.adaptive_pl_last_risk_term_prob = float(
+            state.get('adaptive_pl_last_risk_term_prob', self.adaptive_pl_last_risk_term_prob)
+        )
+        self.adaptive_pl_last_risk_term_conf = float(
+            state.get('adaptive_pl_last_risk_term_conf', self.adaptive_pl_last_risk_term_conf)
+        )
+        self.adaptive_pl_last_risk_term_disagree = float(
+            state.get('adaptive_pl_last_risk_term_disagree', self.adaptive_pl_last_risk_term_disagree)
+        )
+        self.adaptive_pl_last_risk_term_hard = float(
+            state.get('adaptive_pl_last_risk_term_hard', self.adaptive_pl_last_risk_term_hard)
+        )
+        self.adaptive_pl_last_risk_term_credit = float(
+            state.get('adaptive_pl_last_risk_term_credit', self.adaptive_pl_last_risk_term_credit)
+        )
 
     def _save_adaptive_pl_state(self, tag='latest'):
         if not self._adaptive_pl_is_enabled():
@@ -669,6 +739,9 @@ class MyClient(BaseClient):
             'adaptive_pl_last_hard_ratio': float(self.adaptive_pl_last_hard_ratio),
             'adaptive_pl_last_loss_hard': float(self.adaptive_pl_last_loss_hard),
             'adaptive_pl_last_loss_soft': float(self.adaptive_pl_last_loss_soft),
+            'adaptive_pl_last_loss_total': float(self.adaptive_pl_last_loss_total),
+            'adaptive_pl_last_loss_total_backbone': float(self.adaptive_pl_last_loss_total_backbone),
+            'adaptive_pl_last_loss_aux': float(self.adaptive_pl_last_loss_aux),
             'adaptive_pl_last_lg_class_agree_ratio': float(self.adaptive_pl_last_lg_class_agree_ratio),
             'adaptive_pl_last_mean_prob_gap': float(self.adaptive_pl_last_mean_prob_gap),
             'adaptive_pl_last_mean_conf_gap': float(self.adaptive_pl_last_mean_conf_gap),
@@ -702,8 +775,42 @@ class MyClient(BaseClient):
             'adaptive_pl_last_w6_tail_active': float(self.adaptive_pl_last_w6_tail_active),
             'adaptive_pl_last_w6_tail_strength': float(self.adaptive_pl_last_w6_tail_strength),
             'adaptive_pl_last_w6_tail_votes': float(self.adaptive_pl_last_w6_tail_votes),
+            'adaptive_pl_prior_gap_ref_ema': float(self.adaptive_pl_prior_gap_ref_ema),
+            'adaptive_pl_prior_gap_ref_dev_ema': float(self.adaptive_pl_prior_gap_ref_dev_ema),
+            'adaptive_pl_prob_gap_ref_ema': float(self.adaptive_pl_prob_gap_ref_ema),
+            'adaptive_pl_prob_gap_ref_dev_ema': float(self.adaptive_pl_prob_gap_ref_dev_ema),
+            'adaptive_pl_conf_gap_ref_ema': float(self.adaptive_pl_conf_gap_ref_ema),
+            'adaptive_pl_conf_gap_ref_dev_ema': float(self.adaptive_pl_conf_gap_ref_dev_ema),
+            'adaptive_pl_agreement_ref_ema': float(self.adaptive_pl_agreement_ref_ema),
+            'adaptive_pl_agreement_ref_dev_ema': float(self.adaptive_pl_agreement_ref_dev_ema),
+            'adaptive_pl_hard_ratio_ref_ema': float(self.adaptive_pl_hard_ratio_ref_ema),
+            'adaptive_pl_hard_ratio_ref_dev_ema': float(self.adaptive_pl_hard_ratio_ref_dev_ema),
+            'adaptive_pl_last_risk_term_prior': float(self.adaptive_pl_last_risk_term_prior),
+            'adaptive_pl_last_risk_term_prob': float(self.adaptive_pl_last_risk_term_prob),
+            'adaptive_pl_last_risk_term_conf': float(self.adaptive_pl_last_risk_term_conf),
+            'adaptive_pl_last_risk_term_disagree': float(self.adaptive_pl_last_risk_term_disagree),
+            'adaptive_pl_last_risk_term_hard': float(self.adaptive_pl_last_risk_term_hard),
+            'adaptive_pl_last_risk_term_credit': float(self.adaptive_pl_last_risk_term_credit),
         }
         torch.save(state, self._get_adaptive_pl_state_path(tag=tag))
+
+    def _capture_adaptive_pl_runtime_state(self):
+        state = {}
+        for key, value in self.__dict__.items():
+            if not key.startswith('adaptive_pl_'):
+                continue
+            if isinstance(value, np.ndarray):
+                state[key] = value.copy()
+            else:
+                state[key] = copy.deepcopy(value)
+        return state
+
+    def _restore_adaptive_pl_runtime_state(self, state):
+        for key, value in state.items():
+            if isinstance(value, np.ndarray):
+                setattr(self, key, value.copy())
+            else:
+                setattr(self, key, copy.deepcopy(value))
 
     def _maybe_log_adaptive_pl_state(self):
         global writer
@@ -722,9 +829,19 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/both_uncertain_ratio'.format(self.cid), float(self.adaptive_pl_last_both_uncertain_ratio), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/both_uncertain_ema'.format(self.cid), float(self.adaptive_pl_both_uncertain_ema), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/hard_ratio'.format(self.cid), float(self.adaptive_pl_last_hard_ratio), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/loss_hard'.format(self.cid), float(self.adaptive_pl_last_loss_hard), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/loss_soft'.format(self.cid), float(self.adaptive_pl_last_loss_soft), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/boundary_loss_oc'.format(self.cid), float(self.adaptive_pl_last_boundary_loss_oc), self.current_iter)
+        if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+            writer.add_scalar('client_{}/adaptive_pl/loss_hard_backbone'.format(self.cid), float(self.adaptive_pl_last_loss_hard), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_soft_backbone'.format(self.cid), float(self.adaptive_pl_last_loss_soft), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_total_backbone'.format(self.cid), float(self.adaptive_pl_last_loss_total_backbone), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_aux_corr'.format(self.cid), float(self.adaptive_pl_last_loss_aux), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_total_v1'.format(self.cid), float(self.adaptive_pl_last_loss_total), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/boundary_loss_oc_backbone'.format(self.cid), float(self.adaptive_pl_last_boundary_loss_oc), self.current_iter)
+        else:
+            writer.add_scalar('client_{}/adaptive_pl/loss_hard'.format(self.cid), float(self.adaptive_pl_last_loss_hard), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_soft'.format(self.cid), float(self.adaptive_pl_last_loss_soft), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_total'.format(self.cid), float(self.adaptive_pl_last_loss_total), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/loss_risk'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
+            writer.add_scalar('client_{}/adaptive_pl/boundary_loss_oc'.format(self.cid), float(self.adaptive_pl_last_boundary_loss_oc), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/ring_valid_oc_ratio'.format(self.cid), float(self.adaptive_pl_last_ring_valid_oc_ratio), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/seed_support_mean'.format(self.cid), float(self.adaptive_pl_last_seed_support_mean), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/seed_support_soft_ratio'.format(self.cid), float(self.adaptive_pl_last_seed_support_soft_ratio), self.current_iter)
@@ -732,9 +849,10 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/prior_gap'.format(self.cid), float(self.adaptive_pl_last_prior_gap), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/prior_gap_ema'.format(self.cid), float(self.adaptive_pl_prior_gap_ema), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/client_risk'.format(self.cid), float(self.adaptive_pl_last_client_risk), self.current_iter)
-        writer.add_scalar('client_{}/adaptive_pl/loss_risk'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
+        if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+            writer.add_scalar('client_{}/adaptive_pl/loss_aux_corr_weighted'.format(self.cid), float(self.adaptive_pl_last_loss_risk), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/stage_progress'.format(self.cid), float(self.adaptive_pl_last_stage_progress), self.current_iter)
-        if not w5_soft_only_enabled:
+        if (not w5_soft_only_enabled) and (not bool(getattr(self.args, 'risk_calibration_v1_enabled', 0))):
             writer.add_scalar('client_{}/adaptive_pl/release_score'.format(self.cid), float(self.adaptive_pl_last_release_score), self.current_iter)
             writer.add_scalar('client_{}/adaptive_pl/preserve_score'.format(self.cid), float(self.adaptive_pl_last_preserve_score), self.current_iter)
             writer.add_scalar('client_{}/adaptive_pl/correction_score'.format(self.cid), float(self.adaptive_pl_last_correction_score), self.current_iter)
@@ -745,6 +863,12 @@ class MyClient(BaseClient):
         writer.add_scalar('client_{}/adaptive_pl/w6_tail_active'.format(self.cid), float(self.adaptive_pl_last_w6_tail_active), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/w6_tail_strength'.format(self.cid), float(self.adaptive_pl_last_w6_tail_strength), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/w6_tail_votes'.format(self.cid), float(self.adaptive_pl_last_w6_tail_votes), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_prior'.format(self.cid), float(self.adaptive_pl_last_risk_term_prior), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_prob'.format(self.cid), float(self.adaptive_pl_last_risk_term_prob), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_conf'.format(self.cid), float(self.adaptive_pl_last_risk_term_conf), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_disagree'.format(self.cid), float(self.adaptive_pl_last_risk_term_disagree), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_hard'.format(self.cid), float(self.adaptive_pl_last_risk_term_hard), self.current_iter)
+        writer.add_scalar('client_{}/adaptive_pl/risk_term_credit'.format(self.cid), float(self.adaptive_pl_last_risk_term_credit), self.current_iter)
         for bin_idx, tau_val in enumerate(self.adaptive_pl_tau):
             writer.add_scalar('client_{}/adaptive_pl/tau_bin_{}'.format(self.cid, bin_idx), float(tau_val), self.current_iter)
             observed_accept = self.adaptive_pl_last_observed_accept[bin_idx]
@@ -766,6 +890,107 @@ class MyClient(BaseClient):
                 int(self.adaptive_pl_last_bin_counts[bin_idx]),
                 self.current_iter,
             )
+
+    def _risk_ref_cfg(self):
+        momentum = float(getattr(self.args, 'risk_calibration_ref_ema_momentum', 0.97))
+        scale_ratio = float(getattr(self.args, 'risk_calibration_ref_scale_ratio', 0.15))
+        scale_eps = float(getattr(self.args, 'risk_calibration_ref_scale_eps', 1e-3))
+        z_clip = float(getattr(self.args, 'risk_calibration_ref_z_clip', 3.0))
+        hard_weight = float(getattr(self.args, 'risk_calibration_hard_ratio_weight', 0.10))
+        return momentum, scale_ratio, scale_eps, z_clip, hard_weight
+
+    def _update_ref_stat(self, value, mean_attr, dev_attr, momentum):
+        value = float(value)
+        ref_mean = float(getattr(self, mean_attr))
+        ref_dev = float(getattr(self, dev_attr))
+        new_mean = (momentum * ref_mean) + ((1.0 - momentum) * value)
+        new_dev = (momentum * ref_dev) + ((1.0 - momentum) * abs(value - new_mean))
+        setattr(self, mean_attr, float(new_mean))
+        setattr(self, dev_attr, float(max(new_dev, 0.0)))
+
+    def _relative_high_risk_term(self, value, ref_mean, ref_dev, scale_ratio, scale_eps, z_clip):
+        scale = max(float(ref_dev), (abs(float(ref_mean)) * scale_ratio) + scale_eps)
+        raw = (float(value) - float(ref_mean)) / max(scale, 1e-8)
+        return float(np.clip(raw / max(z_clip, 1e-8), 0.0, 1.0))
+
+    def _relative_low_risk_term(self, value, ref_mean, ref_dev, scale_ratio, scale_eps, z_clip):
+        scale = max(float(ref_dev), (abs(float(ref_mean)) * scale_ratio) + scale_eps)
+        raw = (float(ref_mean) - float(value)) / max(scale, 1e-8)
+        return float(np.clip(raw / max(z_clip, 1e-8), 0.0, 1.0))
+
+    def _compute_relative_client_risk(self):
+        momentum, scale_ratio, scale_eps, z_clip, hard_weight = self._risk_ref_cfg()
+        prior_term = self._relative_high_risk_term(
+            self.adaptive_pl_prior_gap_ema,
+            self.adaptive_pl_prior_gap_ref_ema,
+            self.adaptive_pl_prior_gap_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+        prob_term = self._relative_high_risk_term(
+            self.adaptive_pl_prob_gap_ema,
+            self.adaptive_pl_prob_gap_ref_ema,
+            self.adaptive_pl_prob_gap_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+        conf_term = self._relative_high_risk_term(
+            self.adaptive_pl_conf_gap_ema,
+            self.adaptive_pl_conf_gap_ref_ema,
+            self.adaptive_pl_conf_gap_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+        disagree_term = self._relative_low_risk_term(
+            self.adaptive_pl_lg_agreement_ema,
+            self.adaptive_pl_agreement_ref_ema,
+            self.adaptive_pl_agreement_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+        hard_low_term = self._relative_low_risk_term(
+            self.adaptive_pl_hard_ratio_ema,
+            self.adaptive_pl_hard_ratio_ref_ema,
+            self.adaptive_pl_hard_ratio_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+        agreement_credit = self._relative_high_risk_term(
+            self.adaptive_pl_lg_agreement_ema,
+            self.adaptive_pl_agreement_ref_ema,
+            self.adaptive_pl_agreement_ref_dev_ema,
+            scale_ratio,
+            scale_eps,
+            z_clip,
+        )
+
+        self._update_ref_stat(self.adaptive_pl_prior_gap_ema, 'adaptive_pl_prior_gap_ref_ema', 'adaptive_pl_prior_gap_ref_dev_ema', momentum)
+        self._update_ref_stat(self.adaptive_pl_prob_gap_ema, 'adaptive_pl_prob_gap_ref_ema', 'adaptive_pl_prob_gap_ref_dev_ema', momentum)
+        self._update_ref_stat(self.adaptive_pl_conf_gap_ema, 'adaptive_pl_conf_gap_ref_ema', 'adaptive_pl_conf_gap_ref_dev_ema', momentum)
+        self._update_ref_stat(self.adaptive_pl_lg_agreement_ema, 'adaptive_pl_agreement_ref_ema', 'adaptive_pl_agreement_ref_dev_ema', momentum)
+        self._update_ref_stat(self.adaptive_pl_hard_ratio_ema, 'adaptive_pl_hard_ratio_ref_ema', 'adaptive_pl_hard_ratio_ref_dev_ema', momentum)
+
+        self.adaptive_pl_last_risk_term_prior = prior_term
+        self.adaptive_pl_last_risk_term_prob = prob_term
+        self.adaptive_pl_last_risk_term_conf = conf_term
+        self.adaptive_pl_last_risk_term_disagree = disagree_term
+        self.adaptive_pl_last_risk_term_hard = hard_low_term
+        self.adaptive_pl_last_risk_term_credit = agreement_credit
+
+        return {
+            'prior': prior_term,
+            'prob': prob_term,
+            'conf': conf_term,
+            'disagree': disagree_term,
+            'hard': hard_low_term,
+            'credit': agreement_credit,
+            'hard_weight': hard_weight,
+        }
 
     def _extract_univ_outputs(self, model_out):
         if self.args.model == 'unet_univ5':
@@ -958,6 +1183,9 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_propagated_fg_mean = 0.0
         self.adaptive_pl_last_loss_hard = float(loss_hard.detach().item())
         self.adaptive_pl_last_loss_soft = float(loss_soft.detach().item())
+        self.adaptive_pl_last_loss_total = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_total_backbone = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_aux = 0.0
         self.adaptive_pl_last_loss_risk = 0.0
         self.adaptive_pl_last_boundary_loss_oc = float(loss_boundary_oc.detach().item())
 
@@ -973,6 +1201,7 @@ class MyClient(BaseClient):
             'seed_support_map': score.new_zeros(score.shape),
             'hard_ratio': self.adaptive_pl_last_hard_ratio,
             'client_risk': 0.0,
+            'correction_strength': 0.0,
         }
 
     def _compute_adaptive_pl_loss_w5_from_w1p(self, outputs, outputs_auxiliary, outputs_soft, outputs_soft_auxiliary,
@@ -1020,8 +1249,6 @@ class MyClient(BaseClient):
         risk_prior_clip_max = float(getattr(self.args, 'risk_calibration_prior_clip_max', 1.5))
         risk_soft_boost = float(getattr(self.args, 'risk_calibration_soft_boost', 0.5))
         risk_global_soft_lambda = float(getattr(self.args, 'risk_calibration_global_soft_lambda', 0.15))
-        correction_agreement_threshold = float(getattr(self.args, 'risk_calibration_correction_agreement_threshold', 0.88))
-        preserve_agreement_threshold = float(getattr(self.args, 'risk_calibration_preserve_agreement_threshold', 0.92))
         risk_agreement_credit = float(getattr(self.args, 'risk_calibration_risk_agreement_credit', 0.20))
         w5_start_iter = int(getattr(self.args, 'risk_calibration_w5_start_iter', warmup_iters))
         w5_peak_iter = int(getattr(self.args, 'risk_calibration_w5_peak_iter', max(warmup_iters + 1, warmup_iters + 600)))
@@ -1063,28 +1290,31 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_prior_gap = 0.0
 
         if risk_calibration_enabled and valid_mask.any():
-            prior_risk_term = float(np.clip(self.adaptive_pl_prior_gap_ema / 0.05, 0.0, 1.0))
-            prob_risk_term = float(np.clip(self.adaptive_pl_prob_gap_ema / 0.03, 0.0, 1.0))
-            conf_risk_term = float(np.clip(self.adaptive_pl_conf_gap_ema / 0.03, 0.0, 1.0))
-            disagree_risk_term = float(np.clip(
-                (1.0 - self.adaptive_pl_lg_agreement_ema) / max(1e-6, 1.0 - correction_agreement_threshold),
-                0.0,
-                1.0,
-            ))
-            agreement_credit = float(np.clip(
-                (self.adaptive_pl_lg_agreement_ema - preserve_agreement_threshold) / max(1e-6, 1.0 - preserve_agreement_threshold),
-                0.0,
-                1.0,
-            ))
+            risk_terms = self._compute_relative_client_risk()
+            hard_weight = float(np.clip(risk_terms['hard_weight'], 0.0, 0.5))
+            base_weights = {
+                'prior': 0.40,
+                'prob': 0.20,
+                'conf': 0.10,
+                'disagree': 0.30,
+            }
+            weight_scale = max(1e-6, 1.0 - hard_weight)
             risk_score = (
-                0.40 * prior_risk_term
-                + 0.20 * prob_risk_term
-                + 0.10 * conf_risk_term
-                + 0.30 * disagree_risk_term
-                - (risk_agreement_credit * agreement_credit)
+                weight_scale * base_weights['prior'] * risk_terms['prior']
+                + weight_scale * base_weights['prob'] * risk_terms['prob']
+                + weight_scale * base_weights['conf'] * risk_terms['conf']
+                + weight_scale * base_weights['disagree'] * risk_terms['disagree']
+                + hard_weight * risk_terms['hard']
+                - (risk_agreement_credit * risk_terms['credit'])
             )
             risk_score = float(np.clip(risk_score, 0.0, 1.0))
         else:
+            self.adaptive_pl_last_risk_term_prior = 0.0
+            self.adaptive_pl_last_risk_term_prob = 0.0
+            self.adaptive_pl_last_risk_term_conf = 0.0
+            self.adaptive_pl_last_risk_term_disagree = 0.0
+            self.adaptive_pl_last_risk_term_hard = 0.0
+            self.adaptive_pl_last_risk_term_credit = 0.0
             risk_score = 0.0
         self.adaptive_pl_last_client_risk = risk_score
 
@@ -1268,6 +1498,9 @@ class MyClient(BaseClient):
         self.adaptive_pl_last_propagated_fg_mean = 0.0
         self.adaptive_pl_last_loss_hard = float(loss_hard.detach().item())
         self.adaptive_pl_last_loss_soft = float(loss_soft.detach().item())
+        self.adaptive_pl_last_loss_total = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_total_backbone = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_aux = float((risk_global_soft_lambda * calibration_control * loss_risk).detach().item()) if (risk_calibration_enabled and adaptive_active) else 0.0
         self.adaptive_pl_last_loss_risk = float(loss_risk.detach().item())
         self.adaptive_pl_last_boundary_loss_oc = float(loss_boundary_oc.detach().item())
 
@@ -1283,24 +1516,179 @@ class MyClient(BaseClient):
             'seed_support_map': score.new_zeros(score.shape),
             'hard_ratio': self.adaptive_pl_last_hard_ratio,
             'client_risk': self.adaptive_pl_last_client_risk,
+            'correction_strength': calibration_control,
         }
+
+    def _compute_adaptive_pl_loss_v1_backbone_aux(self, outputs, outputs_auxiliary, outputs_soft, outputs_soft_auxiliary,
+                                                  pseudo_label_mix, global_pseudo_label_mix, geometry_bin_batch, label_batch,
+                                                  raw_encoder_feature=None):
+        # V1 keeps W1' as the always-on backbone and uses the older
+        # risk statistics only as a lightweight auxiliary objective.
+        base_result = self._compute_adaptive_pl_loss_w1p_pure(
+            outputs=outputs,
+            outputs_auxiliary=outputs_auxiliary,
+            outputs_soft=outputs_soft,
+            outputs_soft_auxiliary=outputs_soft_auxiliary,
+            pseudo_label_mix=pseudo_label_mix,
+            global_pseudo_label_mix=global_pseudo_label_mix,
+            geometry_bin_batch=geometry_bin_batch,
+            label_batch=label_batch,
+        )
+
+        if global_pseudo_label_mix is None:
+            global_pseudo_label_mix = pseudo_label_mix.detach()
+
+        reliability = compute_adaptive_pseudo_reliability(
+            pseudo_label_mix,
+            global_pseudo_label_mix,
+            gamma_prob=float(getattr(self.args, 'adaptive_pl_gamma_prob', 4.0)),
+            gamma_conf=float(getattr(self.args, 'adaptive_pl_gamma_conf', 3.0)),
+        )
+        global_prob = reliability['global_prob']
+        conf_global = reliability['conf_global']
+        score = reliability['score']
+        geometry_weight_values = parse_geometry_weight_list(
+            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
+            int(getattr(self.args, 'geometry_num_bins', 4)),
+        )
+        geometry_weight_map = build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
+        tau_values = torch.tensor(self.adaptive_pl_tau, device=geometry_bin_batch.device, dtype=score.dtype)
+        tau_map = tau_values[geometry_bin_batch.long().clamp(0, len(self.adaptive_pl_tau) - 1)]
+        valid_mask = (label_batch == self.args.num_classes).bool()
+        adaptive_active = self.current_iter >= int(getattr(self.args, 'adaptive_pl_warmup_iters', 800))
+        tau_global_min = float(getattr(self.args, 'adaptive_pl_global_min_conf', 0.6))
+        risk_calibration_enabled = bool(getattr(self.args, 'risk_calibration_enabled', 0))
+        risk_agreement_credit = float(getattr(self.args, 'risk_calibration_risk_agreement_credit', 0.20))
+        risk_global_soft_lambda = float(getattr(self.args, 'risk_calibration_global_soft_lambda', 0.15))
+        if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+            aux_max_weight = float(getattr(self.args, 'risk_calibration_v1_aux_max_weight', 0.30))
+        else:
+            aux_max_weight = float(getattr(self.args, 'risk_calibration_w7_aux_max_weight', 0.30))
+
+        client_risk = 0.0
+        correction_strength = 0.0
+        aux_loss = outputs.new_tensor(0.0)
+        self.adaptive_pl_last_risk_term_prior = 0.0
+        self.adaptive_pl_last_risk_term_prob = 0.0
+        self.adaptive_pl_last_risk_term_conf = 0.0
+        self.adaptive_pl_last_risk_term_disagree = 0.0
+        self.adaptive_pl_last_risk_term_hard = 0.0
+        self.adaptive_pl_last_risk_term_credit = 0.0
+        if risk_calibration_enabled and adaptive_active and bool(valid_mask.any().item()):
+            risk_terms = self._compute_relative_client_risk()
+            hard_weight = float(np.clip(risk_terms['hard_weight'], 0.0, 0.5))
+            base_weights = {
+                'prior': 0.40,
+                'prob': 0.20,
+                'conf': 0.10,
+                'disagree': 0.30,
+            }
+            weight_scale = max(1e-6, 1.0 - hard_weight)
+            client_risk = float(np.clip(
+                weight_scale * base_weights['prior'] * risk_terms['prior']
+                + weight_scale * base_weights['prob'] * risk_terms['prob']
+                + weight_scale * base_weights['conf'] * risk_terms['conf']
+                + weight_scale * base_weights['disagree'] * risk_terms['disagree']
+                + hard_weight * risk_terms['hard']
+                - (risk_agreement_credit * risk_terms['credit']),
+                0.0,
+                1.0,
+            ))
+            correction_strength = float(np.clip(aux_max_weight * client_risk, 0.0, aux_max_weight))
+
+            both_uncertain = valid_mask & (score < tau_map) & (conf_global < tau_global_min)
+            risk_weight = geometry_weight_map * both_uncertain.float() * valid_mask.float()
+            if risk_weight.sum().item() > 0 and correction_strength > 0.0:
+                loss_corr_1 = weighted_reverse_kl_loss(outputs, global_prob, risk_weight)
+                loss_corr_2 = weighted_reverse_kl_loss(outputs_auxiliary, global_prob, risk_weight)
+                aux_loss = risk_global_soft_lambda * correction_strength * (0.5 * (loss_corr_1 + loss_corr_2))
+
+        merged_result = dict(base_result)
+        merged_result['loss_total'] = base_result['loss_total'] + aux_loss
+        merged_result['loss_risk'] = aux_loss
+        merged_result['client_risk'] = client_risk
+        merged_result['correction_strength'] = correction_strength
+
+        self.adaptive_pl_last_client_risk = client_risk
+        self.adaptive_pl_last_loss_total = float(merged_result['loss_total'].detach().item())
+        self.adaptive_pl_last_loss_total_backbone = float(base_result['loss_total'].detach().item())
+        self.adaptive_pl_last_loss_aux = float(aux_loss.detach().item())
+        self.adaptive_pl_last_loss_risk = float(aux_loss.detach().item())
+        self.adaptive_pl_last_effective_correction = correction_strength
+        self.adaptive_pl_last_calibration_control = correction_strength
+        self.adaptive_pl_last_preserve_score = 0.0
+        self.adaptive_pl_last_correction_score = 0.0
+        self.adaptive_pl_last_hard_control = 0.0
+        self.adaptive_pl_last_release_score = 0.0
+        self.adaptive_pl_last_regime_code = 0.0
+        self.adaptive_pl_last_release_ready = 0.0
+        self.adaptive_pl_last_high_risk = 0.0
+        self.adaptive_pl_release_streak = 0.0
+        self.adaptive_pl_gate_release_armed = 0.0
+        return merged_result
+
+    def _compute_adaptive_pl_loss_w7_backbone_aux(self, outputs, outputs_auxiliary, outputs_soft, outputs_soft_auxiliary,
+                                                  pseudo_label_mix, global_pseudo_label_mix, geometry_bin_batch, label_batch,
+                                                  raw_encoder_feature=None):
+        # W7 keeps its original two-stage semantics: early risk-calibrated path,
+        # then a hard return to pure W1' after the switch iteration.
+        switch_iter = int(getattr(self.args, 'risk_calibration_w7_switch_iter', 800))
+        if self.current_iter >= switch_iter:
+            return self._compute_adaptive_pl_loss_w1p_pure(
+                outputs=outputs,
+                outputs_auxiliary=outputs_auxiliary,
+                outputs_soft=outputs_soft,
+                outputs_soft_auxiliary=outputs_soft_auxiliary,
+                pseudo_label_mix=pseudo_label_mix,
+                global_pseudo_label_mix=global_pseudo_label_mix,
+                geometry_bin_batch=geometry_bin_batch,
+                label_batch=label_batch,
+            )
+
+        prev_w7_enabled = getattr(self.args, 'risk_calibration_w7_enabled', 0)
+        try:
+            self.args.risk_calibration_w7_enabled = 0
+            return self._compute_adaptive_pl_loss(
+                outputs=outputs,
+                outputs_auxiliary=outputs_auxiliary,
+                outputs_soft=outputs_soft,
+                outputs_soft_auxiliary=outputs_soft_auxiliary,
+                pseudo_label_mix=pseudo_label_mix,
+                global_pseudo_label_mix=global_pseudo_label_mix,
+                geometry_bin_batch=geometry_bin_batch,
+                label_batch=label_batch,
+                raw_encoder_feature=raw_encoder_feature,
+            )
+        finally:
+            self.args.risk_calibration_w7_enabled = prev_w7_enabled
 
     def _compute_adaptive_pl_loss(self, outputs, outputs_auxiliary, outputs_soft, outputs_soft_auxiliary,
                                   pseudo_label_mix, global_pseudo_label_mix, geometry_bin_batch, label_batch,
                                   raw_encoder_feature=None):
+        if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+            return self._compute_adaptive_pl_loss_v1_backbone_aux(
+                outputs=outputs,
+                outputs_auxiliary=outputs_auxiliary,
+                outputs_soft=outputs_soft,
+                outputs_soft_auxiliary=outputs_soft_auxiliary,
+                pseudo_label_mix=pseudo_label_mix,
+                global_pseudo_label_mix=global_pseudo_label_mix,
+                geometry_bin_batch=geometry_bin_batch,
+                label_batch=label_batch,
+                raw_encoder_feature=raw_encoder_feature,
+            )
         if bool(getattr(self.args, 'risk_calibration_w7_enabled', 0)):
-            switch_iter = int(getattr(self.args, 'risk_calibration_w7_switch_iter', 800))
-            if self.current_iter >= switch_iter:
-                return self._compute_adaptive_pl_loss_w1p_pure(
-                    outputs=outputs,
-                    outputs_auxiliary=outputs_auxiliary,
-                    outputs_soft=outputs_soft,
-                    outputs_soft_auxiliary=outputs_soft_auxiliary,
-                    pseudo_label_mix=pseudo_label_mix,
-                    global_pseudo_label_mix=global_pseudo_label_mix,
-                    geometry_bin_batch=geometry_bin_batch,
-                    label_batch=label_batch,
-                )
+            return self._compute_adaptive_pl_loss_w7_backbone_aux(
+                outputs=outputs,
+                outputs_auxiliary=outputs_auxiliary,
+                outputs_soft=outputs_soft,
+                outputs_soft_auxiliary=outputs_soft_auxiliary,
+                pseudo_label_mix=pseudo_label_mix,
+                global_pseudo_label_mix=global_pseudo_label_mix,
+                geometry_bin_batch=geometry_bin_batch,
+                label_batch=label_batch,
+                raw_encoder_feature=raw_encoder_feature,
+            )
         if bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0)):
             return self._compute_adaptive_pl_loss_w5_from_w1p(
                 outputs=outputs,
@@ -1425,30 +1813,31 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_prior_gap = 0.0
 
         if risk_calibration_enabled and valid_mask.any():
-            prior_risk_term = float(np.clip(self.adaptive_pl_prior_gap_ema / 0.05, 0.0, 1.0))
-            prob_risk_term = float(np.clip(self.adaptive_pl_prob_gap_ema / 0.03, 0.0, 1.0))
-            conf_risk_term = float(np.clip(self.adaptive_pl_conf_gap_ema / 0.03, 0.0, 1.0))
-            disagree_risk_term = float(np.clip(
-                (1.0 - self.adaptive_pl_lg_agreement_ema) / max(1e-6, 1.0 - correction_agreement_threshold),
-                0.0,
-                1.0,
-            ))
-            agreement_credit = float(np.clip(
-                (self.adaptive_pl_lg_agreement_ema - preserve_agreement_threshold) / max(1e-6, 1.0 - preserve_agreement_threshold),
-                0.0,
-                1.0,
-            ))
-            # Keep prior-gap as the main risk source, use probability/confidence gaps as auxiliaries,
-            # and explicitly reward high agreement so recovered clients can leave strict correction.
+            risk_terms = self._compute_relative_client_risk()
+            hard_weight = float(np.clip(risk_terms['hard_weight'], 0.0, 0.5))
+            base_weights = {
+                'prior': 0.40,
+                'prob': 0.20,
+                'conf': 0.10,
+                'disagree': 0.30,
+            }
+            weight_scale = max(1e-6, 1.0 - hard_weight)
             risk_score = (
-                0.40 * prior_risk_term
-                + 0.20 * prob_risk_term
-                + 0.10 * conf_risk_term
-                + 0.30 * disagree_risk_term
-                - (risk_agreement_credit * agreement_credit)
+                weight_scale * base_weights['prior'] * risk_terms['prior']
+                + weight_scale * base_weights['prob'] * risk_terms['prob']
+                + weight_scale * base_weights['conf'] * risk_terms['conf']
+                + weight_scale * base_weights['disagree'] * risk_terms['disagree']
+                + hard_weight * risk_terms['hard']
+                - (risk_agreement_credit * risk_terms['credit'])
             )
             risk_score = float(np.clip(risk_score, 0.0, 1.0))
         else:
+            self.adaptive_pl_last_risk_term_prior = 0.0
+            self.adaptive_pl_last_risk_term_prob = 0.0
+            self.adaptive_pl_last_risk_term_conf = 0.0
+            self.adaptive_pl_last_risk_term_disagree = 0.0
+            self.adaptive_pl_last_risk_term_hard = 0.0
+            self.adaptive_pl_last_risk_term_credit = 0.0
             risk_score = 0.0
         self.adaptive_pl_last_client_risk = risk_score
 
@@ -1723,6 +2112,9 @@ class MyClient(BaseClient):
             self.adaptive_pl_last_propagated_fg_mean = 0.0
         self.adaptive_pl_last_loss_hard = float(loss_hard.detach().item())
         self.adaptive_pl_last_loss_soft = float(loss_soft.detach().item())
+        self.adaptive_pl_last_loss_total = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_total_backbone = float(total_loss.detach().item())
+        self.adaptive_pl_last_loss_aux = float((risk_global_soft_lambda * calibration_control * loss_risk).detach().item()) if (risk_calibration_enabled and adaptive_active) else 0.0
         self.adaptive_pl_last_loss_risk = float(loss_risk.detach().item())
         self.adaptive_pl_last_boundary_loss_oc = float(loss_boundary_oc.detach().item())
 
@@ -2173,7 +2565,7 @@ class MyClient(BaseClient):
             idx = self.current_iter % len(self.trainloader)
             sampled_batch = self.sampled_batches[idx]
 
-            if self.args.img_class == 'faz':
+            if self.args.img_class in ['faz', 'prostate']:
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             else:
@@ -2430,7 +2822,7 @@ class MyClient(BaseClient):
             sampled_batch = self.sampled_batches[idx]
             # print(self.current_iter, i_iter, idx)
 
-            if self.args.img_class == 'faz':
+            if self.args.img_class in ['faz', 'prostate']:
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
@@ -2812,8 +3204,18 @@ class MyClient(BaseClient):
             metrics_['client_{}_loss_pls'.format(self.cid)] = loss_pls.item()
             if self._adaptive_pl_is_enabled():
                 w5_soft_only_enabled = bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0))
-                metrics_['client_{}_adaptive_pl_loss_hard'.format(self.cid)] = float(adaptive_pl_loss_hard.item())
-                metrics_['client_{}_adaptive_pl_loss_soft'.format(self.cid)] = float(adaptive_pl_loss_soft.item())
+                if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+                    metrics_['client_{}_adaptive_pl_loss_hard_backbone'.format(self.cid)] = float(adaptive_pl_loss_hard.item())
+                    metrics_['client_{}_adaptive_pl_loss_soft_backbone'.format(self.cid)] = float(adaptive_pl_loss_soft.item())
+                    metrics_['client_{}_adaptive_pl_loss_total_backbone'.format(self.cid)] = float(self.adaptive_pl_last_loss_total_backbone)
+                    metrics_['client_{}_adaptive_pl_loss_aux_corr'.format(self.cid)] = float(self.adaptive_pl_last_loss_aux)
+                    metrics_['client_{}_adaptive_pl_loss_total_v1'.format(self.cid)] = float(self.adaptive_pl_last_loss_total)
+                    metrics_['client_{}_adaptive_pl_boundary_loss_oc_backbone'.format(self.cid)] = float(self.adaptive_pl_last_boundary_loss_oc)
+                else:
+                    metrics_['client_{}_adaptive_pl_loss_hard'.format(self.cid)] = float(adaptive_pl_loss_hard.item())
+                    metrics_['client_{}_adaptive_pl_loss_soft'.format(self.cid)] = float(adaptive_pl_loss_soft.item())
+                    metrics_['client_{}_adaptive_pl_loss_total'.format(self.cid)] = float(self.adaptive_pl_last_loss_total)
+                    metrics_['client_{}_adaptive_pl_loss_risk'.format(self.cid)] = float(self.adaptive_pl_last_loss_risk)
                 metrics_['client_{}_adaptive_pl_hard_ratio'.format(self.cid)] = float(adaptive_pl_hard_ratio)
                 metrics_['client_{}_adaptive_pl_lg_class_agree_ratio'.format(self.cid)] = float(self.adaptive_pl_last_lg_class_agree_ratio)
                 metrics_['client_{}_adaptive_pl_lg_class_agree_ema'.format(self.cid)] = float(self.adaptive_pl_lg_agreement_ema)
@@ -2821,13 +3223,13 @@ class MyClient(BaseClient):
                 metrics_['client_{}_adaptive_pl_mean_conf_gap'.format(self.cid)] = float(self.adaptive_pl_last_mean_conf_gap)
                 metrics_['client_{}_adaptive_pl_both_uncertain_ratio'.format(self.cid)] = float(self.adaptive_pl_last_both_uncertain_ratio)
                 metrics_['client_{}_adaptive_pl_both_uncertain_ema'.format(self.cid)] = float(self.adaptive_pl_both_uncertain_ema)
-                metrics_['client_{}_adaptive_pl_boundary_loss_oc'.format(self.cid)] = float(self.adaptive_pl_last_boundary_loss_oc)
+                if not bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
+                    metrics_['client_{}_adaptive_pl_boundary_loss_oc'.format(self.cid)] = float(self.adaptive_pl_last_boundary_loss_oc)
                 metrics_['client_{}_adaptive_pl_ring_valid_oc_ratio'.format(self.cid)] = float(self.adaptive_pl_last_ring_valid_oc_ratio)
                 metrics_['client_{}_adaptive_pl_prior_gap'.format(self.cid)] = float(self.adaptive_pl_last_prior_gap)
                 metrics_['client_{}_adaptive_pl_client_risk'.format(self.cid)] = float(self.adaptive_pl_last_client_risk)
-                metrics_['client_{}_adaptive_pl_loss_risk'.format(self.cid)] = float(self.adaptive_pl_last_loss_risk)
                 metrics_['client_{}_adaptive_pl_stage_progress'.format(self.cid)] = float(self.adaptive_pl_last_stage_progress)
-                if not w5_soft_only_enabled:
+                if (not w5_soft_only_enabled) and (not bool(getattr(self.args, 'risk_calibration_v1_enabled', 0))):
                     metrics_['client_{}_adaptive_pl_release_score'.format(self.cid)] = float(self.adaptive_pl_last_release_score)
                     metrics_['client_{}_adaptive_pl_preserve_score'.format(self.cid)] = float(self.adaptive_pl_last_preserve_score)
                     metrics_['client_{}_adaptive_pl_correction_score'.format(self.cid)] = float(self.adaptive_pl_last_correction_score)
@@ -2894,7 +3296,7 @@ def pretrain_model(args, writer, worker_init_fn):
     model.train()
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
-            if args.img_class == 'faz':
+            if args.img_class in ['faz', 'prostate']:
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif args.img_class == 'odoc' or args.img_class == 'polyp':
@@ -3152,6 +3554,16 @@ def main():
                         help='Clients above this both-uncertain EMA are pushed toward the W4 correction regime.')
     parser.add_argument('--risk_calibration_risk_agreement_credit', type=float, default=0.20,
                         help='Amount of risk reduction granted to clients with persistently high agreement.')
+    parser.add_argument('--risk_calibration_ref_ema_momentum', type=float, default=0.97,
+                        help='EMA momentum for per-client risk reference statistics (mean/deviation baselines).')
+    parser.add_argument('--risk_calibration_ref_scale_ratio', type=float, default=0.15,
+                        help='Scale floor ratio used by relative risk normalization against per-client reference means.')
+    parser.add_argument('--risk_calibration_ref_scale_eps', type=float, default=1e-3,
+                        help='Absolute scale floor used by relative risk normalization against per-client references.')
+    parser.add_argument('--risk_calibration_ref_z_clip', type=float, default=3.0,
+                        help='Z-score clip for relative risk terms before mapping to [0, 1].')
+    parser.add_argument('--risk_calibration_hard_ratio_weight', type=float, default=0.10,
+                        help='Risk-score weight assigned to low hard-ratio relative deviation.')
     parser.add_argument('--risk_calibration_release_min_correction', type=float, default=0.02,
                         help='Minimum correction strength kept for clients in release.')
     parser.add_argument('--risk_calibration_release_max_correction', type=float, default=0.12,
@@ -3185,9 +3597,15 @@ def main():
     parser.add_argument('--risk_calibration_release_hard_ratio_threshold', type=float, default=0.60,
                         help='Additional hard-ratio gate for W4.2 release trigger.')
     parser.add_argument('--risk_calibration_w7_enabled', type=int, default=0,
-                        help="Enable W7 two-stage mode: use W4-style early correction before switch, then hard-return to pure W1' path.")
+                        help="Enable W7 two-stage mode: use the early risk-calibrated path before switch, then hard-return to pure W1'.")
     parser.add_argument('--risk_calibration_w7_switch_iter', type=int, default=800,
                         help="Hard switch iter for W7. Iter >= switch uses pure W1' adaptive pseudo-label path.")
+    parser.add_argument('--risk_calibration_w7_aux_max_weight', type=float, default=0.30,
+                        help="Reserved compatibility weight for deprecated post-W7 backbone+aux experiments. Unused by the restored W7 route.")
+    parser.add_argument('--risk_calibration_v1_enabled', type=int, default=0,
+                        help="Enable V1 mode: keep W1' as backbone and blend a light risk-calibrated auxiliary branch.")
+    parser.add_argument('--risk_calibration_v1_aux_max_weight', type=float, default=0.30,
+                        help="Maximum weight assigned to the auxiliary correction branch when V1 mode is enabled.")
     parser.add_argument('--risk_calibration_w5_soft_only_enabled', type=int, default=0,
                         help='Enable W5 mode: keep W1 hard branch untouched and apply risk calibration only on soft/uncertain branch.')
     parser.add_argument('--risk_calibration_w5_start_iter', type=int, default=800,
@@ -3318,8 +3736,7 @@ def main():
 
     snapshot_path = '../model/{}'.format(
         args.exp)
-    if not os.path.exists(snapshot_path):
-        os.makedirs(snapshot_path)
+    os.makedirs(snapshot_path, exist_ok=True)
     setattr(args, 'snapshot_path', snapshot_path)
 
     # Check arguments
@@ -3378,6 +3795,11 @@ def main():
     assert 0.0 <= args.risk_calibration_correction_agreement_threshold <= 1.0
     assert args.risk_calibration_correction_uncertain_threshold >= 0.0
     assert args.risk_calibration_risk_agreement_credit >= 0.0
+    assert 0.0 <= args.risk_calibration_ref_ema_momentum < 1.0
+    assert args.risk_calibration_ref_scale_ratio >= 0.0
+    assert args.risk_calibration_ref_scale_eps > 0.0
+    assert args.risk_calibration_ref_z_clip > 0.0
+    assert 0.0 <= args.risk_calibration_hard_ratio_weight <= 0.5
     assert 0.0 <= args.risk_calibration_release_min_correction <= args.risk_calibration_release_max_correction <= 1.0
     assert 0.0 <= args.risk_calibration_preserve_min_correction <= args.risk_calibration_preserve_max_correction <= 1.0
     assert 0.0 <= args.risk_calibration_correction_min_correction <= 1.0
@@ -3404,6 +3826,9 @@ def main():
         assert 0.0 <= args.risk_calibration_release_hard_ratio_threshold <= 1.0
     assert args.risk_calibration_w7_enabled in [0, 1]
     assert args.risk_calibration_w7_switch_iter >= 0
+    assert 0.0 <= args.risk_calibration_w7_aux_max_weight <= 1.0
+    assert args.risk_calibration_v1_enabled in [0, 1]
+    assert 0.0 <= args.risk_calibration_v1_aux_max_weight <= 1.0
     assert args.risk_calibration_w5_soft_only_enabled in [0, 1]
     assert args.risk_calibration_w5_start_iter >= 0
     assert args.risk_calibration_w5_peak_iter > args.risk_calibration_w5_start_iter
@@ -3427,10 +3852,18 @@ def main():
         assert args.risk_calibration_tau_lambda == 0.0
         assert args.risk_calibration_conf_lambda == 0.0
         assert args.risk_calibration_hard_dampen == 0.0
-    if args.risk_calibration_w7_enabled == 1:
+    if args.risk_calibration_v1_enabled == 1:
         assert args.risk_calibration_enabled == 1
         assert args.risk_calibration_w5_soft_only_enabled == 0
         assert args.risk_calibration_w6_late_tail_enabled == 0
+        assert args.risk_calibration_w7_enabled == 0
+        assert args.risk_calibration_v1_aux_max_weight >= 0.0
+    if args.risk_calibration_w7_enabled == 1:
+        assert args.risk_calibration_enabled == 1
+        assert args.risk_calibration_v1_enabled == 0
+        assert args.risk_calibration_w5_soft_only_enabled == 0
+        assert args.risk_calibration_w6_late_tail_enabled == 0
+        assert args.risk_calibration_w7_aux_max_weight >= 0.0
         assert args.risk_calibration_w7_switch_iter >= args.adaptive_pl_warmup_iters
     if args.risk_calibration_w6_late_tail_enabled == 1:
         assert args.risk_calibration_w5_soft_only_enabled == 1
@@ -3530,8 +3963,8 @@ def main():
             assert args.student_teacher_persistent == 1
 
     assert args.role in ['server', 'client']
-    assert args.img_class in ['odoc', 'faz', 'polyp']
-    if args.img_class == 'faz':
+    assert args.img_class in ['odoc', 'faz', 'polyp', 'prostate']
+    if args.img_class in ['faz', 'prostate']:
         assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
     else:
         assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
