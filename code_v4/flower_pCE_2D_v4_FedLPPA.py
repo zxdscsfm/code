@@ -1,5 +1,6 @@
 # -*- coding:utf-8 -*-
 import argparse
+import json
 import logging
 import os
 import random
@@ -14,6 +15,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from scipy import ndimage
 from tensorboardX import SummaryWriter
 from torch.nn import BCEWithLogitsLoss
 from torch.nn.modules.loss import CrossEntropyLoss, KLDivLoss, MSELoss, L1Loss
@@ -32,7 +34,11 @@ import copy
 from torch.cuda.amp import autocast, GradScaler
 
 from dataloaders import utils
-from dataloaders.dataset import BaseDataSets, RandomGenerator
+from dataloaders.dataset import (
+    BaseDataSets,
+    RandomGenerator,
+    infer_unlabeled_value_from_label,
+)
 from networks.net_factory import net_factory
 from utils import losses, metrics, ramps
 from val_2D import test_single_volume, test_single_volume_ds
@@ -59,6 +65,23 @@ def build_geometry_weight_map(geometry_bin, weight_values):
     weight_tensor = torch.tensor(weight_values, device=geometry_bin.device, dtype=torch.float32)
     geometry_bin = geometry_bin.long().clamp(0, len(weight_values) - 1)
     return weight_tensor[geometry_bin]
+
+
+def build_linear_geometry_weight_list(num_bins, alpha=0.8, floor=0.2):
+    num_bins = int(num_bins)
+    alpha = float(alpha)
+    floor = float(floor)
+    if num_bins <= 0:
+        raise ValueError('num_bins must be positive, got {}'.format(num_bins))
+    if num_bins == 1:
+        return [1.0]
+    values = []
+    for bin_idx in range(num_bins):
+        progress = float(bin_idx) / float(max(num_bins - 1, 1))
+        value = 1.0 - (alpha * progress)
+        value = max(floor, min(1.0, value))
+        values.append(float(value))
+    return values
 
 
 def weighted_pseudo_dice_loss(inputs, target, pixel_weight=None):
@@ -460,9 +483,735 @@ class MyClient(BaseClient):
         self.teacher_current_lr = self.current_lr
         self._init_adaptive_pl_state()
         self._load_adaptive_pl_state()
+        self._init_trustgeo_state()
+        self._init_dg_state()
+        self._init_support_bonus_state()
 
     def _adaptive_pl_is_enabled(self):
         return bool(getattr(self.args, 'adaptive_pl_enabled', 0)) and self.args.strategy in ['FedUniV2', 'FedUniV2.1']
+
+    def _trustgeo_is_enabled(self):
+        return bool(getattr(self.args, 'trustgeo_enabled', 0)) and bool(getattr(self.args, 'geometry_guided', 0))
+
+    def _support_bonus_is_enabled(self):
+        return bool(getattr(self.args, 'support_bonus_enabled', 0)) and bool(getattr(self.args, 'geometry_guided', 0))
+
+    def _dg_is_enabled(self):
+        return bool(getattr(self.args, 'dg_enabled', 0)) and bool(getattr(self.args, 'geometry_guided', 0))
+
+    def _build_default_geometry_weight_values(self):
+        return parse_geometry_weight_list(
+            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
+            int(getattr(self.args, 'geometry_num_bins', 4)),
+        )
+
+    def _get_dg_cache_path(self):
+        return os.path.join(self.args.snapshot_path, 'dg_dataset_audit.json')
+
+    def _get_dg_local_audit_path(self, client_id=None):
+        if client_id is None:
+            client_id = self.cid
+        return os.path.join(self.args.snapshot_path, 'dg_client_{}_audit.json'.format(int(client_id)))
+
+    def _subsample_dg_cases(self, cases, max_cases):
+        if max_cases <= 0 or len(cases) <= max_cases:
+            return list(cases)
+        keep_indices = np.linspace(0, len(cases) - 1, num=max_cases, dtype=np.int64)
+        keep_indices = sorted(set(int(x) for x in keep_indices.tolist()))
+        return [cases[idx] for idx in keep_indices]
+
+    def _get_dg_cache_key(self):
+        return {
+            'dg_impl_version': 'v1-dg-local-audit-v2',
+            'img_class': self.args.img_class,
+            'root_path': os.path.abspath(self.args.root_path),
+            'min_num_clients': int(self.args.min_num_clients),
+            'dg_max_audit_samples': int(getattr(self.args, 'dg_max_audit_samples', 64)),
+            'dg_max_prop_samples': int(getattr(self.args, 'dg_max_prop_samples', 16)),
+            'dg_local_std_kernel': int(getattr(self.args, 'dg_local_std_kernel', 15)),
+            'dg_far_radius': float(getattr(self.args, 'dg_far_radius', 24.0)),
+            'dg_sep_near_radius': float(getattr(self.args, 'dg_sep_near_radius', 8.0)),
+            'dg_sep_mid_radius': float(getattr(self.args, 'dg_sep_mid_radius', 24.0)),
+            'dg_sep_far_radius': float(getattr(self.args, 'dg_sep_far_radius', 48.0)),
+            'dg_min_fg_pixels': int(getattr(self.args, 'dg_min_fg_pixels', 8)),
+            'dg_min_ring_pixels': int(getattr(self.args, 'dg_min_ring_pixels', 64)),
+            'dg_min_non_seed_pixels': int(getattr(self.args, 'dg_min_non_seed_pixels', 128)),
+            'dg_hom_tau': float(getattr(self.args, 'dg_hom_tau', 0.75)),
+            'dg_sep_tau': float(getattr(self.args, 'dg_sep_tau', 0.25)),
+            'dg_prop_seed_keep_ratio1': float(getattr(self.args, 'dg_prop_seed_keep_ratio1', 0.85)),
+            'dg_prop_seed_keep_ratio2': float(getattr(self.args, 'dg_prop_seed_keep_ratio2', 0.70)),
+            'dg_prop_min_seed_pixels': int(getattr(self.args, 'dg_prop_min_seed_pixels', 4)),
+            'dg_prop_min_keep_pixels': int(getattr(self.args, 'dg_prop_min_keep_pixels', 2)),
+            'dg_prop_min_region_pixels': int(getattr(self.args, 'dg_prop_min_region_pixels', 16)),
+            'dg_prop_dist_std_scale': float(getattr(self.args, 'dg_prop_dist_std_scale', 1.0)),
+            'dg_dataset_w_sep': float(getattr(self.args, 'dg_dataset_w_sep', 0.60)),
+            'dg_dataset_w_hom': float(getattr(self.args, 'dg_dataset_w_hom', 0.30)),
+            'dg_dataset_w_prop': float(getattr(self.args, 'dg_dataset_w_prop', 0.10)),
+        }
+
+    def _write_json_atomic(self, path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = '{}.tmp.{}.{}'.format(path, os.getpid(), int(time.time() * 1000))
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, path)
+
+    def _load_json_if_matching(self, path, cache_key):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+        except Exception:
+            return None
+        if payload.get('cache_key') != cache_key:
+            return None
+        return payload
+
+    def _iter_local_dg_cases(self):
+        dataset = getattr(self.trainloader, 'dataset', None)
+        data_list = getattr(dataset, 'data_list', None)
+        if not data_list:
+            return []
+        cases = []
+        for sample_idx, sample in enumerate(data_list):
+            image = sample.get('image', None)
+            label = sample.get('label', None)
+            if image is None or label is None:
+                continue
+            cases.append({
+                'case_tag': 'client{}_sample{}'.format(self.cid, sample_idx),
+                'image': np.asarray(image, dtype=np.float32),
+                'label': np.asarray(label),
+            })
+        return cases
+
+    def _extract_labeled_and_fg_masks(self, label):
+        label = np.asarray(label)
+        unlabeled_value = infer_unlabeled_value_from_label(label, self.args.img_class)
+        if unlabeled_value is None:
+            labeled_mask = np.ones_like(label, dtype=bool)
+        else:
+            labeled_mask = label != unlabeled_value
+        fg_mask = np.logical_and(labeled_mask, label > 0)
+        return labeled_mask, fg_mask
+
+    def _prepare_dg_feature_maps(self, image):
+        image = np.asarray(image, dtype=np.float32)
+        if image.ndim == 2:
+            image_chw = image[None, ...]
+        elif image.ndim == 3:
+            if image.shape[0] <= 4:
+                image_chw = image
+            elif image.shape[-1] <= 4:
+                image_chw = np.transpose(image, (2, 0, 1))
+            else:
+                image_chw = image[None, ...]
+        else:
+            raise ValueError('Unsupported audit image shape: {}'.format(image.shape))
+
+        image_chw = image_chw.astype(np.float32, copy=False)
+        norm_channels = []
+        for channel in image_chw:
+            mean_val = float(channel.mean())
+            std_val = float(channel.std())
+            norm_channels.append((channel - mean_val) / max(std_val, 1e-6))
+        image_norm = np.stack(norm_channels, axis=0)
+        gray = image_norm.mean(axis=0)
+
+        grad_x = ndimage.sobel(gray, axis=0, mode='reflect')
+        grad_y = ndimage.sobel(gray, axis=1, mode='reflect')
+        grad_mag = np.sqrt(np.maximum((grad_x ** 2) + (grad_y ** 2), 0.0)).astype(np.float32)
+
+        local_std_kernel = int(getattr(self.args, 'dg_local_std_kernel', 15))
+        if local_std_kernel <= 0:
+            local_std_kernel = 15
+        if local_std_kernel % 2 == 0:
+            local_std_kernel += 1
+        mean_map = ndimage.uniform_filter(gray, size=local_std_kernel, mode='reflect')
+        sq_mean_map = ndimage.uniform_filter(gray * gray, size=local_std_kernel, mode='reflect')
+        var_map = np.maximum(sq_mean_map - (mean_map * mean_map), 0.0)
+        local_std = np.sqrt(var_map).astype(np.float32)
+
+        feature_stack = np.stack([gray.astype(np.float32), grad_mag, local_std], axis=0)
+        for feat_idx in range(feature_stack.shape[0]):
+            feat = feature_stack[feat_idx]
+            feat_mean = float(feat.mean())
+            feat_std = float(feat.std())
+            feature_stack[feat_idx] = (feat - feat_mean) / max(feat_std, 1e-6)
+        return gray.astype(np.float32), local_std, feature_stack.astype(np.float32)
+
+    def _compute_dg_homogeneity_score(self, local_std_map, support_mask):
+        far_radius = float(getattr(self.args, 'dg_far_radius', 24.0))
+        if support_mask.any():
+            dist_to_seed = ndimage.distance_transform_edt(~support_mask)
+            non_seed_mask = dist_to_seed >= far_radius
+        else:
+            non_seed_mask = np.ones_like(support_mask, dtype=bool)
+        min_pixels = int(getattr(self.args, 'dg_min_non_seed_pixels', 128))
+        if int(non_seed_mask.sum()) < min_pixels:
+            if support_mask.any():
+                dist_to_seed = ndimage.distance_transform_edt(~support_mask)
+                non_seed_mask = dist_to_seed >= max(8.0, 0.5 * far_radius)
+        if int(non_seed_mask.sum()) < min_pixels:
+            return 0.5
+        mean_local_std = float(local_std_map[non_seed_mask].mean())
+        hom_tau = float(getattr(self.args, 'dg_hom_tau', 0.75))
+        return float(np.exp(-mean_local_std / max(hom_tau, 1e-6)))
+
+    def _compute_dg_separability_score(self, feature_stack, support_mask):
+        min_fg_pixels = int(getattr(self.args, 'dg_min_fg_pixels', 8))
+        if int(support_mask.sum()) < min_fg_pixels:
+            return 0.5
+        dist_to_seed = ndimage.distance_transform_edt(~support_mask)
+        near_radius = float(getattr(self.args, 'dg_sep_near_radius', 8.0))
+        mid_radius = float(getattr(self.args, 'dg_sep_mid_radius', 24.0))
+        far_radius = float(getattr(self.args, 'dg_sep_far_radius', 48.0))
+        near_mask = np.logical_and(dist_to_seed > 0.0, dist_to_seed <= near_radius)
+        mid_mask = np.logical_and(dist_to_seed > near_radius, dist_to_seed <= mid_radius)
+        far_mask = np.logical_and(dist_to_seed > mid_radius, dist_to_seed <= far_radius)
+        min_ring_pixels = int(getattr(self.args, 'dg_min_ring_pixels', 64))
+        if min(int(near_mask.sum()), int(mid_mask.sum()), int(far_mask.sum())) < min_ring_pixels:
+            return 0.5
+
+        seed_feat = feature_stack[:, support_mask].mean(axis=1)
+        near_feat = feature_stack[:, near_mask].mean(axis=1)
+        mid_feat = feature_stack[:, mid_mask].mean(axis=1)
+        far_feat = feature_stack[:, far_mask].mean(axis=1)
+        d_near = float(np.linalg.norm(near_feat - seed_feat))
+        d_mid = float(np.linalg.norm(mid_feat - seed_feat))
+        d_far = float(np.linalg.norm(far_feat - seed_feat))
+        sep_tau = float(getattr(self.args, 'dg_sep_tau', 0.25))
+        score_nm = 1.0 / (1.0 + np.exp(-(d_mid - d_near) / max(sep_tau, 1e-6)))
+        score_mf = 1.0 / (1.0 + np.exp(-(d_far - d_mid) / max(sep_tau, 1e-6)))
+        return float(0.5 * (score_nm + score_mf))
+
+    def _perturb_dg_support_mask(self, support_mask, keep_ratio, rng):
+        support_mask = np.asarray(support_mask, dtype=bool)
+        coords = np.argwhere(support_mask)
+        if len(coords) <= int(getattr(self.args, 'dg_prop_min_seed_pixels', 4)):
+            return support_mask.copy()
+        keep_count = max(
+            int(getattr(self.args, 'dg_prop_min_keep_pixels', 2)),
+            int(round(len(coords) * float(keep_ratio))),
+        )
+        keep_count = min(keep_count, len(coords))
+        perm = rng.permutation(len(coords))
+        keep_coords = coords[perm[:keep_count]]
+        perturbed = np.zeros_like(support_mask, dtype=bool)
+        if len(keep_coords) > 0:
+            perturbed[tuple(keep_coords.T)] = True
+        return perturbed
+
+    def _binary_iou(self, mask_a, mask_b):
+        mask_a = np.asarray(mask_a, dtype=bool)
+        mask_b = np.asarray(mask_b, dtype=bool)
+        union = int(np.logical_or(mask_a, mask_b).sum())
+        if union <= 0:
+            return 0.0
+        inter = int(np.logical_and(mask_a, mask_b).sum())
+        return float(inter) / float(union)
+
+    def _build_dg_support_region(self, feature_stack, support_mask):
+        support_mask = np.asarray(support_mask, dtype=bool)
+        if int(support_mask.sum()) < int(getattr(self.args, 'dg_prop_min_seed_pixels', 4)):
+            return np.zeros_like(support_mask, dtype=bool)
+        support_feat = feature_stack[:, support_mask]
+        support_mean = support_feat.mean(axis=1)
+        support_dist = np.linalg.norm(support_feat.T - support_mean[None, :], axis=1)
+        dist_map = np.linalg.norm(feature_stack - support_mean[:, None, None], axis=0)
+        dist_thr = float(np.median(support_dist) + (float(getattr(self.args, 'dg_prop_dist_std_scale', 1.0)) * np.std(support_dist)))
+        region_mask = dist_map <= max(dist_thr, 1e-6)
+        return np.asarray(region_mask, dtype=bool)
+
+    def _compute_dg_propagation_score(self, feature_stack, support_mask, case_tag):
+        min_fg_pixels = int(getattr(self.args, 'dg_min_fg_pixels', 8))
+        if int(support_mask.sum()) < min_fg_pixels:
+            return 0.5
+
+        base_fg = self._build_dg_support_region(feature_stack, support_mask)
+        if int(base_fg.sum()) < int(getattr(self.args, 'dg_prop_min_region_pixels', 16)):
+            return 0.0
+
+        base_seed = int(sum(ord(ch) for ch in str(case_tag)) % (2 ** 32 - 1))
+        rng = np.random.RandomState(base_seed)
+        keep_ratio_1 = float(getattr(self.args, 'dg_prop_seed_keep_ratio1', 0.85))
+        keep_ratio_2 = float(getattr(self.args, 'dg_prop_seed_keep_ratio2', 0.70))
+        mask_p1 = self._perturb_dg_support_mask(support_mask, keep_ratio_1, rng)
+        mask_p2 = self._perturb_dg_support_mask(support_mask, keep_ratio_2, rng)
+        fg_p1 = self._build_dg_support_region(feature_stack, mask_p1)
+        fg_p2 = self._build_dg_support_region(feature_stack, mask_p2)
+        iou_scores = [
+            self._binary_iou(base_fg, fg_p1),
+            self._binary_iou(base_fg, fg_p2),
+            self._binary_iou(fg_p1, fg_p2),
+        ]
+        return float(np.mean(iou_scores))
+
+    def _compute_local_dg_audit(self):
+        cases = self._iter_local_dg_cases()
+        if not cases:
+            return {
+                'homogeneity': 0.5,
+                'separability': 0.5,
+                'propagation': 0.5,
+                'strength': 0.5,
+                'num_cases': 0,
+                'num_prop_cases': 0,
+            }
+        audit_cases = self._subsample_dg_cases(cases, int(getattr(self.args, 'dg_max_audit_samples', 64)))
+        prop_case_tags = {
+            case['case_tag'] for case in self._subsample_dg_cases(audit_cases, int(getattr(self.args, 'dg_max_prop_samples', 16)))
+        }
+        homogeneity_scores = []
+        separability_scores = []
+        propagation_scores = []
+        for case in audit_cases:
+            image = np.asarray(case['image'], dtype=np.float32)
+            label = np.asarray(case['label'])
+            support_mask, fg_mask = self._extract_labeled_and_fg_masks(label)
+            if int(support_mask.sum()) <= 0:
+                continue
+            _, local_std_map, feature_stack = self._prepare_dg_feature_maps(image)
+            homogeneity_scores.append(self._compute_dg_homogeneity_score(local_std_map, support_mask))
+            separability_scores.append(self._compute_dg_separability_score(feature_stack, support_mask))
+            if case['case_tag'] in prop_case_tags:
+                propagation_scores.append(self._compute_dg_propagation_score(feature_stack, support_mask, case_tag=case['case_tag']))
+
+        homogeneity = float(np.median(np.asarray(homogeneity_scores, dtype=np.float32))) if homogeneity_scores else 0.5
+        separability = float(np.median(np.asarray(separability_scores, dtype=np.float32))) if separability_scores else 0.5
+        propagation = float(np.median(np.asarray(propagation_scores, dtype=np.float32))) if propagation_scores else 0.5
+        w_sep = float(getattr(self.args, 'dg_dataset_w_sep', 0.60))
+        w_hom = float(getattr(self.args, 'dg_dataset_w_hom', 0.30))
+        w_prop = float(getattr(self.args, 'dg_dataset_w_prop', 0.10))
+        strength = float(np.clip((w_sep * separability) + (w_hom * homogeneity) + (w_prop * propagation), 0.0, 1.0))
+        return {
+            'homogeneity': homogeneity,
+            'separability': separability,
+            'propagation': propagation,
+            'strength': strength,
+            'num_cases': len(audit_cases),
+            'num_prop_cases': len(propagation_scores),
+        }
+
+    def _aggregate_dg_dataset_audit(self, local_audits):
+        if not local_audits:
+            return {
+                'homogeneity': 0.5,
+                'separability': 0.5,
+                'propagation': 0.5,
+                'strength': 0.5,
+                'num_cases': 0,
+                'num_prop_cases': 0,
+                'num_client_audits': 0,
+            }
+        homogeneity = float(np.median(np.asarray([x['homogeneity'] for x in local_audits], dtype=np.float32)))
+        separability = float(np.median(np.asarray([x['separability'] for x in local_audits], dtype=np.float32)))
+        propagation = float(np.median(np.asarray([x['propagation'] for x in local_audits], dtype=np.float32)))
+        w_sep = float(getattr(self.args, 'dg_dataset_w_sep', 0.60))
+        w_hom = float(getattr(self.args, 'dg_dataset_w_hom', 0.30))
+        w_prop = float(getattr(self.args, 'dg_dataset_w_prop', 0.10))
+        strength = float(np.clip((w_sep * separability) + (w_hom * homogeneity) + (w_prop * propagation), 0.0, 1.0))
+        return {
+            'homogeneity': homogeneity,
+            'separability': separability,
+            'propagation': propagation,
+            'strength': strength,
+            'num_cases': int(sum(int(x.get('num_cases', 0)) for x in local_audits)),
+            'num_prop_cases': int(sum(int(x.get('num_prop_cases', 0)) for x in local_audits)),
+            'num_client_audits': int(len(local_audits)),
+        }
+
+    def _load_all_dg_local_audits_with_wait(self, cache_key):
+        expected_clients = int(getattr(self.args, 'min_num_clients', 1))
+        timeout_sec = float(getattr(self.args, 'dg_audit_wait_timeout_sec', 300.0))
+        poll_sec = float(getattr(self.args, 'dg_audit_wait_poll_sec', 2.0))
+        start_time = time.time()
+        last_loaded = -1
+        while True:
+            loaded = []
+            for client_id in range(expected_clients):
+                payload = self._load_json_if_matching(self._get_dg_local_audit_path(client_id), cache_key)
+                if payload is None or not isinstance(payload.get('audit'), dict):
+                    continue
+                loaded.append(payload['audit'])
+            if len(loaded) != last_loaded:
+                log(INFO, 'Client {} dg waiting: loaded {}/{} local audits'.format(self.cid, len(loaded), expected_clients))
+                last_loaded = len(loaded)
+            if len(loaded) >= expected_clients:
+                return loaded, True
+            if (time.time() - start_time) >= timeout_sec:
+                return loaded, False
+            time.sleep(max(poll_sec, 0.1))
+
+    def _load_or_compute_dg_dataset_audit(self):
+        cache_path = self._get_dg_cache_path()
+        cache_key = self._get_dg_cache_key()
+        cache_obj = self._load_json_if_matching(cache_path, cache_key)
+        if cache_obj is not None and isinstance(cache_obj.get('audit'), dict):
+            return cache_obj['audit']
+
+        local_audit_path = self._get_dg_local_audit_path()
+        local_payload = self._load_json_if_matching(local_audit_path, cache_key)
+        if local_payload is None or not isinstance(local_payload.get('audit'), dict):
+            local_audit = self._compute_local_dg_audit()
+            local_payload = {
+                'cache_key': cache_key,
+                'client_id': int(self.cid),
+                'local_num_cases': int(len(self._iter_local_dg_cases())),
+                'audit': local_audit,
+            }
+            try:
+                self._write_json_atomic(local_audit_path, local_payload)
+            except Exception:
+                pass
+
+        local_audits, all_ready = self._load_all_dg_local_audits_with_wait(cache_key)
+        audit = self._aggregate_dg_dataset_audit(local_audits)
+        try:
+            if all_ready:
+                self._write_json_atomic(cache_path, {'cache_key': cache_key, 'audit': audit})
+        except Exception:
+            pass
+        return audit
+
+    def _iter_train_supervision_labels(self):
+        dataset = getattr(self.trainloader, 'dataset', None)
+        data_list = getattr(dataset, 'data_list', None)
+        if not data_list:
+            return []
+
+        train_labels = []
+        for sample in data_list:
+            if 'label' not in sample:
+                continue
+            train_labels.append(np.asarray(sample['label']))
+        return train_labels
+
+    def _compute_weak_label_structure_stats(self, dilation_radius, density_kernel=None, mask_mode='foreground'):
+        train_labels = self._iter_train_supervision_labels()
+        if not train_labels:
+            return 0.0, 0.0, 0.0
+
+        dilation_radius = int(dilation_radius)
+        if dilation_radius > 0:
+            dilation_kernel_size = (2 * dilation_radius) + 1
+            dilation_structure = np.ones((dilation_kernel_size, dilation_kernel_size), dtype=np.uint8)
+        else:
+            dilation_structure = None
+
+        if density_kernel is not None:
+            density_kernel = max(1, int(density_kernel))
+            if density_kernel % 2 == 0:
+                density_kernel += 1
+
+        coverages = []
+        dilated_coverages = []
+        densities = []
+        for label in train_labels:
+            unlabeled_value = infer_unlabeled_value_from_label(label, self.args.img_class)
+            if unlabeled_value is None:
+                labeled_mask = np.ones_like(label, dtype=bool)
+            else:
+                labeled_mask = label != unlabeled_value
+            fg_mask = np.logical_and(labeled_mask, label > 0)
+            if mask_mode == 'foreground':
+                support_mask = fg_mask
+            elif mask_mode == 'labeled':
+                support_mask = labeled_mask
+            else:
+                raise ValueError('Unsupported mask_mode: {}'.format(mask_mode))
+
+            coverages.append(float(support_mask.mean()))
+            if dilation_structure is not None and support_mask.any():
+                dilated_support_mask = ndimage.binary_dilation(support_mask, structure=dilation_structure)
+            else:
+                dilated_support_mask = support_mask
+            dilated_coverages.append(float(dilated_support_mask.mean()))
+            if density_kernel is not None and support_mask.any():
+                density_map = ndimage.uniform_filter(support_mask.astype(np.float32), size=density_kernel, mode='constant')
+                densities.append(float(np.median(density_map[support_mask])))
+            else:
+                densities.append(0.0)
+
+        coverage_client = float(np.median(np.asarray(coverages, dtype=np.float32)))
+        dilated_coverage_client = float(np.median(np.asarray(dilated_coverages, dtype=np.float32)))
+        density_client = float(np.median(np.asarray(densities, dtype=np.float32)))
+        return coverage_client, dilated_coverage_client, density_client
+
+    def _compute_support_bonus_client_stats(self):
+        fg_coverage_client, dilated_fg_coverage_client, density_client = self._compute_weak_label_structure_stats(
+            dilation_radius=int(getattr(self.args, 'support_bonus_dilation_radius', 5)),
+            density_kernel=int(getattr(self.args, 'support_bonus_density_kernel', 11)),
+            mask_mode='foreground',
+        )
+        tau_c = float(getattr(self.args, 'support_bonus_tau_c', 0.05))
+        tau_d = float(getattr(self.args, 'support_bonus_tau_d', 0.20))
+        coverage_score = 1.0 - np.exp(-fg_coverage_client / max(tau_c, 1e-8))
+        dilated_score = 1.0 - np.exp(-dilated_fg_coverage_client / max(tau_d, 1e-8))
+        density_score = float(np.clip(density_client, 0.0, 1.0))
+        trust_score = float(np.clip((0.5 * coverage_score) + (0.3 * dilated_score) + (0.2 * density_score), 0.0, 1.0))
+        bonus_strength = float(getattr(self.args, 'support_bonus_lambda', 0.10)) * trust_score
+        return fg_coverage_client, dilated_fg_coverage_client, density_client, bonus_strength
+
+    def _init_support_bonus_state(self):
+        self.support_bonus_fg_coverage = 0.0
+        self.support_bonus_dilated_fg_coverage = 0.0
+        self.support_bonus_density = 0.0
+        self.support_bonus_strength = 0.0
+        if not self._support_bonus_is_enabled():
+            return
+        (
+            self.support_bonus_fg_coverage,
+            self.support_bonus_dilated_fg_coverage,
+            self.support_bonus_density,
+            self.support_bonus_strength,
+        ) = self._compute_support_bonus_client_stats()
+        log(
+            INFO,
+            'Client {} support-bonus: fg_coverage={:.6f}, dilated_fg_coverage={:.6f}, density={:.6f}, bonus_strength={:.6f}'.format(
+                self.cid,
+                self.support_bonus_fg_coverage,
+                self.support_bonus_dilated_fg_coverage,
+                self.support_bonus_density,
+                self.support_bonus_strength,
+            ),
+        )
+
+    def _compute_trustgeo_client_stats(self):
+        fg_coverage_client, dilated_fg_coverage_client, fg_density_client = self._compute_weak_label_structure_stats(
+            dilation_radius=int(getattr(self.args, 'trustgeo_dilation_radius', 5)),
+            density_kernel=int(getattr(self.args, 'trustgeo_density_kernel', 11)),
+            mask_mode='foreground',
+        )
+        support_coverage_client, dilated_support_coverage_client, support_density_client = self._compute_weak_label_structure_stats(
+            dilation_radius=int(getattr(self.args, 'trustgeo_dilation_radius', 5)),
+            density_kernel=int(getattr(self.args, 'trustgeo_density_kernel', 11)),
+            mask_mode='labeled',
+        )
+
+        c_low = float(getattr(self.args, 'trustgeo_c_low', 0.0015))
+        c_high = float(getattr(self.args, 'trustgeo_c_high', 0.0400))
+        d_low = float(getattr(self.args, 'trustgeo_d_low', 0.0060))
+        d_high = float(getattr(self.args, 'trustgeo_d_high', 0.0900))
+        support_low = float(getattr(self.args, 'trustgeo_support_low', 0.0100))
+        support_high = float(getattr(self.args, 'trustgeo_support_high', 0.1500))
+        support_mod_min = float(getattr(self.args, 'trustgeo_support_mod_min', 0.85))
+        w_c = float(getattr(self.args, 'trustgeo_w_c', 0.70))
+        w_d = float(getattr(self.args, 'trustgeo_w_d', 0.30))
+
+        coverage_score = float(np.clip((fg_coverage_client - c_low) / max(c_high - c_low, 1e-8), 0.0, 1.0))
+        dilated_score = float(np.clip((dilated_fg_coverage_client - d_low) / max(d_high - d_low, 1e-8), 0.0, 1.0))
+        support_score = float(np.clip((support_coverage_client - support_low) / max(support_high - support_low, 1e-8), 0.0, 1.0))
+        support_mod = float(np.clip(support_mod_min + ((1.0 - support_mod_min) * support_score), support_mod_min, 1.0))
+
+        # Foreground coverage is the primary trust signal; labeled support only
+        # acts as a weak modulation so that large annotated support cannot
+        # "rescue" a client whose foreground anchors are intrinsically too sparse.
+        if fg_coverage_client <= c_low:
+            trust_score = 0.0
+            base_score = 0.0
+        else:
+            base_score = float(np.clip((w_c * coverage_score) + (w_d * dilated_score), 0.0, 1.0))
+            trust_score = base_score * support_mod
+        return (
+            fg_coverage_client,
+            dilated_fg_coverage_client,
+            fg_density_client,
+            support_coverage_client,
+            dilated_support_coverage_client,
+            support_density_client,
+            coverage_score,
+            dilated_score,
+            support_score,
+            support_mod,
+            base_score,
+            trust_score,
+        )
+
+    def _init_trustgeo_state(self):
+        self.trustgeo_fg_coverage = 0.0
+        self.trustgeo_dilated_fg_coverage = 0.0
+        self.trustgeo_fg_density = 0.0
+        self.trustgeo_support_coverage = 0.0
+        self.trustgeo_dilated_support_coverage = 0.0
+        self.trustgeo_support_density = 0.0
+        self.trustgeo_coverage_score = 0.0
+        self.trustgeo_dilated_score = 0.0
+        self.trustgeo_support_score = 0.0
+        self.trustgeo_support_mod = 1.0
+        self.trustgeo_base_strength = 0.0
+        self.trustgeo_strength = 0.0
+        self.trustgeo_prior_weights = self._build_default_geometry_weight_values()
+        if not self._trustgeo_is_enabled():
+            return
+        self.trustgeo_prior_weights = build_linear_geometry_weight_list(
+            int(getattr(self.args, 'geometry_num_bins', 4)),
+            alpha=float(getattr(self.args, 'trustgeo_prior_alpha', 0.8)),
+            floor=float(getattr(self.args, 'trustgeo_prior_floor', 0.2)),
+        )
+        (
+            self.trustgeo_fg_coverage,
+            self.trustgeo_dilated_fg_coverage,
+            self.trustgeo_fg_density,
+            self.trustgeo_support_coverage,
+            self.trustgeo_dilated_support_coverage,
+            self.trustgeo_support_density,
+            self.trustgeo_coverage_score,
+            self.trustgeo_dilated_score,
+            self.trustgeo_support_score,
+            self.trustgeo_support_mod,
+            self.trustgeo_base_strength,
+            self.trustgeo_strength,
+        ) = self._compute_trustgeo_client_stats()
+        log(
+            INFO,
+            'Client {} trustgeo: fg_coverage={:.6f}, dilated_fg_coverage={:.6f}, fg_density={:.6f}, support_coverage={:.6f}, dilated_support_coverage={:.6f}, support_density={:.6f}, s_c={:.4f}, s_d={:.4f}, support_score={:.4f}, support_mod={:.4f}, base_lambda={:.6f}, lambda_client={:.6f}, prior_weights={}'.format(
+                self.cid,
+                self.trustgeo_fg_coverage,
+                self.trustgeo_dilated_fg_coverage,
+                self.trustgeo_fg_density,
+                self.trustgeo_support_coverage,
+                self.trustgeo_dilated_support_coverage,
+                self.trustgeo_support_density,
+                self.trustgeo_coverage_score,
+                self.trustgeo_dilated_score,
+                self.trustgeo_support_score,
+                self.trustgeo_support_mod,
+                self.trustgeo_base_strength,
+                self.trustgeo_strength,
+                [round(x, 4) for x in self.trustgeo_prior_weights],
+            ),
+        )
+
+    def _init_dg_state(self):
+        self.dg_dataset_homogeneity = 0.5
+        self.dg_dataset_separability = 0.5
+        self.dg_dataset_propagation = 0.5
+        self.dg_dataset_strength = 0.5
+        self.dg_dataset_num_cases = 0
+        self.dg_dataset_num_prop_cases = 0
+        self.dg_dataset_num_client_audits = 0
+        self.dg_fg_coverage = 0.0
+        self.dg_dilated_fg_coverage = 0.0
+        self.dg_fg_density = 0.0
+        self.dg_support_coverage = 0.0
+        self.dg_dilated_support_coverage = 0.0
+        self.dg_support_density = 0.0
+        self.dg_coverage_score = 0.0
+        self.dg_dilated_score = 0.0
+        self.dg_support_score = 0.0
+        self.dg_support_mod = 1.0
+        self.dg_client_base_strength = 0.0
+        self.dg_client_strength = 0.0
+        self.dg_strength = 0.0
+        self.dg_prior_weights = self._build_default_geometry_weight_values()
+        if not self._dg_is_enabled():
+            return
+        self.dg_prior_weights = build_linear_geometry_weight_list(
+            int(getattr(self.args, 'geometry_num_bins', 4)),
+            alpha=float(getattr(self.args, 'trustgeo_prior_alpha', 0.8)),
+            floor=float(getattr(self.args, 'trustgeo_prior_floor', 0.2)),
+        )
+        audit = self._load_or_compute_dg_dataset_audit()
+        self.dg_dataset_homogeneity = float(audit.get('homogeneity', 0.5))
+        self.dg_dataset_separability = float(audit.get('separability', 0.5))
+        self.dg_dataset_propagation = float(audit.get('propagation', 0.5))
+        self.dg_dataset_strength = float(audit.get('strength', 0.5))
+        self.dg_dataset_num_cases = int(audit.get('num_cases', 0))
+        self.dg_dataset_num_prop_cases = int(audit.get('num_prop_cases', 0))
+        self.dg_dataset_num_client_audits = int(audit.get('num_client_audits', 0))
+        (
+            self.dg_fg_coverage,
+            self.dg_dilated_fg_coverage,
+            self.dg_fg_density,
+            self.dg_support_coverage,
+            self.dg_dilated_support_coverage,
+            self.dg_support_density,
+            self.dg_coverage_score,
+            self.dg_dilated_score,
+            self.dg_support_score,
+            self.dg_support_mod,
+            self.dg_client_base_strength,
+            self.dg_client_strength,
+        ) = self._compute_trustgeo_client_stats()
+        self.dg_strength = float(np.clip(self.dg_dataset_strength * self.dg_client_strength, 0.0, 1.0))
+        log(
+            INFO,
+            'Client {} dg: g_dataset={:.6f} (sep={:.4f}, hom={:.4f}, prop={:.4f}, cases={}, prop_cases={}, client_audits={}), '
+            'e_client={:.6f}, e_client_base={:.6f}, lambda_client={:.6f}, fg_coverage={:.6f}, dilated_fg_coverage={:.6f}, '
+            's_c={:.4f}, s_d={:.4f}, support_mod={:.4f}, prior_weights={}'.format(
+                self.cid,
+                self.dg_dataset_strength,
+                self.dg_dataset_separability,
+                self.dg_dataset_homogeneity,
+                self.dg_dataset_propagation,
+                self.dg_dataset_num_cases,
+                self.dg_dataset_num_prop_cases,
+                self.dg_dataset_num_client_audits,
+                self.dg_client_strength,
+                self.dg_client_base_strength,
+                self.dg_strength,
+                self.dg_fg_coverage,
+                self.dg_dilated_fg_coverage,
+                self.dg_coverage_score,
+                self.dg_dilated_score,
+                self.dg_support_mod,
+                [round(x, 4) for x in self.dg_prior_weights],
+            ),
+        )
+
+    def _build_support_bonus_weight_map(self, label_batch, target_batch=None):
+        weight_map = torch.ones_like(label_batch, dtype=torch.float32, device=label_batch.device)
+        if target_batch is None:
+            return weight_map
+        support_radius = int(getattr(self.args, 'support_bonus_support_radius', 5))
+        bonus_strength = float(np.clip(self.support_bonus_strength, 0.0, 1.0))
+        if support_radius <= 0 or bonus_strength <= 0.0:
+            return weight_map
+
+        unlabeled_mask = (label_batch == self.args.num_classes)
+        target_batch = target_batch.to(device=label_batch.device, dtype=label_batch.dtype)
+        support_mask = torch.zeros_like(unlabeled_mask, dtype=torch.bool)
+        kernel_size = (2 * support_radius) + 1
+
+        # Make the bonus class-aware: a pixel only receives extra weight if its
+        # pseudo target matches the nearby weak foreground seed class.
+        for class_idx in range(1, int(self.args.num_classes)):
+            class_seed_mask = label_batch == class_idx
+            if not bool(class_seed_mask.any().item()):
+                continue
+            dilated_seed = F.max_pool2d(
+                class_seed_mask.float().unsqueeze(1),
+                kernel_size=kernel_size,
+                stride=1,
+                padding=support_radius,
+            ).squeeze(1) > 0.0
+            class_support = unlabeled_mask & dilated_seed & (target_batch == class_idx)
+            support_mask = support_mask | class_support
+        return weight_map + (bonus_strength * support_mask.float())
+
+    def _build_effective_geometry_weight_map(self, geometry_bin_batch, label_batch=None, target_batch=None, apply_support_bonus=True):
+        if self._support_bonus_is_enabled():
+            if label_batch is None:
+                if geometry_bin_batch is None:
+                    return None
+                return torch.ones_like(geometry_bin_batch, dtype=torch.float32, device=geometry_bin_batch.device)
+            if not apply_support_bonus:
+                return torch.ones_like(label_batch, dtype=torch.float32, device=label_batch.device)
+            return self._build_support_bonus_weight_map(label_batch, target_batch=target_batch)
+        if geometry_bin_batch is None:
+            return None
+        if self._dg_is_enabled():
+            prior_weight_map = build_geometry_weight_map(geometry_bin_batch, self.dg_prior_weights)
+            strength = float(np.clip(self.dg_strength, 0.0, 1.0))
+            return 1.0 + (strength * (prior_weight_map - 1.0))
+        if self._trustgeo_is_enabled():
+            prior_weight_map = build_geometry_weight_map(geometry_bin_batch, self.trustgeo_prior_weights)
+            strength = float(np.clip(self.trustgeo_strength, 0.0, 1.0))
+            return 1.0 + (strength * (prior_weight_map - 1.0))
+        geometry_weight_values = self._build_default_geometry_weight_values()
+        return build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
 
     def _init_adaptive_pl_state(self):
         num_bins = int(getattr(self.args, 'geometry_num_bins', 4))
@@ -820,6 +1569,37 @@ class MyClient(BaseClient):
         log_interval = int(getattr(self.args, 'adaptive_pl_log_interval', 50))
         if log_interval <= 0 or self.current_iter % log_interval != 0:
             return
+        if self._dg_is_enabled():
+            writer.add_scalar('client_{}/dg/dataset_homogeneity'.format(self.cid), float(self.dg_dataset_homogeneity), self.current_iter)
+            writer.add_scalar('client_{}/dg/dataset_separability'.format(self.cid), float(self.dg_dataset_separability), self.current_iter)
+            writer.add_scalar('client_{}/dg/dataset_propagation'.format(self.cid), float(self.dg_dataset_propagation), self.current_iter)
+            writer.add_scalar('client_{}/dg/dataset_strength'.format(self.cid), float(self.dg_dataset_strength), self.current_iter)
+            writer.add_scalar('client_{}/dg/dataset_num_client_audits'.format(self.cid), float(self.dg_dataset_num_client_audits), self.current_iter)
+            writer.add_scalar('client_{}/dg/client_base_strength'.format(self.cid), float(self.dg_client_base_strength), self.current_iter)
+            writer.add_scalar('client_{}/dg/client_strength'.format(self.cid), float(self.dg_client_strength), self.current_iter)
+            writer.add_scalar('client_{}/dg/strength'.format(self.cid), float(self.dg_strength), self.current_iter)
+            writer.add_scalar('client_{}/dg/fg_coverage'.format(self.cid), float(self.dg_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/dg/dilated_fg_coverage'.format(self.cid), float(self.dg_dilated_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/dg/s_c'.format(self.cid), float(self.dg_coverage_score), self.current_iter)
+            writer.add_scalar('client_{}/dg/s_d'.format(self.cid), float(self.dg_dilated_score), self.current_iter)
+        if self._trustgeo_is_enabled():
+            writer.add_scalar('client_{}/trustgeo/fg_coverage'.format(self.cid), float(self.trustgeo_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/dilated_fg_coverage'.format(self.cid), float(self.trustgeo_dilated_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/fg_density'.format(self.cid), float(self.trustgeo_fg_density), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/support_coverage'.format(self.cid), float(self.trustgeo_support_coverage), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/dilated_support_coverage'.format(self.cid), float(self.trustgeo_dilated_support_coverage), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/support_density'.format(self.cid), float(self.trustgeo_support_density), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/s_c'.format(self.cid), float(self.trustgeo_coverage_score), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/s_d'.format(self.cid), float(self.trustgeo_dilated_score), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/support_score'.format(self.cid), float(self.trustgeo_support_score), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/support_mod'.format(self.cid), float(self.trustgeo_support_mod), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/base_strength'.format(self.cid), float(self.trustgeo_base_strength), self.current_iter)
+            writer.add_scalar('client_{}/trustgeo/strength'.format(self.cid), float(self.trustgeo_strength), self.current_iter)
+        if self._support_bonus_is_enabled():
+            writer.add_scalar('client_{}/support_bonus/fg_coverage'.format(self.cid), float(self.support_bonus_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/support_bonus/dilated_fg_coverage'.format(self.cid), float(self.support_bonus_dilated_fg_coverage), self.current_iter)
+            writer.add_scalar('client_{}/support_bonus/density'.format(self.cid), float(self.support_bonus_density), self.current_iter)
+            writer.add_scalar('client_{}/support_bonus/strength'.format(self.cid), float(self.support_bonus_strength), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/lg_class_agree_ratio'.format(self.cid), float(self.adaptive_pl_last_lg_class_agree_ratio), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/lg_class_agree_ema'.format(self.cid), float(self.adaptive_pl_lg_agreement_ema), self.current_iter)
         writer.add_scalar('client_{}/adaptive_pl/mean_prob_gap'.format(self.cid), float(self.adaptive_pl_last_mean_prob_gap), self.current_iter)
@@ -1031,11 +1811,6 @@ class MyClient(BaseClient):
         conf_gap = reliability['conf_gap']
         agree_lg = reliability['agree_lg']
         score = reliability['score']
-        geometry_weight_values = parse_geometry_weight_list(
-            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-            int(getattr(self.args, 'geometry_num_bins', 4)),
-        )
-        geometry_weight_map = build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
         tau_values = torch.tensor(self.adaptive_pl_tau, device=geometry_bin_batch.device, dtype=score.dtype)
         tau_map = tau_values[geometry_bin_batch.long().clamp(0, len(self.adaptive_pl_tau) - 1)]
         unlabeled_mask = label_batch == self.args.num_classes
@@ -1126,9 +1901,15 @@ class MyClient(BaseClient):
         lambda_dynamic = torch.exp(-blend_kappa * conf_gap).clamp(1e-6, 1.0)
         corrected_prob = lambda_dynamic.unsqueeze(1) * local_prob + (1.0 - lambda_dynamic).unsqueeze(1) * global_prob
         hard_target = torch.argmax(corrected_prob, dim=1)
+        supervision_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=hard_target.detach(),
+            apply_support_bonus=True,
+        )
 
-        hard_weight = geometry_weight_map * hard_mask.float() * valid_mask.float()
-        soft_weight = geometry_weight_map * soft_mask.float() * valid_mask.float()
+        hard_weight = supervision_weight_map * hard_mask.float() * valid_mask.float()
+        soft_weight = supervision_weight_map * soft_mask.float() * valid_mask.float()
         loss_hard_1 = weighted_pseudo_dice_loss(outputs_soft, hard_target, hard_weight)
         loss_hard_2 = weighted_pseudo_dice_loss(outputs_soft_auxiliary, hard_target, hard_weight)
         loss_soft_1 = weighted_reverse_kl_loss(outputs, corrected_prob, soft_weight)
@@ -1221,11 +2002,12 @@ class MyClient(BaseClient):
         conf_gap = reliability['conf_gap']
         agree_lg = reliability['agree_lg']
         score = reliability['score']
-        geometry_weight_values = parse_geometry_weight_list(
-            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-            int(getattr(self.args, 'geometry_num_bins', 4)),
+        risk_geometry_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=None,
+            apply_support_bonus=False,
         )
-        geometry_weight_map = build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
         tau_values = torch.tensor(self.adaptive_pl_tau, device=geometry_bin_batch.device, dtype=score.dtype)
         tau_map = tau_values[geometry_bin_batch.long().clamp(0, len(self.adaptive_pl_tau) - 1)]
         unlabeled_mask = label_batch == self.args.num_classes
@@ -1437,10 +2219,23 @@ class MyClient(BaseClient):
             corrected_prob_soft = corrected_prob_soft * prior_scale.view(1, -1, 1, 1)
             corrected_prob_soft = corrected_prob_soft / corrected_prob_soft.sum(dim=1, keepdim=True).clamp_min(1e-6)
         hard_target = torch.argmax(corrected_prob, dim=1)
+        soft_target = torch.argmax(corrected_prob_soft.detach(), dim=1)
+        hard_supervision_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=hard_target.detach(),
+            apply_support_bonus=True,
+        )
+        soft_supervision_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=soft_target,
+            apply_support_bonus=True,
+        )
 
-        hard_weight = geometry_weight_map * hard_mask.float() * valid_mask.float()
-        soft_weight = geometry_weight_map * soft_mask.float() * valid_mask.float()
-        risk_weight = geometry_weight_map * both_uncertain.float() * valid_mask.float()
+        hard_weight = hard_supervision_weight_map * hard_mask.float() * valid_mask.float()
+        soft_weight = soft_supervision_weight_map * soft_mask.float() * valid_mask.float()
+        risk_weight = risk_geometry_weight_map * both_uncertain.float() * valid_mask.float()
         loss_hard_1 = weighted_pseudo_dice_loss(outputs_soft, hard_target, hard_weight)
         loss_hard_2 = weighted_pseudo_dice_loss(outputs_soft_auxiliary, hard_target, hard_weight)
         loss_soft_1 = weighted_reverse_kl_loss(outputs, corrected_prob_soft, soft_weight)
@@ -1547,11 +2342,12 @@ class MyClient(BaseClient):
         global_prob = reliability['global_prob']
         conf_global = reliability['conf_global']
         score = reliability['score']
-        geometry_weight_values = parse_geometry_weight_list(
-            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-            int(getattr(self.args, 'geometry_num_bins', 4)),
+        risk_geometry_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=None,
+            apply_support_bonus=False,
         )
-        geometry_weight_map = build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
         tau_values = torch.tensor(self.adaptive_pl_tau, device=geometry_bin_batch.device, dtype=score.dtype)
         tau_map = tau_values[geometry_bin_batch.long().clamp(0, len(self.adaptive_pl_tau) - 1)]
         valid_mask = (label_batch == self.args.num_classes).bool()
@@ -1597,7 +2393,7 @@ class MyClient(BaseClient):
             correction_strength = float(np.clip(aux_max_weight * client_risk, 0.0, aux_max_weight))
 
             both_uncertain = valid_mask & (score < tau_map) & (conf_global < tau_global_min)
-            risk_weight = geometry_weight_map * both_uncertain.float() * valid_mask.float()
+            risk_weight = risk_geometry_weight_map * both_uncertain.float() * valid_mask.float()
             if risk_weight.sum().item() > 0 and correction_strength > 0.0:
                 loss_corr_1 = weighted_reverse_kl_loss(outputs, global_prob, risk_weight)
                 loss_corr_2 = weighted_reverse_kl_loss(outputs_auxiliary, global_prob, risk_weight)
@@ -1715,11 +2511,12 @@ class MyClient(BaseClient):
         conf_gap = reliability['conf_gap']
         agree_lg = reliability['agree_lg']
         score = reliability['score']
-        geometry_weight_values = parse_geometry_weight_list(
-            getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-            int(getattr(self.args, 'geometry_num_bins', 4)),
+        risk_geometry_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=None,
+            apply_support_bonus=False,
         )
-        geometry_weight_map = build_geometry_weight_map(geometry_bin_batch, geometry_weight_values)
         tau_values = torch.tensor(self.adaptive_pl_tau, device=geometry_bin_batch.device, dtype=score.dtype)
         tau_map = tau_values[geometry_bin_batch.long().clamp(0, len(self.adaptive_pl_tau) - 1)]
         unlabeled_mask = label_batch == self.args.num_classes
@@ -2042,10 +2839,23 @@ class MyClient(BaseClient):
                 seed_support_active = False
 
         hard_target = torch.argmax(corrected_prob, dim=1)
+        soft_target = torch.argmax(corrected_prob_soft.detach(), dim=1)
+        hard_supervision_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=hard_target.detach(),
+            apply_support_bonus=True,
+        )
+        soft_supervision_weight_map = self._build_effective_geometry_weight_map(
+            geometry_bin_batch,
+            label_batch=label_batch,
+            target_batch=soft_target,
+            apply_support_bonus=True,
+        )
 
-        hard_weight = geometry_weight_map * hard_mask.float() * valid_mask.float()
-        soft_weight = geometry_weight_map * soft_mask.float() * valid_mask.float()
-        risk_weight = geometry_weight_map * both_uncertain.float() * valid_mask.float()
+        hard_weight = hard_supervision_weight_map * hard_mask.float() * valid_mask.float()
+        soft_weight = soft_supervision_weight_map * soft_mask.float() * valid_mask.float()
+        risk_weight = risk_geometry_weight_map * both_uncertain.float() * valid_mask.float()
         loss_hard_1 = weighted_pseudo_dice_loss(outputs_soft, hard_target, hard_weight)
         loss_hard_2 = weighted_pseudo_dice_loss(outputs_soft_auxiliary, hard_target, hard_weight)
         loss_soft_1 = weighted_reverse_kl_loss(outputs, corrected_prob_soft, soft_weight)
@@ -2412,13 +3222,11 @@ class MyClient(BaseClient):
             else:
                 geometry_weight_map = None
                 if getattr(self.args, 'geometry_guided', 0) == 1 and geometry_bin_batch is not None:
-                    geometry_weight_values = parse_geometry_weight_list(
-                        getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-                        int(getattr(self.args, 'geometry_num_bins', 4)),
-                    )
-                    geometry_weight_map = build_geometry_weight_map(
+                    geometry_weight_map = self._build_effective_geometry_weight_map(
                         geometry_bin_batch,
-                        geometry_weight_values,
+                        label_batch=label_batch,
+                        target_batch=pseudo_label,
+                        apply_support_bonus=True,
                     )
                 if self._adaptive_pl_is_enabled() and geometry_weight_map is not None:
                     adaptive_pl_result = self._compute_adaptive_pl_loss(
@@ -3070,13 +3878,11 @@ class MyClient(BaseClient):
                                 pseudo_label = adaptive_pl_result['hard_target']
                                 adaptive_pl_applied = True
                             else:
-                                geometry_weight_values = parse_geometry_weight_list(
-                                    getattr(self.args, 'geometry_pseudo_weights', '1.0,0.8,0.5,0.2'),
-                                    int(getattr(self.args, 'geometry_num_bins', 4)),
-                                )
-                                geometry_weight_map = build_geometry_weight_map(
+                                geometry_weight_map = self._build_effective_geometry_weight_map(
                                     geometry_bin_batch,
-                                    geometry_weight_values,
+                                    label_batch=label_batch,
+                                    target_batch=pseudo_label,
+                                    apply_support_bonus=True,
                                 )
                         if adaptive_pl_applied:
                             pass
@@ -3202,6 +4008,37 @@ class MyClient(BaseClient):
         if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
             metrics_['client_{}_loss_uni'.format(self.cid)] = loss_uni.item()
             metrics_['client_{}_loss_pls'.format(self.cid)] = loss_pls.item()
+            if self._dg_is_enabled():
+                metrics_['client_{}_dg_dataset_homogeneity'.format(self.cid)] = float(self.dg_dataset_homogeneity)
+                metrics_['client_{}_dg_dataset_separability'.format(self.cid)] = float(self.dg_dataset_separability)
+                metrics_['client_{}_dg_dataset_propagation'.format(self.cid)] = float(self.dg_dataset_propagation)
+                metrics_['client_{}_dg_dataset_strength'.format(self.cid)] = float(self.dg_dataset_strength)
+                metrics_['client_{}_dg_dataset_num_client_audits'.format(self.cid)] = float(self.dg_dataset_num_client_audits)
+                metrics_['client_{}_dg_client_base_strength'.format(self.cid)] = float(self.dg_client_base_strength)
+                metrics_['client_{}_dg_client_strength'.format(self.cid)] = float(self.dg_client_strength)
+                metrics_['client_{}_dg_strength'.format(self.cid)] = float(self.dg_strength)
+                metrics_['client_{}_dg_fg_coverage'.format(self.cid)] = float(self.dg_fg_coverage)
+                metrics_['client_{}_dg_dilated_fg_coverage'.format(self.cid)] = float(self.dg_dilated_fg_coverage)
+                metrics_['client_{}_dg_s_c'.format(self.cid)] = float(self.dg_coverage_score)
+                metrics_['client_{}_dg_s_d'.format(self.cid)] = float(self.dg_dilated_score)
+            if self._trustgeo_is_enabled():
+                metrics_['client_{}_trustgeo_strength'.format(self.cid)] = float(self.trustgeo_strength)
+                metrics_['client_{}_trustgeo_fg_coverage'.format(self.cid)] = float(self.trustgeo_fg_coverage)
+                metrics_['client_{}_trustgeo_dilated_fg_coverage'.format(self.cid)] = float(self.trustgeo_dilated_fg_coverage)
+                metrics_['client_{}_trustgeo_fg_density'.format(self.cid)] = float(self.trustgeo_fg_density)
+                metrics_['client_{}_trustgeo_support_coverage'.format(self.cid)] = float(self.trustgeo_support_coverage)
+                metrics_['client_{}_trustgeo_dilated_support_coverage'.format(self.cid)] = float(self.trustgeo_dilated_support_coverage)
+                metrics_['client_{}_trustgeo_support_density'.format(self.cid)] = float(self.trustgeo_support_density)
+                metrics_['client_{}_trustgeo_s_c'.format(self.cid)] = float(self.trustgeo_coverage_score)
+                metrics_['client_{}_trustgeo_s_d'.format(self.cid)] = float(self.trustgeo_dilated_score)
+                metrics_['client_{}_trustgeo_support_score'.format(self.cid)] = float(self.trustgeo_support_score)
+                metrics_['client_{}_trustgeo_support_mod'.format(self.cid)] = float(self.trustgeo_support_mod)
+                metrics_['client_{}_trustgeo_base_strength'.format(self.cid)] = float(self.trustgeo_base_strength)
+            if self._support_bonus_is_enabled():
+                metrics_['client_{}_support_bonus_strength'.format(self.cid)] = float(self.support_bonus_strength)
+                metrics_['client_{}_support_bonus_fg_coverage'.format(self.cid)] = float(self.support_bonus_fg_coverage)
+                metrics_['client_{}_support_bonus_dilated_fg_coverage'.format(self.cid)] = float(self.support_bonus_dilated_fg_coverage)
+                metrics_['client_{}_support_bonus_density'.format(self.cid)] = float(self.support_bonus_density)
             if self._adaptive_pl_is_enabled():
                 w5_soft_only_enabled = bool(getattr(self.args, 'risk_calibration_w5_soft_only_enabled', 0))
                 if bool(getattr(self.args, 'risk_calibration_v1_enabled', 0)):
@@ -3452,6 +4289,96 @@ def main():
                         help='Mid-radius threshold for rule-based geometry bins')
     parser.add_argument('--geometry_pseudo_weights', type=str, default='1.0,0.8,0.5,0.2',
                         help='Comma-separated pseudo-label weights for geometry bins 0..K-1')
+    parser.add_argument('--trustgeo_enabled', type=int, default=0,
+                        help='Enable static client-level geometry qualification to interpolate between v1B and a fixed geometry prior.')
+    parser.add_argument('--trustgeo_dilation_radius', type=int, default=5,
+                        help='Pixel radius used when computing trustgeo weak-label structure statistics.')
+    parser.add_argument('--trustgeo_density_kernel', type=int, default=11,
+                        help='Odd kernel size used to estimate local weak-label densities for trustgeo diagnostics.')
+    parser.add_argument('--trustgeo_c_low', type=float, default=0.0015,
+                        help='Lower raw foreground-coverage bound for piecewise-linear trustgeo qualification.')
+    parser.add_argument('--trustgeo_c_high', type=float, default=0.0400,
+                        help='Upper raw foreground-coverage bound for piecewise-linear trustgeo qualification.')
+    parser.add_argument('--trustgeo_d_low', type=float, default=0.0060,
+                        help='Lower dilated foreground-coverage bound for piecewise-linear trustgeo qualification.')
+    parser.add_argument('--trustgeo_d_high', type=float, default=0.0900,
+                        help='Upper dilated foreground-coverage bound for piecewise-linear trustgeo qualification.')
+    parser.add_argument('--trustgeo_support_low', type=float, default=0.0100,
+                        help='Lower labeled-support-coverage bound used by the weak trustgeo modulation term.')
+    parser.add_argument('--trustgeo_support_high', type=float, default=0.1500,
+                        help='Upper labeled-support-coverage bound used by the weak trustgeo modulation term.')
+    parser.add_argument('--trustgeo_support_mod_min', type=float, default=0.85,
+                        help='Minimum multiplicative modulation applied from labeled support to the foreground-driven trustgeo score.')
+    parser.add_argument('--trustgeo_w_c', type=float, default=0.70,
+                        help='Weight assigned to raw foreground coverage in trustgeo qualification.')
+    parser.add_argument('--trustgeo_w_d', type=float, default=0.30,
+                        help='Weight assigned to dilated foreground coverage in trustgeo qualification.')
+    parser.add_argument('--trustgeo_prior_alpha', type=float, default=0.8,
+                        help='Linear decay strength for the fixed geometry prior used by trustgeo.')
+    parser.add_argument('--trustgeo_prior_floor', type=float, default=0.2,
+                        help='Minimum bin weight floor for the fixed geometry prior used by trustgeo.')
+    parser.add_argument('--dg_enabled', type=int, default=0,
+                        help='Enable dataset-level geometry audit that gates client-level geometry qualification.')
+    parser.add_argument('--dg_max_audit_samples', type=int, default=64,
+                        help='Maximum number of train cases used for the dataset-level geometry audit.')
+    parser.add_argument('--dg_max_prop_samples', type=int, default=16,
+                        help='Maximum number of train cases used for the weak propagation stability probe.')
+    parser.add_argument('--dg_local_std_kernel', type=int, default=15,
+                        help='Odd kernel size used for local texture-homogeneity estimation in dataset audit.')
+    parser.add_argument('--dg_far_radius', type=float, default=24.0,
+                        help='Distance threshold that defines the non-seed region for homogeneity audit.')
+    parser.add_argument('--dg_sep_near_radius', type=float, default=8.0,
+                        help='Near-ring radius used by the appearance separability audit.')
+    parser.add_argument('--dg_sep_mid_radius', type=float, default=24.0,
+                        help='Mid-ring radius used by the appearance separability audit.')
+    parser.add_argument('--dg_sep_far_radius', type=float, default=48.0,
+                        help='Far-ring radius used by the appearance separability audit.')
+    parser.add_argument('--dg_min_fg_pixels', type=int, default=8,
+                        help='Minimum weak-foreground pixels required to score a case in dataset audit.')
+    parser.add_argument('--dg_min_ring_pixels', type=int, default=64,
+                        help='Minimum ring pixels required for a valid appearance-separability score.')
+    parser.add_argument('--dg_min_non_seed_pixels', type=int, default=128,
+                        help='Minimum non-seed pixels required for a valid homogeneity score.')
+    parser.add_argument('--dg_hom_tau', type=float, default=0.75,
+                        help='Scale parameter used to convert non-seed texture roughness into a homogeneity score.')
+    parser.add_argument('--dg_sep_tau', type=float, default=0.25,
+                        help='Scale parameter used in the monotonic appearance-separability logistic score.')
+    parser.add_argument('--dg_prop_seed_keep_ratio1', type=float, default=0.85,
+                        help='First seed-retention ratio used in the weak propagation stability probe.')
+    parser.add_argument('--dg_prop_seed_keep_ratio2', type=float, default=0.70,
+                        help='Second seed-retention ratio used in the weak propagation stability probe.')
+    parser.add_argument('--dg_prop_min_seed_pixels', type=int, default=4,
+                        help='Minimum pixels per foreground seed class before seed perturbation is applied.')
+    parser.add_argument('--dg_prop_min_keep_pixels', type=int, default=2,
+                        help='Minimum pixels retained for each foreground seed class in seed perturbation.')
+    parser.add_argument('--dg_prop_min_region_pixels', type=int, default=16,
+                        help='Minimum propagated foreground pixels required for a non-zero propagation stability score.')
+    parser.add_argument('--dg_prop_dist_std_scale', type=float, default=1.0,
+                        help='Std multiplier used by the support-conditioned propagation probe when converting support-feature spread into a growth threshold.')
+    parser.add_argument('--dg_dataset_w_sep', type=float, default=0.60,
+                        help='Weight of appearance separability in the dataset-level geometry gate.')
+    parser.add_argument('--dg_dataset_w_hom', type=float, default=0.30,
+                        help='Weight of non-seed homogeneity in the dataset-level geometry gate.')
+    parser.add_argument('--dg_dataset_w_prop', type=float, default=0.10,
+                        help='Weight of propagation stability in the dataset-level geometry gate.')
+    parser.add_argument('--dg_audit_wait_timeout_sec', type=float, default=300.0,
+                        help='Maximum time each client waits for all local DG audit summaries before falling back to partial aggregation.')
+    parser.add_argument('--dg_audit_wait_poll_sec', type=float, default=2.0,
+                        help='Polling interval used while waiting for peer DG audit summaries.')
+    parser.add_argument('--support_bonus_enabled', type=int, default=0,
+                        help='Enable conservative local support bonus on top of the v1B path.')
+    parser.add_argument('--support_bonus_tau_c', type=float, default=0.05,
+                        help='Saturation constant for raw weak-foreground coverage in support bonus scoring.')
+    parser.add_argument('--support_bonus_tau_d', type=float, default=0.20,
+                        help='Saturation constant for dilated weak-foreground coverage in support bonus scoring.')
+    parser.add_argument('--support_bonus_dilation_radius', type=int, default=5,
+                        help='Pixel radius used when computing dilated weak-foreground support coverage.')
+    parser.add_argument('--support_bonus_density_kernel', type=int, default=11,
+                        help='Odd kernel size used to estimate local weak-label density for support bonus scoring.')
+    parser.add_argument('--support_bonus_support_radius', type=int, default=5,
+                        help='Pixel radius used to define the local support region for support bonus weighting.')
+    parser.add_argument('--support_bonus_lambda', type=float, default=0.10,
+                        help='Maximum extra weight applied inside the local support region, scaled by the client trust score.')
     parser.add_argument('--adaptive_pl_enabled', type=int, default=0,
                         help='Enable adaptive tau-gated pseudo-label selection on top of geometry-guided weighting.')
     parser.add_argument('--adaptive_pl_tau_init', type=float, default=0.55,
@@ -3744,6 +4671,9 @@ def main():
     assert args.eval_iters > 0 and (args.eval_iters % args.iters == 0)
     assert args.max_iterations > 0 and (args.max_iterations % args.eval_iters == 0)
     assert args.geometry_guided in [0, 1]
+    assert args.trustgeo_enabled in [0, 1]
+    assert args.dg_enabled in [0, 1]
+    assert args.support_bonus_enabled in [0, 1]
     assert args.adaptive_pl_enabled in [0, 1]
     assert args.adaptive_pl_tau_update in [0, 1]
     assert args.adaptive_pl_resume_state in [0, 1]
@@ -3752,6 +4682,47 @@ def main():
     assert args.geometry_mid_radius >= args.geometry_near_radius
     _geometry_weights = parse_geometry_weight_list(args.geometry_pseudo_weights, args.geometry_num_bins)
     assert all(x >= 0 for x in _geometry_weights)
+    assert args.trustgeo_dilation_radius >= 0
+    assert args.trustgeo_density_kernel > 0 and (args.trustgeo_density_kernel % 2 == 1)
+    assert 0.0 <= args.trustgeo_c_low < args.trustgeo_c_high <= 1.0
+    assert 0.0 <= args.trustgeo_d_low < args.trustgeo_d_high <= 1.0
+    assert 0.0 <= args.trustgeo_support_low < args.trustgeo_support_high <= 1.0
+    assert 0.0 < args.trustgeo_support_mod_min <= 1.0
+    assert args.trustgeo_w_c >= 0.0 and args.trustgeo_w_d >= 0.0
+    assert abs((args.trustgeo_w_c + args.trustgeo_w_d) - 1.0) < 1e-6
+    assert args.trustgeo_prior_alpha >= 0.0
+    assert 0.0 <= args.trustgeo_prior_floor <= 1.0
+    _trustgeo_prior_weights = build_linear_geometry_weight_list(
+        args.geometry_num_bins,
+        alpha=args.trustgeo_prior_alpha,
+        floor=args.trustgeo_prior_floor,
+    )
+    assert len(_trustgeo_prior_weights) == args.geometry_num_bins
+    assert args.dg_max_audit_samples >= 0
+    assert args.dg_max_prop_samples >= 0
+    assert args.dg_local_std_kernel > 0 and (args.dg_local_std_kernel % 2 == 1)
+    assert args.dg_far_radius >= 0.0
+    assert 0.0 <= args.dg_sep_near_radius < args.dg_sep_mid_radius < args.dg_sep_far_radius
+    assert args.dg_min_fg_pixels >= 1
+    assert args.dg_min_ring_pixels >= 1
+    assert args.dg_min_non_seed_pixels >= 1
+    assert args.dg_hom_tau > 0.0
+    assert args.dg_sep_tau > 0.0
+    assert 0.0 < args.dg_prop_seed_keep_ratio2 <= args.dg_prop_seed_keep_ratio1 <= 1.0
+    assert args.dg_prop_min_seed_pixels >= 1
+    assert args.dg_prop_min_keep_pixels >= 1
+    assert args.dg_prop_min_region_pixels >= 1
+    assert args.dg_prop_dist_std_scale > 0.0
+    assert args.dg_dataset_w_sep >= 0.0 and args.dg_dataset_w_hom >= 0.0 and args.dg_dataset_w_prop >= 0.0
+    assert abs((args.dg_dataset_w_sep + args.dg_dataset_w_hom + args.dg_dataset_w_prop) - 1.0) < 1e-6
+    assert args.dg_audit_wait_timeout_sec >= 0.0
+    assert args.dg_audit_wait_poll_sec > 0.0
+    assert args.support_bonus_tau_c > 0.0
+    assert args.support_bonus_tau_d > 0.0
+    assert args.support_bonus_dilation_radius >= 0
+    assert args.support_bonus_density_kernel > 0 and (args.support_bonus_density_kernel % 2 == 1)
+    assert args.support_bonus_support_radius >= 0
+    assert args.support_bonus_lambda >= 0.0
     assert 0.0 <= args.adaptive_pl_tau_init <= 1.0
     assert 0.0 <= args.adaptive_pl_target_accept <= 1.0
     assert args.adaptive_pl_warmup_iters >= 0
@@ -3871,6 +4842,15 @@ def main():
             assert args.risk_calibration_w6_tail_start_iter >= args.risk_calibration_w5_end_iter
     if args.adaptive_pl_enabled == 1:
         assert args.geometry_guided == 1
+    if args.trustgeo_enabled == 1:
+        assert args.geometry_guided == 1
+    if args.dg_enabled == 1:
+        assert args.geometry_guided == 1
+        assert args.trustgeo_enabled == 0
+    if args.support_bonus_enabled == 1:
+        assert args.geometry_guided == 1
+        assert args.trustgeo_enabled == 0
+        assert args.dg_enabled == 0
     if args.seed_support_enabled == 1:
         assert args.adaptive_pl_enabled == 1
     assert args.ala_num_pre_loss > 0
