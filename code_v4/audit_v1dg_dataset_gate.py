@@ -120,13 +120,13 @@ def compute_homogeneity(local_std_map, support_mask, args):
 
 def compute_separability(feature_stack, support_mask, args):
     if int(support_mask.sum()) < args.dg_min_fg_pixels:
-        return 0.5
+        return None
     dist_to_seed = ndimage.distance_transform_edt(~support_mask)
     near_mask = np.logical_and(dist_to_seed > 0.0, dist_to_seed <= args.dg_sep_near_radius)
     mid_mask = np.logical_and(dist_to_seed > args.dg_sep_near_radius, dist_to_seed <= args.dg_sep_mid_radius)
     far_mask = np.logical_and(dist_to_seed > args.dg_sep_mid_radius, dist_to_seed <= args.dg_sep_far_radius)
     if min(int(near_mask.sum()), int(mid_mask.sum()), int(far_mask.sum())) < args.dg_min_ring_pixels:
-        return 0.5
+        return None
 
     seed_feat = feature_stack[:, support_mask].mean(axis=1)
     near_feat = feature_stack[:, near_mask].mean(axis=1)
@@ -135,9 +135,11 @@ def compute_separability(feature_stack, support_mask, args):
     d_near = float(np.linalg.norm(near_feat - seed_feat))
     d_mid = float(np.linalg.norm(mid_feat - seed_feat))
     d_far = float(np.linalg.norm(far_feat - seed_feat))
-    score_nm = 1.0 / (1.0 + np.exp(-(d_mid - d_near) / max(args.dg_sep_tau, 1e-6)))
-    score_mf = 1.0 / (1.0 + np.exp(-(d_far - d_mid) / max(args.dg_sep_tau, 1e-6)))
-    return float(0.5 * (score_nm + score_mf))
+
+    margin_nm = (d_mid - d_near) / max(d_mid + d_near, 1e-6)
+    margin_mf = (d_far - d_mid) / max(d_far + d_mid, 1e-6)
+    monotonic_margin = (0.7 * max(0.0, margin_nm)) + (0.3 * max(0.0, margin_mf))
+    return float(np.clip(monotonic_margin * args.dg_sep_margin_scale, 0.0, 1.0))
 
 
 def perturb_support_mask(support_mask, keep_ratio, rng, args):
@@ -212,14 +214,18 @@ def compute_local_audit(dataset, cid, args):
             continue
         local_std, feature_stack = prepare_feature_maps(case["image"], args.dg_local_std_kernel)
         hom.append(compute_homogeneity(local_std, support_mask, args))
-        sep.append(compute_separability(feature_stack, support_mask, args))
+        sep_score = compute_separability(feature_stack, support_mask, args)
+        if sep_score is not None:
+            sep.append(sep_score)
         if case["case_tag"] in prop_tags:
             prop.append(compute_propagation(feature_stack, support_mask, case["case_tag"], args))
     return {
         "homogeneity": float(np.median(np.asarray(hom, dtype=np.float32))) if hom else 0.5,
-        "separability": float(np.median(np.asarray(sep, dtype=np.float32))) if sep else 0.5,
+        "separability": float(np.median(np.asarray(sep, dtype=np.float32))) if sep else 0.0,
         "propagation": float(np.median(np.asarray(prop, dtype=np.float32))) if prop else 0.5,
+        "strength": float(np.clip(float(np.median(np.asarray(sep, dtype=np.float32))) if sep else 0.0, 0.0, 1.0) ** args.dg_dataset_strength_power),
         "num_cases": len(cases),
+        "num_sep_cases": len(sep),
         "num_prop_cases": len(prop),
     }
 
@@ -261,19 +267,10 @@ def weak_label_stats(dataset, img_class, dilation_radius=5, density_kernel=11, m
     )
 
 
-def compute_e_client(dataset, args):
+def compute_client_support_stats(dataset, args):
     fg_cov, dil_cov, fg_den = weak_label_stats(dataset, args.img_class, args.trustgeo_dilation_radius, args.trustgeo_density_kernel, "foreground")
     sup_cov, dil_sup_cov, sup_den = weak_label_stats(dataset, args.img_class, args.trustgeo_dilation_radius, args.trustgeo_density_kernel, "labeled")
-    s_c = float(np.clip((fg_cov - args.trustgeo_c_low) / max(args.trustgeo_c_high - args.trustgeo_c_low, 1e-8), 0.0, 1.0))
-    s_d = float(np.clip((dil_cov - args.trustgeo_d_low) / max(args.trustgeo_d_high - args.trustgeo_d_low, 1e-8), 0.0, 1.0))
-    support_score = float(np.clip((sup_cov - args.trustgeo_support_low) / max(args.trustgeo_support_high - args.trustgeo_support_low, 1e-8), 0.0, 1.0))
-    support_mod = float(np.clip(args.trustgeo_support_mod_min + ((1.0 - args.trustgeo_support_mod_min) * support_score), args.trustgeo_support_mod_min, 1.0))
-    if fg_cov <= args.trustgeo_c_low:
-        base = 0.0
-        e_client = 0.0
-    else:
-        base = float(np.clip((args.trustgeo_w_c * s_c) + (args.trustgeo_w_d * s_d), 0.0, 1.0))
-        e_client = base * support_mod
+    client_support_raw = float(max(fg_cov, 0.0))
     return {
         "fg_coverage": fg_cov,
         "dilated_fg_coverage": dil_cov,
@@ -281,30 +278,33 @@ def compute_e_client(dataset, args):
         "support_coverage": sup_cov,
         "dilated_support_coverage": dil_sup_cov,
         "support_density": sup_den,
-        "s_c": s_c,
-        "s_d": s_d,
-        "support_score": support_score,
-        "support_mod": support_mod,
-        "e_client_base": base,
-        "e_client": e_client,
+        "client_support_raw": client_support_raw,
     }
 
 
 def aggregate_dataset(local_audits, args):
-    sep = float(np.median(np.asarray([x["separability"] for x in local_audits], dtype=np.float32)))
+    valid_sep_audits = [x for x in local_audits if int(x.get("num_sep_cases", 0)) > 0]
+    sep_source = valid_sep_audits if valid_sep_audits else local_audits
+    sep = float(np.median(np.asarray([x["separability"] for x in sep_source], dtype=np.float32))) if sep_source else 0.0
     hom = float(np.median(np.asarray([x["homogeneity"] for x in local_audits], dtype=np.float32)))
     prop = float(np.median(np.asarray([x["propagation"] for x in local_audits], dtype=np.float32)))
-    q_no_prop = float(np.clip((0.7 * sep) + (0.3 * hom), 0.0, 1.0))
-    g_old = float(np.clip((args.dg_dataset_w_sep * sep) + (args.dg_dataset_w_hom * hom) + (args.dg_dataset_w_prop * prop), 0.0, 1.0))
+    support_raw_values = [float(x.get("client_support_raw", 0.0)) for x in local_audits if float(x.get("client_support_raw", 0.0)) > 0.0]
+    if support_raw_values:
+        client_support_ref = float(np.percentile(np.asarray(support_raw_values, dtype=np.float32), args.dg_client_ref_percentile))
+    else:
+        client_support_ref = 0.0
+    g_dataset = float(np.clip(sep, 0.0, 1.0) ** args.dg_dataset_strength_power)
     return {
         "separability": sep,
         "homogeneity": hom,
         "propagation": prop,
-        "q_no_prop": q_no_prop,
-        "g_old": g_old,
+        "g_dataset": g_dataset,
         "num_cases": int(sum(x["num_cases"] for x in local_audits)),
+        "num_sep_cases": int(sum(int(x.get("num_sep_cases", 0)) for x in local_audits)),
         "num_prop_cases": int(sum(x["num_prop_cases"] for x in local_audits)),
         "num_client_audits": len(local_audits),
+        "client_support_ref": client_support_ref,
+        "client_support_raw_values": support_raw_values,
     }
 
 
@@ -324,40 +324,47 @@ def audit_dataset(name, cfg, args):
             geometry_guided=False,
         )
         local = compute_local_audit(dataset, cid, args)
+        support_stats = compute_client_support_stats(dataset, args)
+        local["client_support_raw"] = support_stats["client_support_raw"]
         local_audits.append(local)
-        e_stats = compute_e_client(dataset, args)
         client_rows.append({
             "cid": cid,
             "client": client,
             "sup_type": sup_type,
             **local,
-            **e_stats,
+            **support_stats,
         })
     ds = aggregate_dataset(local_audits, args)
     for row in client_rows:
-        row["lambda_old"] = float(ds["g_old"] * row["e_client"])
-        row["lambda_no_prop"] = float(ds["q_no_prop"] * row["e_client"])
+        if ds["client_support_ref"] <= 0.0:
+            relative_support = 0.0
+        else:
+            relative_support = row["client_support_raw"] / max(ds["client_support_ref"], 1e-8)
+        row["relative_support"] = float(relative_support)
+        row["e_client_base"] = float(relative_support)
+        row["e_client"] = float(np.clip(relative_support, 0.0, 1.0))
+        row["lambda_client"] = float(ds["g_dataset"] * row["e_client"])
     return {"dataset": name, "root": root, "dataset_audit": ds, "clients": client_rows}
 
 
 def print_summary(results):
     print("\nDATASET SUMMARY")
-    print("dataset\tsep\thom\tprop\tq_no_prop\tg_old\tcases\tprop_cases")
+    print("dataset\tg_dataset\tsep\thom\tprop\tcases\tsep_cases\tprop_cases\tsupport_ref")
     for r in results:
         a = r["dataset_audit"]
         print(
-            f"{r['dataset']}\t{a['separability']:.6f}\t{a['homogeneity']:.6f}\t"
-            f"{a['propagation']:.6f}\t{a['q_no_prop']:.6f}\t{a['g_old']:.6f}\t"
-            f"{a['num_cases']}\t{a['num_prop_cases']}"
+            f"{r['dataset']}\t{a['g_dataset']:.6f}\t{a['separability']:.6f}\t{a['homogeneity']:.6f}\t"
+            f"{a['propagation']:.6f}\t{a['num_cases']}\t{a['num_sep_cases']}\t{a['num_prop_cases']}\t"
+            f"{a['client_support_ref']:.6f}"
         )
     print("\nCLIENT SUMMARY")
-    print("dataset\tcid\tclient\tsup_type\te_client\tlambda_old\tlambda_no_prop\tfg_cov\tdil_fg_cov")
+    print("dataset\tcid\tclient\tsup_type\te_client\tlambda_client\trel_support\tsupport_raw\tfg_cov\tdil_fg_cov")
     for r in results:
         for c in r["clients"]:
             print(
                 f"{r['dataset']}\t{c['cid']}\t{c['client']}\t{c['sup_type']}\t"
-                f"{c['e_client']:.6f}\t{c['lambda_old']:.6f}\t{c['lambda_no_prop']:.6f}\t"
-                f"{c['fg_coverage']:.6f}\t{c['dilated_fg_coverage']:.6f}"
+                f"{c['e_client']:.6f}\t{c['lambda_client']:.6f}\t{c['relative_support']:.6f}\t"
+                f"{c['client_support_raw']:.6f}\t{c['fg_coverage']:.6f}\t{c['dilated_fg_coverage']:.6f}"
             )
 
 
@@ -378,6 +385,8 @@ def parse_args():
     parser.add_argument("--dg_min_non_seed_pixels", type=int, default=128)
     parser.add_argument("--dg_hom_tau", type=float, default=0.75)
     parser.add_argument("--dg_sep_tau", type=float, default=0.25)
+    parser.add_argument("--dg_sep_margin_scale", type=float, default=2.0)
+    parser.add_argument("--dg_dataset_strength_power", type=float, default=2.0)
     parser.add_argument("--dg_prop_seed_keep_ratio1", type=float, default=0.85)
     parser.add_argument("--dg_prop_seed_keep_ratio2", type=float, default=0.70)
     parser.add_argument("--dg_prop_min_seed_pixels", type=int, default=4)
@@ -387,6 +396,7 @@ def parse_args():
     parser.add_argument("--dg_dataset_w_sep", type=float, default=0.60)
     parser.add_argument("--dg_dataset_w_hom", type=float, default=0.30)
     parser.add_argument("--dg_dataset_w_prop", type=float, default=0.10)
+    parser.add_argument("--dg_client_ref_percentile", type=float, default=75.0)
     parser.add_argument("--trustgeo_dilation_radius", type=int, default=5)
     parser.add_argument("--trustgeo_density_kernel", type=int, default=11)
     parser.add_argument("--trustgeo_c_low", type=float, default=0.0015)

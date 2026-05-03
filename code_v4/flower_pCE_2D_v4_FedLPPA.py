@@ -522,7 +522,7 @@ class MyClient(BaseClient):
 
     def _get_dg_cache_key(self):
         return {
-            'dg_impl_version': 'v1-dg-local-audit-v2',
+            'dg_impl_version': 'v1-dg-local-audit-v5',
             'img_class': self.args.img_class,
             'root_path': os.path.abspath(self.args.root_path),
             'min_num_clients': int(self.args.min_num_clients),
@@ -538,15 +538,15 @@ class MyClient(BaseClient):
             'dg_min_non_seed_pixels': int(getattr(self.args, 'dg_min_non_seed_pixels', 128)),
             'dg_hom_tau': float(getattr(self.args, 'dg_hom_tau', 0.75)),
             'dg_sep_tau': float(getattr(self.args, 'dg_sep_tau', 0.25)),
+            'dg_sep_margin_scale': float(getattr(self.args, 'dg_sep_margin_scale', 2.0)),
+            'dg_dataset_strength_power': float(getattr(self.args, 'dg_dataset_strength_power', 2.0)),
             'dg_prop_seed_keep_ratio1': float(getattr(self.args, 'dg_prop_seed_keep_ratio1', 0.85)),
             'dg_prop_seed_keep_ratio2': float(getattr(self.args, 'dg_prop_seed_keep_ratio2', 0.70)),
             'dg_prop_min_seed_pixels': int(getattr(self.args, 'dg_prop_min_seed_pixels', 4)),
             'dg_prop_min_keep_pixels': int(getattr(self.args, 'dg_prop_min_keep_pixels', 2)),
             'dg_prop_min_region_pixels': int(getattr(self.args, 'dg_prop_min_region_pixels', 16)),
             'dg_prop_dist_std_scale': float(getattr(self.args, 'dg_prop_dist_std_scale', 1.0)),
-            'dg_dataset_w_sep': float(getattr(self.args, 'dg_dataset_w_sep', 0.60)),
-            'dg_dataset_w_hom': float(getattr(self.args, 'dg_dataset_w_hom', 0.30)),
-            'dg_dataset_w_prop': float(getattr(self.args, 'dg_dataset_w_prop', 0.10)),
+            'dg_client_ref_percentile': float(getattr(self.args, 'dg_client_ref_percentile', 75.0)),
         }
 
     def _write_json_atomic(self, path, payload):
@@ -662,7 +662,7 @@ class MyClient(BaseClient):
     def _compute_dg_separability_score(self, feature_stack, support_mask):
         min_fg_pixels = int(getattr(self.args, 'dg_min_fg_pixels', 8))
         if int(support_mask.sum()) < min_fg_pixels:
-            return 0.5
+            return None
         dist_to_seed = ndimage.distance_transform_edt(~support_mask)
         near_radius = float(getattr(self.args, 'dg_sep_near_radius', 8.0))
         mid_radius = float(getattr(self.args, 'dg_sep_mid_radius', 24.0))
@@ -672,7 +672,7 @@ class MyClient(BaseClient):
         far_mask = np.logical_and(dist_to_seed > mid_radius, dist_to_seed <= far_radius)
         min_ring_pixels = int(getattr(self.args, 'dg_min_ring_pixels', 64))
         if min(int(near_mask.sum()), int(mid_mask.sum()), int(far_mask.sum())) < min_ring_pixels:
-            return 0.5
+            return None
 
         seed_feat = feature_stack[:, support_mask].mean(axis=1)
         near_feat = feature_stack[:, near_mask].mean(axis=1)
@@ -681,10 +681,12 @@ class MyClient(BaseClient):
         d_near = float(np.linalg.norm(near_feat - seed_feat))
         d_mid = float(np.linalg.norm(mid_feat - seed_feat))
         d_far = float(np.linalg.norm(far_feat - seed_feat))
-        sep_tau = float(getattr(self.args, 'dg_sep_tau', 0.25))
-        score_nm = 1.0 / (1.0 + np.exp(-(d_mid - d_near) / max(sep_tau, 1e-6)))
-        score_mf = 1.0 / (1.0 + np.exp(-(d_far - d_mid) / max(sep_tau, 1e-6)))
-        return float(0.5 * (score_nm + score_mf))
+
+        margin_nm = (d_mid - d_near) / max(d_mid + d_near, 1e-6)
+        margin_mf = (d_far - d_mid) / max(d_far + d_mid, 1e-6)
+        monotonic_margin = (0.7 * max(0.0, margin_nm)) + (0.3 * max(0.0, margin_mf))
+        margin_scale = float(getattr(self.args, 'dg_sep_margin_scale', 2.0))
+        return float(np.clip(monotonic_margin * margin_scale, 0.0, 1.0))
 
     def _perturb_dg_support_mask(self, support_mask, keep_ratio, rng):
         support_mask = np.asarray(support_mask, dtype=bool)
@@ -748,16 +750,88 @@ class MyClient(BaseClient):
         ]
         return float(np.mean(iou_scores))
 
+    def _compute_dg_client_support_stats(self):
+        fg_coverage_client, dilated_fg_coverage_client, fg_density_client = self._compute_weak_label_structure_stats(
+            dilation_radius=int(getattr(self.args, 'trustgeo_dilation_radius', 5)),
+            density_kernel=int(getattr(self.args, 'trustgeo_density_kernel', 11)),
+            mask_mode='foreground',
+        )
+        support_coverage_client, dilated_support_coverage_client, support_density_client = self._compute_weak_label_structure_stats(
+            dilation_radius=int(getattr(self.args, 'trustgeo_dilation_radius', 5)),
+            density_kernel=int(getattr(self.args, 'trustgeo_density_kernel', 11)),
+            mask_mode='labeled',
+        )
+        client_support_raw = float(max(fg_coverage_client, 0.0))
+        return (
+            fg_coverage_client,
+            dilated_fg_coverage_client,
+            fg_density_client,
+            support_coverage_client,
+            dilated_support_coverage_client,
+            support_density_client,
+            client_support_raw,
+        )
+
+    def _compute_dg_client_stats(self, audit):
+        (
+            fg_coverage_client,
+            dilated_fg_coverage_client,
+            fg_density_client,
+            support_coverage_client,
+            dilated_support_coverage_client,
+            support_density_client,
+            client_support_raw,
+        ) = self._compute_dg_client_support_stats()
+
+        support_ref = float(audit.get('client_support_ref', 0.0))
+        if support_ref <= 0.0:
+            relative_support = 0.0
+        else:
+            relative_support = client_support_raw / max(support_ref, 1e-8)
+        client_strength = float(np.clip(relative_support, 0.0, 1.0))
+
+        return (
+            fg_coverage_client,
+            dilated_fg_coverage_client,
+            fg_density_client,
+            support_coverage_client,
+            dilated_support_coverage_client,
+            support_density_client,
+            client_support_raw,
+            support_ref,
+            relative_support,
+            1.0,
+            relative_support,
+            client_strength,
+        )
+
     def _compute_local_dg_audit(self):
         cases = self._iter_local_dg_cases()
+        (
+            fg_coverage_client,
+            dilated_fg_coverage_client,
+            fg_density_client,
+            support_coverage_client,
+            dilated_support_coverage_client,
+            support_density_client,
+            client_support_raw,
+        ) = self._compute_dg_client_support_stats()
         if not cases:
             return {
                 'homogeneity': 0.5,
-                'separability': 0.5,
+                'separability': 0.0,
                 'propagation': 0.5,
-                'strength': 0.5,
+                'strength': 0.0,
                 'num_cases': 0,
+                'num_sep_cases': 0,
                 'num_prop_cases': 0,
+                'client_support_raw': client_support_raw,
+                'fg_coverage': fg_coverage_client,
+                'dilated_fg_coverage': dilated_fg_coverage_client,
+                'fg_density': fg_density_client,
+                'support_coverage': support_coverage_client,
+                'dilated_support_coverage': dilated_support_coverage_client,
+                'support_density': support_density_client,
             }
         audit_cases = self._subsample_dg_cases(cases, int(getattr(self.args, 'dg_max_audit_samples', 64)))
         prop_case_tags = {
@@ -774,52 +848,77 @@ class MyClient(BaseClient):
                 continue
             _, local_std_map, feature_stack = self._prepare_dg_feature_maps(image)
             homogeneity_scores.append(self._compute_dg_homogeneity_score(local_std_map, support_mask))
-            separability_scores.append(self._compute_dg_separability_score(feature_stack, support_mask))
+            separability_score = self._compute_dg_separability_score(feature_stack, support_mask)
+            if separability_score is not None:
+                separability_scores.append(separability_score)
             if case['case_tag'] in prop_case_tags:
                 propagation_scores.append(self._compute_dg_propagation_score(feature_stack, support_mask, case_tag=case['case_tag']))
 
         homogeneity = float(np.median(np.asarray(homogeneity_scores, dtype=np.float32))) if homogeneity_scores else 0.5
-        separability = float(np.median(np.asarray(separability_scores, dtype=np.float32))) if separability_scores else 0.5
+        separability = float(np.median(np.asarray(separability_scores, dtype=np.float32))) if separability_scores else 0.0
         propagation = float(np.median(np.asarray(propagation_scores, dtype=np.float32))) if propagation_scores else 0.5
-        w_sep = float(getattr(self.args, 'dg_dataset_w_sep', 0.60))
-        w_hom = float(getattr(self.args, 'dg_dataset_w_hom', 0.30))
-        w_prop = float(getattr(self.args, 'dg_dataset_w_prop', 0.10))
-        strength = float(np.clip((w_sep * separability) + (w_hom * homogeneity) + (w_prop * propagation), 0.0, 1.0))
+        strength_power = float(getattr(self.args, 'dg_dataset_strength_power', 2.0))
+        strength = float(np.clip(separability, 0.0, 1.0) ** max(strength_power, 1e-6))
         return {
             'homogeneity': homogeneity,
             'separability': separability,
             'propagation': propagation,
             'strength': strength,
             'num_cases': len(audit_cases),
+            'num_sep_cases': len(separability_scores),
             'num_prop_cases': len(propagation_scores),
+            'client_support_raw': client_support_raw,
+            'fg_coverage': fg_coverage_client,
+            'dilated_fg_coverage': dilated_fg_coverage_client,
+            'fg_density': fg_density_client,
+            'support_coverage': support_coverage_client,
+            'dilated_support_coverage': dilated_support_coverage_client,
+            'support_density': support_density_client,
         }
 
     def _aggregate_dg_dataset_audit(self, local_audits):
         if not local_audits:
             return {
                 'homogeneity': 0.5,
-                'separability': 0.5,
+                'separability': 0.0,
                 'propagation': 0.5,
-                'strength': 0.5,
+                'strength': 0.0,
                 'num_cases': 0,
+                'num_sep_cases': 0,
                 'num_prop_cases': 0,
                 'num_client_audits': 0,
+                'client_support_ref': 0.0,
+                'client_support_raw_values': [],
             }
         homogeneity = float(np.median(np.asarray([x['homogeneity'] for x in local_audits], dtype=np.float32)))
-        separability = float(np.median(np.asarray([x['separability'] for x in local_audits], dtype=np.float32)))
+        valid_sep_audits = [x for x in local_audits if int(x.get('num_sep_cases', 0)) > 0]
+        separability_source = valid_sep_audits if valid_sep_audits else local_audits
+        separability = float(np.median(np.asarray([x['separability'] for x in separability_source], dtype=np.float32)))
         propagation = float(np.median(np.asarray([x['propagation'] for x in local_audits], dtype=np.float32)))
-        w_sep = float(getattr(self.args, 'dg_dataset_w_sep', 0.60))
-        w_hom = float(getattr(self.args, 'dg_dataset_w_hom', 0.30))
-        w_prop = float(getattr(self.args, 'dg_dataset_w_prop', 0.10))
-        strength = float(np.clip((w_sep * separability) + (w_hom * homogeneity) + (w_prop * propagation), 0.0, 1.0))
+        strength_power = float(getattr(self.args, 'dg_dataset_strength_power', 2.0))
+        strength = float(np.clip(separability, 0.0, 1.0) ** max(strength_power, 1e-6))
+        support_raw_values = [
+            float(x.get('client_support_raw', 0.0))
+            for x in local_audits
+            if float(x.get('client_support_raw', 0.0)) > 0.0
+        ]
+        if support_raw_values:
+            ref_percentile = float(getattr(self.args, 'dg_client_ref_percentile', 75.0))
+            ref_percentile = float(np.clip(ref_percentile, 0.0, 100.0))
+            client_support_ref = float(np.percentile(np.asarray(support_raw_values, dtype=np.float32), ref_percentile))
+        else:
+            client_support_ref = 0.0
         return {
             'homogeneity': homogeneity,
             'separability': separability,
             'propagation': propagation,
             'strength': strength,
             'num_cases': int(sum(int(x.get('num_cases', 0)) for x in local_audits)),
+            'num_sep_cases': int(sum(int(x.get('num_sep_cases', 0)) for x in local_audits)),
             'num_prop_cases': int(sum(int(x.get('num_prop_cases', 0)) for x in local_audits)),
             'num_client_audits': int(len(local_audits)),
+            'client_support_ref': client_support_ref,
+            'client_support_raw_values': support_raw_values,
         }
 
     def _load_all_dg_local_audits_with_wait(self, cache_key):
@@ -834,7 +933,9 @@ class MyClient(BaseClient):
                 payload = self._load_json_if_matching(self._get_dg_local_audit_path(client_id), cache_key)
                 if payload is None or not isinstance(payload.get('audit'), dict):
                     continue
-                loaded.append(payload['audit'])
+                audit = dict(payload['audit'])
+                audit['client_id'] = int(payload.get('client_id', client_id))
+                loaded.append(audit)
             if len(loaded) != last_loaded:
                 log(INFO, 'Client {} dg waiting: loaded {}/{} local audits'.format(self.cid, len(loaded), expected_clients))
                 last_loaded = len(loaded)
@@ -1090,6 +1191,7 @@ class MyClient(BaseClient):
         self.dg_dataset_propagation = 0.5
         self.dg_dataset_strength = 0.5
         self.dg_dataset_num_cases = 0
+        self.dg_dataset_num_sep_cases = 0
         self.dg_dataset_num_prop_cases = 0
         self.dg_dataset_num_client_audits = 0
         self.dg_fg_coverage = 0.0
@@ -1119,6 +1221,7 @@ class MyClient(BaseClient):
         self.dg_dataset_propagation = float(audit.get('propagation', 0.5))
         self.dg_dataset_strength = float(audit.get('strength', 0.5))
         self.dg_dataset_num_cases = int(audit.get('num_cases', 0))
+        self.dg_dataset_num_sep_cases = int(audit.get('num_sep_cases', 0))
         self.dg_dataset_num_prop_cases = int(audit.get('num_prop_cases', 0))
         self.dg_dataset_num_client_audits = int(audit.get('num_client_audits', 0))
         (
@@ -1134,19 +1237,20 @@ class MyClient(BaseClient):
             self.dg_support_mod,
             self.dg_client_base_strength,
             self.dg_client_strength,
-        ) = self._compute_trustgeo_client_stats()
+        ) = self._compute_dg_client_stats(audit)
         self.dg_strength = float(np.clip(self.dg_dataset_strength * self.dg_client_strength, 0.0, 1.0))
         log(
             INFO,
-            'Client {} dg: g_dataset={:.6f} (sep={:.4f}, hom={:.4f}, prop={:.4f}, cases={}, prop_cases={}, client_audits={}), '
+            'Client {} dg: g_dataset={:.6f} (sep={:.4f}, hom={:.4f}, prop={:.4f}, cases={}, sep_cases={}, prop_cases={}, client_audits={}), '
             'e_client={:.6f}, e_client_base={:.6f}, lambda_client={:.6f}, fg_coverage={:.6f}, dilated_fg_coverage={:.6f}, '
-            's_c={:.4f}, s_d={:.4f}, support_mod={:.4f}, prior_weights={}'.format(
+            'client_support_raw={:.6f}, client_support_ref={:.6f}, relative_support={:.4f}, prior_weights={}'.format(
                 self.cid,
                 self.dg_dataset_strength,
                 self.dg_dataset_separability,
                 self.dg_dataset_homogeneity,
                 self.dg_dataset_propagation,
                 self.dg_dataset_num_cases,
+                self.dg_dataset_num_sep_cases,
                 self.dg_dataset_num_prop_cases,
                 self.dg_dataset_num_client_audits,
                 self.dg_client_strength,
@@ -1156,7 +1260,7 @@ class MyClient(BaseClient):
                 self.dg_dilated_fg_coverage,
                 self.dg_coverage_score,
                 self.dg_dilated_score,
-                self.dg_support_mod,
+                self.dg_support_score,
                 [round(x, 4) for x in self.dg_prior_weights],
             ),
         )
@@ -1574,14 +1678,16 @@ class MyClient(BaseClient):
             writer.add_scalar('client_{}/dg/dataset_separability'.format(self.cid), float(self.dg_dataset_separability), self.current_iter)
             writer.add_scalar('client_{}/dg/dataset_propagation'.format(self.cid), float(self.dg_dataset_propagation), self.current_iter)
             writer.add_scalar('client_{}/dg/dataset_strength'.format(self.cid), float(self.dg_dataset_strength), self.current_iter)
+            writer.add_scalar('client_{}/dg/dataset_num_sep_cases'.format(self.cid), float(self.dg_dataset_num_sep_cases), self.current_iter)
             writer.add_scalar('client_{}/dg/dataset_num_client_audits'.format(self.cid), float(self.dg_dataset_num_client_audits), self.current_iter)
             writer.add_scalar('client_{}/dg/client_base_strength'.format(self.cid), float(self.dg_client_base_strength), self.current_iter)
             writer.add_scalar('client_{}/dg/client_strength'.format(self.cid), float(self.dg_client_strength), self.current_iter)
             writer.add_scalar('client_{}/dg/strength'.format(self.cid), float(self.dg_strength), self.current_iter)
             writer.add_scalar('client_{}/dg/fg_coverage'.format(self.cid), float(self.dg_fg_coverage), self.current_iter)
             writer.add_scalar('client_{}/dg/dilated_fg_coverage'.format(self.cid), float(self.dg_dilated_fg_coverage), self.current_iter)
-            writer.add_scalar('client_{}/dg/s_c'.format(self.cid), float(self.dg_coverage_score), self.current_iter)
-            writer.add_scalar('client_{}/dg/s_d'.format(self.cid), float(self.dg_dilated_score), self.current_iter)
+            writer.add_scalar('client_{}/dg/client_support_raw'.format(self.cid), float(self.dg_coverage_score), self.current_iter)
+            writer.add_scalar('client_{}/dg/client_support_ref'.format(self.cid), float(self.dg_dilated_score), self.current_iter)
+            writer.add_scalar('client_{}/dg/relative_support'.format(self.cid), float(self.dg_support_score), self.current_iter)
         if self._trustgeo_is_enabled():
             writer.add_scalar('client_{}/trustgeo/fg_coverage'.format(self.cid), float(self.trustgeo_fg_coverage), self.current_iter)
             writer.add_scalar('client_{}/trustgeo/dilated_fg_coverage'.format(self.cid), float(self.trustgeo_dilated_fg_coverage), self.current_iter)
@@ -4013,14 +4119,16 @@ class MyClient(BaseClient):
                 metrics_['client_{}_dg_dataset_separability'.format(self.cid)] = float(self.dg_dataset_separability)
                 metrics_['client_{}_dg_dataset_propagation'.format(self.cid)] = float(self.dg_dataset_propagation)
                 metrics_['client_{}_dg_dataset_strength'.format(self.cid)] = float(self.dg_dataset_strength)
+                metrics_['client_{}_dg_dataset_num_sep_cases'.format(self.cid)] = float(self.dg_dataset_num_sep_cases)
                 metrics_['client_{}_dg_dataset_num_client_audits'.format(self.cid)] = float(self.dg_dataset_num_client_audits)
                 metrics_['client_{}_dg_client_base_strength'.format(self.cid)] = float(self.dg_client_base_strength)
                 metrics_['client_{}_dg_client_strength'.format(self.cid)] = float(self.dg_client_strength)
                 metrics_['client_{}_dg_strength'.format(self.cid)] = float(self.dg_strength)
                 metrics_['client_{}_dg_fg_coverage'.format(self.cid)] = float(self.dg_fg_coverage)
                 metrics_['client_{}_dg_dilated_fg_coverage'.format(self.cid)] = float(self.dg_dilated_fg_coverage)
-                metrics_['client_{}_dg_s_c'.format(self.cid)] = float(self.dg_coverage_score)
-                metrics_['client_{}_dg_s_d'.format(self.cid)] = float(self.dg_dilated_score)
+                metrics_['client_{}_dg_client_support_raw'.format(self.cid)] = float(self.dg_coverage_score)
+                metrics_['client_{}_dg_client_support_ref'.format(self.cid)] = float(self.dg_dilated_score)
+                metrics_['client_{}_dg_relative_support'.format(self.cid)] = float(self.dg_support_score)
             if self._trustgeo_is_enabled():
                 metrics_['client_{}_trustgeo_strength'.format(self.cid)] = float(self.trustgeo_strength)
                 metrics_['client_{}_trustgeo_fg_coverage'.format(self.cid)] = float(self.trustgeo_fg_coverage)
@@ -4343,6 +4451,10 @@ def main():
                         help='Scale parameter used to convert non-seed texture roughness into a homogeneity score.')
     parser.add_argument('--dg_sep_tau', type=float, default=0.25,
                         help='Scale parameter used in the monotonic appearance-separability logistic score.')
+    parser.add_argument('--dg_sep_margin_scale', type=float, default=2.0,
+                        help='Positive-part scale applied to normalized appearance-distance monotonicity in the dataset-level geometry gate.')
+    parser.add_argument('--dg_dataset_strength_power', type=float, default=2.0,
+                        help='Power used to conservatively sharpen the dataset-level geometry gate from separability.')
     parser.add_argument('--dg_prop_seed_keep_ratio1', type=float, default=0.85,
                         help='First seed-retention ratio used in the weak propagation stability probe.')
     parser.add_argument('--dg_prop_seed_keep_ratio2', type=float, default=0.70,
@@ -4361,6 +4473,8 @@ def main():
                         help='Weight of non-seed homogeneity in the dataset-level geometry gate.')
     parser.add_argument('--dg_dataset_w_prop', type=float, default=0.10,
                         help='Weight of propagation stability in the dataset-level geometry gate.')
+    parser.add_argument('--dg_client_ref_percentile', type=float, default=75.0,
+                        help='Percentile of positive client foreground support used as the within-dataset DG client support reference.')
     parser.add_argument('--dg_audit_wait_timeout_sec', type=float, default=300.0,
                         help='Maximum time each client waits for all local DG audit summaries before falling back to partial aggregation.')
     parser.add_argument('--dg_audit_wait_poll_sec', type=float, default=2.0,
@@ -4708,6 +4822,8 @@ def main():
     assert args.dg_min_non_seed_pixels >= 1
     assert args.dg_hom_tau > 0.0
     assert args.dg_sep_tau > 0.0
+    assert args.dg_sep_margin_scale > 0.0
+    assert args.dg_dataset_strength_power > 0.0
     assert 0.0 < args.dg_prop_seed_keep_ratio2 <= args.dg_prop_seed_keep_ratio1 <= 1.0
     assert args.dg_prop_min_seed_pixels >= 1
     assert args.dg_prop_min_keep_pixels >= 1
@@ -4715,6 +4831,7 @@ def main():
     assert args.dg_prop_dist_std_scale > 0.0
     assert args.dg_dataset_w_sep >= 0.0 and args.dg_dataset_w_hom >= 0.0 and args.dg_dataset_w_prop >= 0.0
     assert abs((args.dg_dataset_w_sep + args.dg_dataset_w_hom + args.dg_dataset_w_prop) - 1.0) < 1e-6
+    assert 0.0 <= args.dg_client_ref_percentile <= 100.0
     assert args.dg_audit_wait_timeout_sec >= 0.0
     assert args.dg_audit_wait_poll_sec > 0.0
     assert args.support_bonus_tau_c > 0.0
