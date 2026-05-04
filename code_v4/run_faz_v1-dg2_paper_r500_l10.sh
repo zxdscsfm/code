@@ -1,12 +1,12 @@
 #!/bin/bash
-# PROSTATE V1-DG:
-# v1B backbone governance + dataset-level geometry gate + client-level geometry qualification.
+# FAZ V1-DG2:
+# v1B backbone governance + normalized dataset geometry gate + relative client qualification.
 
-#SBATCH --job-name=FedLPPA_PROSTATE_V1-DG
+#SBATCH --job-name=FedLPPA_FAZ_V1-DG2
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
-#SBATCH --ntasks=7
-#SBATCH --gres=gpu:7
+#SBATCH --ntasks=6
+#SBATCH --gres=gpu:6
 #SBATCH --mem=128G
 #SBATCH --output=logs/main_%j.log
 
@@ -19,20 +19,20 @@ export PYTHONUNBUFFERED=1
 
 cd /data/jianbingshen/yanghongji/FedLPPA/code_v4
 
-METHOD_TAG="${METHOD_TAG:-v1-dg_prostate_paper_r500_l10}"
-SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8388}"
+METHOD_TAG="${METHOD_TAG:-v1-dg2_faz_paper_r500_l10}"
+SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8398}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
 EVAL_ITERS="${EVAL_ITERS:-10}"
 TSNE_ITERS="${TSNE_ITERS:-200}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5000}"
-ROOT_PATH="${ROOT_PATH:-/data/jianbingshen/yanghongji/FedLPPA_github_official_full/data/PROSTATE_h5}"
+ROOT_PATH="${ROOT_PATH:-/data/jianbingshen/yanghongji/FedLPPA_github_official_full/data/FAZ_h5}"
 ADAPTIVE_TAU_UPDATE="${ADAPTIVE_TAU_UPDATE:-0}"
 ADAPTIVE_RESUME_STATE="${ADAPTIVE_RESUME_STATE:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-RUN_TAG="${METHOD_TAG}_prostate_$(date +%Y%m%d_%H%M%S)_seed${SEED}"
-EXP_NAME="prostate/FedLPPA_${RUN_TAG}"
+RUN_TAG="${METHOD_TAG}_faz_$(date +%Y%m%d_%H%M%S)_seed${SEED}"
+EXP_NAME="faz/FedLPPA_${RUN_TAG}"
 LOG_DIR="logs/run_${RUN_TAG}"
 
 mkdir -p "${LOG_DIR}"
@@ -41,7 +41,7 @@ BASE_ARGS="\
 --root_path ${ROOT_PATH} \
 --num_classes 2 \
 --in_chns 1 \
---img_class prostate \
+--img_class faz \
 --exp ${EXP_NAME} \
 --model unet_univ5 \
 --max_iterations ${MAX_ITERATIONS} \
@@ -54,8 +54,8 @@ BASE_ARGS="\
 --seed ${SEED} \
 --server_address ${SERVER_ADDRESS} \
 --strategy FedUniV2.1 \
---min_num_clients 6 \
---img_size 384 \
+--min_num_clients 5 \
+--img_size 256 \
 --alpha 0.1 \
 --beta 0.5 \
 --ala_threshold 0.1 \
@@ -73,15 +73,6 @@ BASE_ARGS="\
 --trustgeo_enabled 0 \
 --trustgeo_dilation_radius 5 \
 --trustgeo_density_kernel 11 \
---trustgeo_c_low 0.0015 \
---trustgeo_c_high 0.0400 \
---trustgeo_d_low 0.0060 \
---trustgeo_d_high 0.0900 \
---trustgeo_support_low 0.0100 \
---trustgeo_support_high 0.1500 \
---trustgeo_support_mod_min 0.85 \
---trustgeo_w_c 0.70 \
---trustgeo_w_d 0.30 \
 --trustgeo_prior_alpha 0.8 \
 --trustgeo_prior_floor 0.2 \
 --dg_enabled 1 \
@@ -97,14 +88,15 @@ BASE_ARGS="\
 --dg_min_non_seed_pixels 128 \
 --dg_hom_tau 0.75 \
 --dg_sep_tau 0.25 \
+--dg_sep_margin_scale 2.0 \
+--dg_dataset_strength_power 2.0 \
 --dg_prop_seed_keep_ratio1 0.85 \
 --dg_prop_seed_keep_ratio2 0.70 \
 --dg_prop_min_seed_pixels 4 \
 --dg_prop_min_keep_pixels 2 \
 --dg_prop_min_region_pixels 16 \
---dg_dataset_w_sep 0.60 \
---dg_dataset_w_hom 0.30 \
---dg_dataset_w_prop 0.10 \
+--dg_prop_dist_std_scale 1.0 \
+--dg_client_ref_percentile 75.0 \
 --adaptive_pl_enabled 1 \
 --adaptive_pl_tau_init 0.55 \
 --adaptive_pl_tau_update ${ADAPTIVE_TAU_UPDATE} \
@@ -131,7 +123,7 @@ BASE_ARGS="\
 --risk_calibration_v1_aux_max_weight 0.30 \
 ${EXTRA_ARGS}"
 
-echo "Starting PROSTATE V1-DG run"
+echo "Starting FAZ V1-DG2 run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "METHOD_TAG=${METHOD_TAG}"
@@ -165,17 +157,15 @@ fi
 
 CLIENT_PIDS=()
 
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 0 --client client1 --sup_type block --gpu 1 > "${LOG_DIR}/client0.log" 2>&1 &
+python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 0 --client client1 --sup_type scribble_noisy --gpu 1 > "${LOG_DIR}/client0.log" 2>&1 &
 CLIENT_PIDS+=($!)
 python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 1 --client client2 --sup_type keypoint --gpu 2 > "${LOG_DIR}/client1.log" 2>&1 &
 CLIENT_PIDS+=($!)
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 2 --client client3 --sup_type scribble --gpu 3 > "${LOG_DIR}/client2.log" 2>&1 &
+python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 2 --client client3 --sup_type block --gpu 3 > "${LOG_DIR}/client2.log" 2>&1 &
 CLIENT_PIDS+=($!)
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 3 --client client4 --sup_type keypoint --gpu 4 > "${LOG_DIR}/client3.log" 2>&1 &
+python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 3 --client client4 --sup_type box --gpu 4 > "${LOG_DIR}/client3.log" 2>&1 &
 CLIENT_PIDS+=($!)
 python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 4 --client client5 --sup_type scribble --gpu 5 > "${LOG_DIR}/client4.log" 2>&1 &
-CLIENT_PIDS+=($!)
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 5 --client client6 --sup_type box --gpu 6 > "${LOG_DIR}/client5.log" 2>&1 &
 CLIENT_PIDS+=($!)
 
 wait "${SERVER_PID}" || SERVER_STATUS=$?
@@ -187,4 +177,4 @@ wait || true
 if [ "${SERVER_STATUS}" -ne 0 ]; then
     exit "${SERVER_STATUS}"
 fi
-echo "PROSTATE V1-DG run finished. EXP_NAME=${EXP_NAME}"
+echo "FAZ V1-DG2 run finished. EXP_NAME=${EXP_NAME}"

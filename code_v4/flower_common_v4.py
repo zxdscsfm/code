@@ -25,6 +25,7 @@ import copy
 import shutil
 from functools import reduce
 import math
+import traceback
 from torch.cuda.amp import autocast, GradScaler
 
 from networks.net_factory import net_factory
@@ -91,38 +92,60 @@ class BaseClient(fl.client.Client):
         weights = fl.common.parameters_to_ndarrays(ins.parameters)
         config = ins.config
         fit_begin = timeit.default_timer()
+        try:
+            self.model.set_weights(weights, config)
+            loss, metrics_ = self._train(config)
 
-        self.model.set_weights(weights, config)
-        loss, metrics_ = self._train(config)
+            weights_prime = self.model.get_weights(config)
+            params_prime = fl.common.ndarrays_to_parameters(weights_prime)
+            num_examples_train = len(self.trainloader)
+            fit_duration = timeit.default_timer() - fit_begin
+            metrics_['fit_duration'] = fit_duration
 
-        weights_prime = self.model.get_weights(config)
-        params_prime = fl.common.ndarrays_to_parameters(weights_prime)
-        num_examples_train = len(self.trainloader)
-        fit_duration = timeit.default_timer() - fit_begin
-        metrics_['fit_duration'] = fit_duration
-
-        return FitRes(
-            status=Status('OK', 'Success'),
-            parameters=params_prime,
-            num_examples=num_examples_train,
-            metrics=metrics_
-        )
+            return FitRes(
+                status=Status('OK', 'Success'),
+                parameters=params_prime,
+                num_examples=num_examples_train,
+                metrics=metrics_
+            )
+        except Exception as exc:
+            log(
+                WARNING,
+                'Client %s fit failed at iter_global=%s stage=%s: %s\n%s',
+                self.cid,
+                config.get('iter_global', 'NA'),
+                config.get('stage', 'fit'),
+                repr(exc),
+                traceback.format_exc(),
+            )
+            raise
 
     def evaluate(self, ins):
         print('Client {}: evaluate'.format(self.cid))
 
         weights = fl.common.parameters_to_ndarrays(ins.parameters)
         config = ins.config
+        try:
+            self.model.set_weights(weights, config)
+            loss, metrics_ = self._validate(config)
 
-        self.model.set_weights(weights, config)
-        loss, metrics_ = self._validate(config)
-
-        return EvaluateRes(
-            status=Status('OK', 'Success'),
-            loss=loss,
-            num_examples=len(self.valloader),
-            metrics=metrics_
-        )
+            return EvaluateRes(
+                status=Status('OK', 'Success'),
+                loss=loss,
+                num_examples=len(self.valloader),
+                metrics=metrics_
+            )
+        except Exception as exc:
+            log(
+                WARNING,
+                'Client %s evaluate failed at iter_global=%s stage=%s: %s\n%s',
+                self.cid,
+                config.get('iter_global', 'NA'),
+                config.get('stage', 'evaluate'),
+                repr(exc),
+                traceback.format_exc(),
+            )
+            raise
 
 
     def _train(self, config):
@@ -419,6 +442,8 @@ class MyServer(Server):
             return client_state_dict
 
         best_performance = 0.0
+        failed_round_streak = 0
+        max_failed_round_streak = max(1, int(getattr(self.args, 'max_consecutive_failed_rounds', 3)))
         iterator = tqdm(range(iters, num_rounds+iters, iters), ncols=70)
         for current_round in iterator:
             iter_num = current_round
@@ -426,9 +451,19 @@ class MyServer(Server):
             res_fit = self.fit_round(server_round=current_round, timeout=timeout)
             if res_fit[0] is None:
                 log(INFO, 'round {}: fit failed'.format(current_round))
+                failed_round_streak += 1
+                if failed_round_streak >= max_failed_round_streak:
+                    log(INFO, 'round {}: aborting after {} consecutive failed rounds'.format(
+                        current_round, failed_round_streak
+                    ))
+                    break
                 continue
 
             parameters_prime, metrics_prime, (results_prime, failtures_prime) = res_fit
+            if failtures_prime:
+                log(INFO, 'round {}: fit had {} failures: {}'.format(
+                    current_round, len(failtures_prime), [repr(f) for f in failtures_prime]
+                ))
             self.parameters = parameters_prime
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
@@ -475,6 +510,12 @@ class MyServer(Server):
                     res_cen = self.strategy.evaluate(current_round, parameters=self.parameters)
                     if res_cen is None:
                         log(INFO, 'round {}: evaluate failed'.format(current_round))
+                        failed_round_streak += 1
+                        if failed_round_streak >= max_failed_round_streak:
+                            log(INFO, 'round {}: aborting after {} consecutive failed rounds'.format(
+                                current_round, failed_round_streak
+                            ))
+                            break
                         continue
                     loss_cen, metrics_cen = res_cen
                     log(
@@ -489,8 +530,18 @@ class MyServer(Server):
                 res_fed = self.evaluate_round(server_round=current_round, timeout=timeout)
                 if res_fed[0] is None:
                     log(INFO, 'round {}: evaluate failed'.format(current_round))
+                    failed_round_streak += 1
+                    if failed_round_streak >= max_failed_round_streak:
+                        log(INFO, 'round {}: aborting after {} consecutive failed rounds'.format(
+                            current_round, failed_round_streak
+                        ))
+                        break
                     continue
                 loss_fed, evaluate_metrics_fed, (results_fed, failtures_fed) = res_fed
+                if failtures_fed:
+                    log(INFO, 'round {}: evaluate had {} failures: {}'.format(
+                        current_round, len(failtures_fed), [repr(f) for f in failtures_fed]
+                    ))
                 # print(loss_fed, evaluate_metrics_fed.keys())
                 for client_id in client_id_list:
                     for class_i in range(num_classes-1):
@@ -544,6 +595,7 @@ class MyServer(Server):
 
                 val_mean_dice = mean_metrics['val_mean_dice']
                 log(INFO, metric_log)
+                failed_round_streak = 0
 
                 if val_mean_dice > best_performance:
                     best_performance = val_mean_dice

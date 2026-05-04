@@ -486,6 +486,24 @@ class MyClient(BaseClient):
         self._init_trustgeo_state()
         self._init_dg_state()
         self._init_support_bonus_state()
+        self.trainloader_iter = None
+
+    def _reset_local_round_batch_stream(self):
+        self.sampled_batches.clear()
+        self.trainloader_iter = iter(self.trainloader)
+        print('generating sampled batches......')
+
+    def _next_local_train_batch(self):
+        if self.trainloader_iter is None:
+            self._reset_local_round_batch_stream()
+        try:
+            sampled_batch = next(self.trainloader_iter)
+        except StopIteration:
+            self.trainloader_iter = iter(self.trainloader)
+            print('generating sampled batches......')
+            sampled_batch = next(self.trainloader_iter)
+        self.sampled_batches.append(sampled_batch)
+        return sampled_batch
 
     def _adaptive_pl_is_enabled(self):
         return bool(getattr(self.args, 'adaptive_pl_enabled', 0)) and self.args.strategy in ['FedUniV2', 'FedUniV2.1']
@@ -3463,21 +3481,15 @@ class MyClient(BaseClient):
             for param in global_student_pl_model.parameters():
                 param.requires_grad = False
 
+        self._reset_local_round_batch_stream()
         for i_iter in range(config['iters']):
-            if self.current_iter % len(self.trainloader) == 0:
-                print('generating sampled batches......')
-                self.sampled_batches.clear()
-                for _, sampled_batch in enumerate(self.trainloader):
-                    self.sampled_batches.append(sampled_batch)
-
             self.teacher_current_lr = self._compute_decay_lr(self.current_iter)
             self.student_current_lr = self._get_student_teacher_student_lr(self.current_iter)
             self._set_optimizer_lr(teacher_optimizer, self.teacher_current_lr)
             self._set_optimizer_lr(student_optimizer, self.student_current_lr)
             self.current_lr = self.student_current_lr
 
-            idx = self.current_iter % len(self.trainloader)
-            sampled_batch = self.sampled_batches[idx]
+            sampled_batch = self._next_local_train_batch()
 
             if self.args.img_class in ['faz', 'prostate']:
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
@@ -3724,17 +3736,10 @@ class MyClient(BaseClient):
             for param in global_pl_model.parameters():
                 param.requires_grad = False
         
+        self._reset_local_round_batch_stream()
         for i_iter in range(config['iters']):
-            # genearate sampled batches
-            if self.current_iter % len(self.trainloader) == 0:
-                print('generating sampled batches......')
-                self.sampled_batches.clear()
-                for i_batch, sampled_batch in enumerate(self.trainloader):
-                    self.sampled_batches.append(sampled_batch)
-
-            idx = self.current_iter % len(self.trainloader)
-            sampled_batch = self.sampled_batches[idx]
-            # print(self.current_iter, i_iter, idx)
+            sampled_batch = self._next_local_train_batch()
+            # print(self.current_iter, i_iter)
 
             if self.args.img_class in ['faz', 'prostate']:
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
@@ -4689,6 +4694,14 @@ def main():
                         help='Minimum number of train samples kept per client when using train_sample_ratio.')
     parser.add_argument('--val_sample_floor', type=int, default=0,
                         help='Minimum number of val samples kept per client when using val_sample_ratio.')
+    parser.add_argument('--train_num_workers', type=int, default=0,
+                        help='Number of dataloader workers for training.')
+    parser.add_argument('--eval_num_workers', type=int, default=0,
+                        help='Number of dataloader workers for validation.')
+    parser.add_argument('--round_timeout_sec', type=float, default=0.0,
+                        help='Flower round timeout in seconds; default disables timeout.')
+    parser.add_argument('--max_consecutive_failed_rounds', type=int, default=3,
+                        help='Abort server after this many consecutive failed rounds.')
     parser.add_argument('--prototype_filter_enabled', type=int, default=0,
                         help='Enable prototype-margin-guided pseudo-label filtering.')
     parser.add_argument('--prototype_filter_warmup_rounds', type=int, default=50,
@@ -4978,6 +4991,9 @@ def main():
     assert 0.0 <= args.val_sample_ratio <= 1.0
     assert args.train_sample_floor >= 0
     assert args.val_sample_floor >= 0
+    assert args.train_num_workers >= 0
+    assert args.eval_num_workers >= 0
+    assert args.max_consecutive_failed_rounds >= 1
     assert args.prototype_filter_enabled in [0, 1]
     assert args.prototype_filter_warmup_rounds >= 0
     assert 0.0 < args.prototype_filter_topk_ratio <= 1.0
@@ -5119,9 +5135,9 @@ def main():
 
     drop_last = True if args.strategy in ['FedUni', 'FedUniV2', 'FedUniV2.1'] else False
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
+                             num_workers=args.train_num_workers, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
     valloader = DataLoader(db_val, batch_size=1, shuffle=False,
-                           num_workers=0)
+                           num_workers=args.eval_num_workers)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
@@ -5234,7 +5250,10 @@ def main():
         fl.server.start_server(
             server_address=args.server_address,
             server=server,
-            config=ServerConfig(num_rounds=args.max_iterations, round_timeout=None)
+            config=ServerConfig(
+                num_rounds=args.max_iterations,
+                round_timeout=(None if args.round_timeout_sec <= 0 else float(args.round_timeout_sec)),
+            )
         )
     else:
         client = MyClient(args, model, trainloader, valloader, amp=(args.amp == 1))
