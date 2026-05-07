@@ -140,6 +140,7 @@ class BaseClient(fl.client.Client):
             log(INFO, 'save model to {}'.format(save_mode_path))
 
         if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+            and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
             and (self.current_iter % self.args.tsne_iters == 0):
             tsne_feature_ = tsne_feature(self.args, self.model, self.valloader, self.amp)
             val_metrics['tsne_feature'] = fl.common.ndarray_to_bytes(tsne_feature_.cpu().numpy())
@@ -176,7 +177,18 @@ def tsne_feature(args, model, dataloader, amp=False):
     return all_feature_lc
 
 
-def tsne(n_components, data, label, list):
+def format_site_name(client_id):
+    if client_id < 26:
+        return f"Site {chr(ord('A') + client_id)}"
+    return f"Site {client_id + 1}"
+
+
+def build_site_markers(site_names):
+    marker_cycle = ["o", "v", "H", "s", "^", "P", "X", "D", "<", ">", "*", "p", "8"]
+    return {site_name: marker_cycle[idx % len(marker_cycle)] for idx, site_name in enumerate(site_names)}
+
+
+def tsne(n_components, data, label, site_labels):
     params = {
         'font.family':'',
         'font.serif':'',
@@ -193,15 +205,17 @@ def tsne(n_components, data, label, list):
 
         df = pd.DataFrame(z)
         df['label'] = label
-        df['list'] = list
-        # palet = sns.color_palette("hls",2)
-        # flatui = ['#f3a598', '#faaf42','#480080','#0fa14a','#7a7c7f']
-        flatui = ['#f3a598', '#66c7df','#faaf42','#9659ef','#11b855']
-        palet = sns.color_palette(flatui)
-        markers = {'Site A': "o", 'Site B': 'v', 'Site C': 'H', 'Site D': 's', 'Site E': '^'}
+        df['list'] = site_labels
+        site_names = list(dict.fromkeys(site_labels))
+        flatui = ['#f3a598', '#66c7df', '#faaf42', '#9659ef', '#11b855', '#7a7c7f', '#d65f5f', '#2f7f5f']
+        if len(site_names) <= len(flatui):
+            palet = sns.color_palette(flatui[:len(site_names)])
+        else:
+            palet = sns.color_palette("husl", len(site_names))
+        markers = build_site_markers(site_names)
         alpha = 0.8
 
-        sns.scatterplot(x=z[:,0], y=z[:,1], hue=list, style=list, markers=markers, linewidth = 0.1, 
+        sns.scatterplot(x=z[:,0], y=z[:,1], hue=site_labels, style=site_labels, markers=markers, linewidth = 0.1,
                         palette=palet, alpha=alpha, data=df)
 
         plt.xlim(-150, 150)
@@ -393,12 +407,15 @@ class MyServer(Server):
         for current_round in iterator:
             iter_num = current_round
             # Train model and replace previous global model
+            parameters_before_fit = self.parameters
             res_fit = self.fit_round(server_round=current_round, timeout=timeout)
             if res_fit[0] is None:
                 log(INFO, 'round {}: fit failed'.format(current_round))
                 continue
 
             parameters_prime, metrics_prime, (results_prime, failtures_prime) = res_fit
+            if getattr(self.args, 'wann_enabled', 0) == 1:
+                self._append_wann_update_diagnostics(metrics_prime, results_prime, parameters_before_fit)
             self.parameters = parameters_prime
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
@@ -474,8 +491,8 @@ class MyServer(Server):
                                         evaluate_metrics_fed['client_{}_val_mean_dice'.format(client_id)], iter_num)
 
                 if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+                    and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
                     and (iter_num % self.args.tsne_iters == 0):
-                    site_list = ['Site A', 'Site B', 'Site C', 'Site D', 'Site E']
                     tsne_feature_list = []
                     labels = []
                     sites = []
@@ -483,7 +500,7 @@ class MyServer(Server):
                         tsne_feature = fl.common.bytes_to_ndarray(evaluate_metrics_fed['client_{}_tsne_feature'.format(client_id)])
                         tsne_feature_list.append(tsne_feature)
                         labels += [client_id + 1] * tsne_feature.shape[0]
-                        sites += [site_list[client_id]] * tsne_feature.shape[0]
+                        sites += [format_site_name(client_id)] * tsne_feature.shape[0]
 
                     all_tsne_feature = np.concatenate(tsne_feature_list, axis=0)
                     # print(labels, sites)
@@ -659,6 +676,64 @@ class MyServer(Server):
         elapsed = end_time - start_time
         log(INFO, 'FL finished in %s', elapsed)
         return history
+
+    def _append_wann_update_diagnostics(self, metrics_prime, results_prime, parameters_before_fit):
+        for client_id in range(self.args.min_num_clients):
+            metrics_prime.setdefault('client_{}_wann_update_norm'.format(client_id), 0.0)
+            metrics_prime.setdefault('client_{}_wann_update_cos_loo'.format(client_id), 0.0)
+            metrics_prime.setdefault('client_{}_wann_update_conflict'.format(client_id), 0.0)
+        if not results_prime or parameters_before_fit is None:
+            return
+
+        def client_id_from_metrics(metrics):
+            for client_id in range(self.args.min_num_clients):
+                if 'client_{}_lr'.format(client_id) in metrics:
+                    return client_id
+            return None
+
+        client_items = []
+        for _, fit_res in results_prime:
+            client_id = client_id_from_metrics(fit_res.metrics)
+            if client_id is not None:
+                client_items.append((client_id, parameters_to_ndarrays(fit_res.parameters)))
+        if len(client_items) < 2:
+            return
+
+        client_items = sorted(client_items, key=lambda item: item[0])
+        num_layers = len(client_items[0][1])
+        prev_arrays = parameters_to_ndarrays(parameters_before_fit)
+        if len(prev_arrays) == num_layers:
+            global_arrays = prev_arrays
+        elif len(prev_arrays) >= (self.args.min_num_clients + 1) * num_layers:
+            start_idx = self.args.min_num_clients * num_layers
+            global_arrays = prev_arrays[start_idx:start_idx + num_layers]
+        else:
+            return
+
+        deltas = []
+        for _, weights in client_items:
+            if len(weights) != num_layers:
+                return
+            flat_parts = []
+            for w_client, w_global in zip(weights, global_arrays):
+                if w_client.shape != w_global.shape or not np.issubdtype(w_client.dtype, np.number):
+                    continue
+                flat_parts.append((w_client.astype(np.float32) - w_global.astype(np.float32)).reshape(-1))
+            if not flat_parts:
+                return
+            deltas.append(np.concatenate(flat_parts))
+
+        for idx, (client_id, _) in enumerate(client_items):
+            delta_i = deltas[idx]
+            others = [deltas[j] for j in range(len(deltas)) if j != idx]
+            delta_without_i = np.mean(others, axis=0)
+            norm_i = float(np.linalg.norm(delta_i))
+            norm_without_i = float(np.linalg.norm(delta_without_i))
+            denom = max(norm_i * norm_without_i, 1e-12)
+            cos_loo = float(np.dot(delta_i, delta_without_i) / denom)
+            metrics_prime['client_{}_wann_update_norm'.format(client_id)] = norm_i
+            metrics_prime['client_{}_wann_update_cos_loo'.format(client_id)] = cos_loo
+            metrics_prime['client_{}_wann_update_conflict'.format(client_id)] = 1.0 if cos_loo < 0.0 else 0.0
 
 
 def fit_metrics_aggregation_fn(fit_metrics):

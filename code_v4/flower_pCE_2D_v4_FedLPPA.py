@@ -39,6 +39,12 @@ from utils.gate_crf_loss import ModelLossSemsegGatedCRF
 from flower_common_v4 import (BaseClient, MyModel, fit_metrics_aggregation_fn, TreeEnergyLoss, MScaleRecurveTreeEnergyLoss, evaluate, get_evaluate_fn,
                         get_strategy, MyServer, VAL_METRICS, get_fedrep_local_keys, get_evaluate_metrics_aggregation_fn,
                         get_bn_stats)
+from weak_annotation_reliability import (
+    build_wann_maps,
+    consistency_loss as wann_consistency_loss,
+    soft_band_loss as wann_soft_band_loss,
+    weighted_ce_loss as wann_weighted_ce_loss,
+)
 
 
 
@@ -94,6 +100,12 @@ class MyClient(BaseClient):
         previous_prompts = None
         previous_prompts_dis = None
         previous_prompts_uni = None
+        wann_ref_model = None
+        if int(getattr(self.args, 'wann_enabled', 0)) == 1:
+            wann_ref_model = copy.deepcopy(self.model).cuda()
+            wann_ref_model.eval()
+            for param in wann_ref_model.parameters():
+                param.requires_grad = False
         
         for i_iter in range(config['iters']):
             # genearate sampled batches
@@ -107,7 +119,7 @@ class MyClient(BaseClient):
             sampled_batch = self.sampled_batches[idx]
             # print(self.current_iter, i_iter, idx)
 
-            if self.args.img_class == 'faz':
+            if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
@@ -162,9 +174,60 @@ class MyClient(BaseClient):
                     outputs, feature, de1, de2, de3, de4 = out
 
                 outputs_soft = torch.softmax(outputs, dim=1)
-                loss_ce_seg = ce_loss(outputs, label_batch[:].long())
-                loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
-                loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
+                if int(getattr(self.args, 'wann_enabled', 0)) == 1:
+                    with torch.no_grad():
+                        ref_out = wann_ref_model(volume_batch)
+                        if self.args.model == 'fcnet':
+                            _, ref_logits = ref_out
+                        elif self.args.model in ['deeplabv3plus', 'treefcn']:
+                            ref_logits = ref_out[0]
+                        elif self.args.model in [
+                            'unet_head', 'unet_multihead', 'unet_lc', 'unet_uni',
+                            'unet_univ2', 'unet_univ3', 'unet_univ4', 'unet_univ5'
+                        ]:
+                            ref_logits = ref_out[0]
+                        else:
+                            ref_logits = ref_out[0]
+                    wann_maps = build_wann_maps(
+                        image=volume_batch,
+                        label=label_batch,
+                        logits=outputs,
+                        aux_logits=outputs_auxiliary,
+                        sup_type=self.args.sup_type,
+                        img_class=self.args.img_class,
+                        num_classes=self.args.num_classes,
+                        iter_num=self.current_iter,
+                        args=self.args,
+                        ref_logits=ref_logits,
+                    )
+                    loss_ce_seg = wann_weighted_ce_loss(
+                        outputs, label_batch, wann_maps.core_weight, ignore_index=self.args.num_classes
+                    )
+                    loss_ce_auxiliary = wann_weighted_ce_loss(
+                        outputs_auxiliary, label_batch, wann_maps.core_weight, ignore_index=self.args.num_classes
+                    )
+                    loss_hard = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
+                    lambda_soft = float(getattr(self.args, 'wann_soft_lambda', 0.2)) * ramps.sigmoid_rampup(
+                        self.current_iter, int(getattr(self.args, 'wann_soft_rampup_iters', 800))
+                    )
+                    lambda_cons = float(getattr(self.args, 'wann_cons_lambda', 0.05)) * ramps.sigmoid_rampup(
+                        self.current_iter, int(getattr(self.args, 'wann_cons_rampup_iters', 800))
+                    )
+                    loss_soft = wann_soft_band_loss(
+                        outputs, outputs_auxiliary, label_batch, wann_maps, ignore_index=self.args.num_classes
+                    )
+                    loss_cons = wann_consistency_loss(outputs, outputs_auxiliary, wann_maps.ignore_mask)
+                    loss_ce = loss_hard + lambda_soft * loss_soft + lambda_cons * loss_cons
+                else:
+                    wann_maps = None
+                    lambda_soft = 0.0
+                    lambda_cons = 0.0
+                    loss_hard = torch.tensor(0.0).cuda()
+                    loss_soft = torch.tensor(0.0).cuda()
+                    loss_cons = torch.tensor(0.0).cuda()
+                    loss_ce_seg = ce_loss(outputs, label_batch[:].long())
+                    loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
+                    loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
 # TreeEnergyLoss
                 # unlabeled_RoIs = (sampled_batch['label'] == self.args.num_classes)
                 # unlabeled_RoIs = unlabeled_RoIs.cuda()
@@ -294,7 +357,6 @@ class MyClient(BaseClient):
                     loss_pls = (loss_pls_1 + loss_pls_2) / 2
                     loss = torch.add(loss, loss_pls, alpha=self.args.beta)
                     if i_iter > 0:
-                        print(previous_prompts_dis == distribution_prompts[self.args.cid])
                         distance_prompts = l1_loss(previous_prompts.detach(), prompts[self.args.cid].clone().detach())
                         distance_prompts_dis = l1_loss(previous_prompts_dis.detach(), distribution_prompts[self.args.cid].clone().detach())
                         distance_prompts_uni = l1_loss(previous_prompts_uni.detach(), uni_prompts.clone().detach())
@@ -381,6 +443,15 @@ class MyClient(BaseClient):
             metrics_['client_{}_Prediction2'.format(self.cid)] = fl.common.ndarray_to_bytes(outputs_auxiliary.cpu().numpy())
             metrics_['client_{}_Pseudo'.format(self.cid)] = fl.common.ndarray_to_bytes(pseudo_labs.cpu().numpy())
 
+        if int(getattr(self.args, 'wann_enabled', 0)) == 1 and wann_maps is not None:
+            metrics_['client_{}_wann_loss_hard'.format(self.cid)] = loss_hard.item()
+            metrics_['client_{}_wann_loss_soft'.format(self.cid)] = loss_soft.item()
+            metrics_['client_{}_wann_loss_cons'.format(self.cid)] = loss_cons.item()
+            metrics_['client_{}_wann_lambda_soft'.format(self.cid)] = float(lambda_soft)
+            metrics_['client_{}_wann_lambda_cons'.format(self.cid)] = float(lambda_cons)
+            for key, value in wann_maps.profile.items():
+                metrics_['client_{}_wann_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+
         return loss.item(), metrics_
 
 
@@ -392,7 +463,7 @@ def pretrain_model(args, writer, worker_init_fn):
         RandomGenerator(args.patch_size, img_class=args.img_class)
     ]))
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     model = net_factory(args, net_type=args.model, in_chns=args.in_chns, class_num=args.num_classes)
@@ -410,7 +481,7 @@ def pretrain_model(args, writer, worker_init_fn):
     model.train()
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
-            if args.img_class == 'faz':
+            if args.img_class == 'faz' or args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif args.img_class == 'odoc' or args.img_class == 'polyp':
@@ -465,6 +536,8 @@ def main():
                         default='[::]:8080', help='gRPC server address (default: [::]:8080)')
     parser.add_argument('--gpu', type=int,
                         required=True, help='GPU index')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of DataLoader workers')
     parser.add_argument('--role', type=str,
                         required=True, help='Role')
     # server
@@ -549,6 +622,50 @@ def main():
     parser.add_argument('--img_class', type=str,
                         default='faz', help='the img class(odoc or faz)')
     parser.add_argument('--seed', type=int,  default=2022, help='random seed')
+    parser.add_argument('--wann_enabled', type=int, default=0,
+                        help='Enable weak annotation reliability reconstruction')
+    parser.add_argument('--wann_core_thresh', type=float, default=0.65,
+                        help='Reliability threshold for hard-supervised core pixels')
+    parser.add_argument('--wann_soft_thresh', type=float, default=0.25,
+                        help='Reliability threshold for soft-band pixels')
+    parser.add_argument('--wann_core_min_weight', type=float, default=0.8,
+                        help='Minimum hard-supervision weight for core pixels')
+    parser.add_argument('--wann_r_max', type=float, default=1.2,
+                        help='Maximum reliability weight')
+    parser.add_argument('--wann_dilated_support_score', type=float, default=0.55,
+                        help='Annotation score assigned to non-core pixels near weak support')
+    parser.add_argument('--wann_appearance_temp', type=float, default=1.5,
+                        help='Temperature for image-appearance consistency')
+    parser.add_argument('--wann_texture_kernel_size', type=int, default=5,
+                        help='Local window size for WANN texture ambiguity penalty')
+    parser.add_argument('--wann_texture_temp', type=float, default=1.0,
+                        help='Temperature for WANN local texture ambiguity penalty')
+    parser.add_argument('--wann_texture_weight', type=float, default=0.25,
+                        help='Weight of WANN local texture stability in appearance reliability')
+    parser.add_argument('--wann_pred_start_iter', type=int, default=800,
+                        help='Iteration to start using prediction ambiguity in WANN')
+    parser.add_argument('--wann_entropy_weight', type=float, default=0.5,
+                        help='Entropy penalty weight in WANN reliability')
+    parser.add_argument('--wann_agreement_weight', type=float, default=0.5,
+                        help='Main-aux agreement weight in WANN reliability')
+    parser.add_argument('--wann_global_agreement_weight', type=float, default=0.5,
+                        help='Current-reference prediction agreement weight in WANN reliability')
+    parser.add_argument('--wann_keypoint_soft_radius', type=int, default=2,
+                        help='Soft-band radius for keypoint annotations')
+    parser.add_argument('--wann_scribble_soft_radius', type=int, default=4,
+                        help='Soft-band radius for scribble annotations')
+    parser.add_argument('--wann_box_soft_radius', type=int, default=2,
+                        help='Soft-band radius for box/block annotations')
+    parser.add_argument('--wann_mask_soft_radius', type=int, default=1,
+                        help='Soft-band radius for mask annotations')
+    parser.add_argument('--wann_soft_lambda', type=float, default=0.2,
+                        help='Maximum WANN soft-band loss weight')
+    parser.add_argument('--wann_cons_lambda', type=float, default=0.05,
+                        help='Maximum WANN ignore-region consistency weight')
+    parser.add_argument('--wann_soft_rampup_iters', type=int, default=800,
+                        help='Rampup iterations for WANN soft-band loss')
+    parser.add_argument('--wann_cons_rampup_iters', type=int, default=800,
+                        help='Rampup iterations for WANN consistency loss')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -575,7 +692,9 @@ def main():
     assert args.max_iterations > 0 and (args.max_iterations % args.eval_iters == 0)
 
     if args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']:
-        assert args.tsne_iters > 0 and (args.tsne_iters % args.iters == 0)
+        assert args.tsne_iters >= 0
+        if args.tsne_iters > 0:
+            assert args.tsne_iters % args.iters == 0
 
     if args.strategy == 'FedRep':
         assert args.iters > args.rep_iters
@@ -608,11 +727,31 @@ def main():
         assert args.dual_init in ['random', 'adjacent', 'nearest', 'aggregated']
 
     assert args.role in ['server', 'client']
-    assert args.img_class in ['odoc', 'faz', 'polyp']
+    assert args.img_class in ['odoc', 'faz', 'polyp', 'prostate']
     if args.img_class == 'faz':
         assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
     else:
         assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
+    assert args.wann_enabled in [0, 1]
+    assert 0.0 <= args.wann_soft_thresh <= args.wann_core_thresh <= args.wann_r_max
+    assert 0.0 <= args.wann_core_min_weight <= args.wann_r_max
+    assert 0.0 <= args.wann_dilated_support_score <= 1.0
+    assert args.wann_appearance_temp > 0.0
+    assert args.wann_texture_kernel_size >= 1
+    assert args.wann_texture_temp > 0.0
+    assert 0.0 <= args.wann_texture_weight <= 1.0
+    assert args.wann_pred_start_iter >= 0
+    assert 0.0 <= args.wann_entropy_weight <= 1.0
+    assert 0.0 <= args.wann_agreement_weight <= 1.0
+    assert 0.0 <= args.wann_global_agreement_weight <= 1.0
+    assert args.wann_keypoint_soft_radius >= 0
+    assert args.wann_scribble_soft_radius >= 0
+    assert args.wann_box_soft_radius >= 0
+    assert args.wann_mask_soft_radius >= 0
+    assert args.wann_soft_lambda >= 0.0
+    assert args.wann_cons_lambda >= 0.0
+    assert args.wann_soft_rampup_iters >= 0
+    assert args.wann_cons_rampup_iters >= 0
 
     # Configure logger
     if args.role == 'server':
@@ -639,7 +778,7 @@ def main():
 
     drop_last = True if args.strategy in ['FedUni', 'FedUniV2', 'FedUniV2.1'] else False
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
+                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
     valloader = DataLoader(db_val, batch_size=1, shuffle=False,
                            num_workers=0)
 
@@ -719,6 +858,25 @@ def main():
         # Start server
         state_dict_keys = model.model.state_dict().keys()
         train_scalar_metrics = ['lr', 'total_loss', 'loss_ce']
+        if args.wann_enabled == 1:
+            train_scalar_metrics += [
+                'wann_loss_hard',
+                'wann_loss_soft',
+                'wann_loss_cons',
+                'wann_lambda_soft',
+                'wann_lambda_cons',
+                'wann_effective_supervision_mass',
+                'wann_core_ratio',
+                'wann_soft_ratio',
+                'wann_low_weight_ratio',
+                'wann_mean_reliability',
+                'wann_entropy_low_r',
+                'wann_max_prob_low_r',
+                'wann_foreground_ratio_low_r',
+                'wann_update_norm',
+                'wann_update_cos_loo',
+                'wann_update_conflict',
+            ]
         train_image_metrics = ['Image', 'Prediction', 'GroundTruth']
         if args.strategy in ['FedUniV2', 'FedUniV2.1']:
             train_image_metrics += ['Prediction2', 'Pseudo']
