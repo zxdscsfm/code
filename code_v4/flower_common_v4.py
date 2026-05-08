@@ -315,6 +315,7 @@ class MyServer(Server):
         self.train_scalar_metrics = train_scalar_metrics
         self.train_image_metrics = train_image_metrics
         self.val_metrics = val_metrics
+        self.rgftd_teacher_ndarrays = None
 
     # pylint: disable=too-many-locals
     def fit(self, num_rounds, timeout):
@@ -324,6 +325,10 @@ class MyServer(Server):
         # Initialize parameters
         log(INFO, 'Initializing global parameters')
         self.parameters = self._get_initial_parameters(timeout=timeout)
+        if self._rgftd_enabled():
+            self.rgftd_teacher_ndarrays = [
+                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+            ]
         log(INFO, 'Evaluating initial parameters')
         res = self.strategy.evaluate(0, parameters=self.parameters)
         print(res)
@@ -417,6 +422,8 @@ class MyServer(Server):
             if getattr(self.args, 'wann_enabled', 0) == 1:
                 self._append_wann_update_diagnostics(metrics_prime, results_prime, parameters_before_fit)
             self.parameters = parameters_prime
+            if self._rgftd_enabled():
+                self._update_rgftd_teacher(self.parameters)
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
                 prompts_list = []
@@ -663,6 +670,12 @@ class MyServer(Server):
                 weight_list.append(performance_array)
                 prompts_array = np.mean(prompts_list, axis=0)
                 weight_list.append(prompts_array)
+                if self._rgftd_enabled():
+                    if self.rgftd_teacher_ndarrays is None:
+                        self.rgftd_teacher_ndarrays = [
+                            array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                        ]
+                    weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
                 self.parameters = ndarrays_to_parameters(weight_list)
                 '''print(iter_num, 'val_dice_list', val_dice_list)
                 print(iter_num, 'performance_array', performance_array)'''
@@ -676,6 +689,37 @@ class MyServer(Server):
         elapsed = end_time - start_time
         log(INFO, 'FL finished in %s', elapsed)
         return history
+
+    def _rgftd_enabled(self):
+        return int(getattr(self.args, 'rgftd_enabled', 0)) == 1
+
+    def _extract_global_ndarrays_for_rgftd(self, parameters):
+        arrays = parameters_to_ndarrays(parameters)
+        num_weights = len(self.state_dict_keys)
+        if len(arrays) == num_weights:
+            return arrays
+        start_idx = self.args.min_num_clients * num_weights
+        end_idx = start_idx + num_weights
+        if len(arrays) >= end_idx:
+            return arrays[start_idx:end_idx]
+        return arrays[:num_weights]
+
+    def _update_rgftd_teacher(self, parameters):
+        global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
+        if self.rgftd_teacher_ndarrays is None or len(self.rgftd_teacher_ndarrays) != len(global_arrays):
+            self.rgftd_teacher_ndarrays = [array.copy() for array in global_arrays]
+            return
+
+        decay = float(getattr(self.args, 'rgftd_teacher_ema_decay', 0.99))
+        updated = []
+        for teacher_array, global_array in zip(self.rgftd_teacher_ndarrays, global_arrays):
+            if teacher_array.shape != global_array.shape:
+                updated.append(global_array.copy())
+            elif np.issubdtype(global_array.dtype, np.floating):
+                updated.append((decay * teacher_array + (1.0 - decay) * global_array).astype(global_array.dtype))
+            else:
+                updated.append(global_array.copy())
+        self.rgftd_teacher_ndarrays = updated
 
     def _append_wann_update_diagnostics(self, metrics_prime, results_prime, parameters_before_fit):
         for client_id in range(self.args.min_num_clients):
@@ -1321,6 +1365,10 @@ class MyModel(nn.Module):
         self.trainloader = trainloader
         self.valloader = valloader
         self.amp=(args.amp == 1)
+        self.rgftd_teacher_state_dict = None
+        self.ala_last_epochs = 0
+        self.ala_last_std = 0.0
+        self.ala_hit_max_epochs = 0
         if self.amp:
             self.scaler = GradScaler()
 
@@ -1378,6 +1426,7 @@ class MyModel(nn.Module):
 
     def set_weights(self, weights, config):
         # print('Setting weights')
+        self.rgftd_teacher_state_dict = None
         # MetaFed
         if self.args.strategy == 'MetaFed':
             def get_teacher_id_v1(weight_dict):
@@ -1533,6 +1582,11 @@ class MyModel(nn.Module):
                         all_state_dict_temp = {}
                         num_weights = len(self.model.state_dict().items())
                         print(num_weights)
+                        expected_without_rgftd = (self.args.min_num_clients + 1) * num_weights + 2
+                        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and len(weights) >= expected_without_rgftd + num_weights:
+                            self.rgftd_teacher_state_dict = OrderedDict({
+                                k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), weights[-num_weights:])
+                            })
                         for client_id in self.client_id_list:
                             start_idx = 0 + client_id * num_weights
                             end_idx = num_weights + client_id * num_weights
@@ -1710,6 +1764,10 @@ class MyModel(nn.Module):
             # weight learning
             losses = []
             count = 0
+            self.ala_last_epochs = 0
+            self.ala_last_std = 0.0
+            self.ala_hit_max_epochs = 0
+            ala_max_epochs = int(getattr(self.args, 'ala_max_epochs', 0))
             while True:
                 for i_batch, sampled_batch in enumerate(self.trainloader):
 
@@ -1750,17 +1808,26 @@ class MyModel(nn.Module):
 
                 losses.append(loss.item())
                 count += 1
+                current_std = float(np.std(losses[-num_pre_loss:]))
+                self.ala_last_epochs = count
+                self.ala_last_std = current_std
 
-                print('Client:', self.args.cid, '\tStd:', np.std(losses[-num_pre_loss:]),
+                print('Client:', self.args.cid, '\tStd:', current_std,
                     '\tALA epochs:', count, self.start_phase)
 
                 # only train one epoch in the subsequent iterations
                 if not self.start_phase:
                     break
 
+                if ala_max_epochs > 0 and count >= ala_max_epochs:
+                    self.ala_hit_max_epochs = 1
+                    print('Client:', self.args.cid, '\tStd:', current_std,
+                        '\tALA max epochs reached:', ala_max_epochs)
+                    break
+
                 # train the weight until convergence
-                if len(losses) > num_pre_loss and np.std(losses[-num_pre_loss:]) < threshold:
-                    print('Client:', self.args.cid, '\tStd:', np.std(losses[-num_pre_loss:]),
+                if len(losses) > num_pre_loss and current_std < threshold:
+                    print('Client:', self.args.cid, '\tStd:', current_std,
                         '\tALA epochs:', count)
                     break
 

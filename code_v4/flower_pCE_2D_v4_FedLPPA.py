@@ -45,7 +45,55 @@ from weak_annotation_reliability import (
     soft_band_loss as wann_soft_band_loss,
     weighted_ce_loss as wann_weighted_ce_loss,
 )
+from rgftd_reliability_distillation import get_rgftd_lambda, rgftd_loss, zero_rgftd_profile
 
+
+def _primary_logits(model_out):
+    if torch.is_tensor(model_out):
+        return model_out
+    return model_out[0]
+
+
+def _average_rgftd_profiles(profile_a, profile_b):
+    return {
+        key: 0.5 * (profile_a[key] + profile_b[key])
+        for key in profile_a.keys()
+    }
+
+
+def _scalar_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile):
+    parts = [
+        'client %d : iteration %d : WANN/RGFTD' % (cid, iter_num),
+    ]
+    if wann_maps is not None:
+        wann_profile = wann_maps.profile
+        parts.extend([
+            'wann_mass=%.4f' % _scalar_float(wann_profile.get('effective_supervision_mass', 0.0)),
+            'wann_core=%.4f' % _scalar_float(wann_profile.get('core_ratio', 0.0)),
+            'wann_soft=%.4f' % _scalar_float(wann_profile.get('soft_ratio', 0.0)),
+            'wann_low=%.4f' % _scalar_float(wann_profile.get('low_weight_ratio', 0.0)),
+            'wann_low_maxp=%.4f' % _scalar_float(wann_profile.get('max_prob_low_r', 0.0)),
+        ])
+    if rgftd_profile is not None:
+        parts.extend([
+            'rgftd_lambda=%.6f' % float(lambda_rgftd),
+            'rgftd_loss=%.6f' % _scalar_float(rgftd_profile.get('loss', 0.0)),
+            'rgftd_region=%.6f' % _scalar_float(rgftd_profile.get('region_ratio', 0.0)),
+            'rgftd_active=%.6f' % _scalar_float(rgftd_profile.get('active_ratio', 0.0)),
+            'rgftd_t_fg=%.6f' % _scalar_float(rgftd_profile.get('teacher_foreground_ratio', 0.0)),
+            'rgftd_a_fg=%.6f' % _scalar_float(rgftd_profile.get('active_foreground_ratio', 0.0)),
+            'rgftd_a_bg=%.6f' % _scalar_float(rgftd_profile.get('active_background_ratio', 0.0)),
+            'rgftd_veto=%.1f' % _scalar_float(rgftd_profile.get('foreground_veto_ratio', 0.0)),
+            'rgftd_fg_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0)),
+            'rgftd_bg_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels', 0.0)),
+        ])
+    return ', '.join(parts)
 
 
 class MyClient(BaseClient):
@@ -106,6 +154,15 @@ class MyClient(BaseClient):
             wann_ref_model.eval()
             for param in wann_ref_model.parameters():
                 param.requires_grad = False
+        rgftd_teacher_model = None
+        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+            teacher_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
+            if teacher_state_dict is not None:
+                rgftd_teacher_model = copy.deepcopy(self.model.model).cuda()
+                rgftd_teacher_model.load_state_dict(teacher_state_dict, strict=False)
+                rgftd_teacher_model.eval()
+                for param in rgftd_teacher_model.parameters():
+                    param.requires_grad = False
         
         for i_iter in range(config['iters']):
             # genearate sampled batches
@@ -218,13 +275,38 @@ class MyClient(BaseClient):
                     )
                     loss_cons = wann_consistency_loss(outputs, outputs_auxiliary, wann_maps.ignore_mask)
                     loss_ce = loss_hard + lambda_soft * loss_soft + lambda_cons * loss_cons
+                    loss_rgftd = outputs.sum() * 0.0
+                    loss_rgftd_seg = outputs.sum() * 0.0
+                    loss_rgftd_aux = outputs.sum() * 0.0
+                    lambda_rgftd = 0.0
+                    rgftd_profile = zero_rgftd_profile(outputs.device)
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
+                        lambda_rgftd = get_rgftd_lambda(self.current_iter, self.args)
+                        if float(lambda_rgftd) > 0.0:
+                            with torch.no_grad():
+                                teacher_out = rgftd_teacher_model(volume_batch)
+                                teacher_logits = _primary_logits(teacher_out)
+                            loss_rgftd_seg, _, rgftd_profile_seg = rgftd_loss(
+                                outputs, teacher_logits, wann_maps, self.args, self.current_iter
+                            )
+                            loss_rgftd_aux, _, rgftd_profile_aux = rgftd_loss(
+                                outputs_auxiliary, teacher_logits, wann_maps, self.args, self.current_iter
+                            )
+                            loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux)
+                            rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
+                            loss_ce = loss_ce + float(lambda_rgftd) * loss_rgftd
                 else:
                     wann_maps = None
                     lambda_soft = 0.0
                     lambda_cons = 0.0
+                    lambda_rgftd = 0.0
                     loss_hard = torch.tensor(0.0).cuda()
                     loss_soft = torch.tensor(0.0).cuda()
                     loss_cons = torch.tensor(0.0).cuda()
+                    loss_rgftd = torch.tensor(0.0).cuda()
+                    loss_rgftd_seg = torch.tensor(0.0).cuda()
+                    loss_rgftd_aux = torch.tensor(0.0).cuda()
+                    rgftd_profile = zero_rgftd_profile(loss_rgftd.device)
                     loss_ce_seg = ce_loss(outputs, label_batch[:].long())
                     loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
                     loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
@@ -377,6 +459,14 @@ class MyClient(BaseClient):
 
             self.current_iter = self.current_iter + 1
             log(INFO, 'client %d : iteration %d : lr: %f, loss : %f, loss_ce: %f' % (self.cid, self.current_iter, self.current_lr, loss.item(), loss_ce.item()))
+            if int(getattr(self.args, 'wann_enabled', 0)) == 1 and self.current_iter % int(self.args.eval_iters) == 0:
+                log(INFO, _format_wann_rgftd_log(
+                    self.cid,
+                    self.current_iter,
+                    wann_maps,
+                    lambda_rgftd,
+                    rgftd_profile,
+                ))
 
             lr_ = self.args.base_lr * (1.0 - self.current_iter / self.args.max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -442,6 +532,10 @@ class MyClient(BaseClient):
                 outputs_auxiliary, pseudo_labs = outputs_auxiliary.repeat(3, 1, 1), pseudo_labs.repeat(3, 1, 1)
             metrics_['client_{}_Prediction2'.format(self.cid)] = fl.common.ndarray_to_bytes(outputs_auxiliary.cpu().numpy())
             metrics_['client_{}_Pseudo'.format(self.cid)] = fl.common.ndarray_to_bytes(pseudo_labs.cpu().numpy())
+            if int(getattr(self.args, 'ala_max_epochs', 0)) > 0:
+                metrics_['client_{}_ala_epochs'.format(self.cid)] = float(getattr(self.model, 'ala_last_epochs', 0))
+                metrics_['client_{}_ala_final_std'.format(self.cid)] = float(getattr(self.model, 'ala_last_std', 0.0))
+                metrics_['client_{}_ala_hit_max_epochs'.format(self.cid)] = float(getattr(self.model, 'ala_hit_max_epochs', 0))
 
         if int(getattr(self.args, 'wann_enabled', 0)) == 1 and wann_maps is not None:
             metrics_['client_{}_wann_loss_hard'.format(self.cid)] = loss_hard.item()
@@ -451,6 +545,16 @@ class MyClient(BaseClient):
             metrics_['client_{}_wann_lambda_cons'.format(self.cid)] = float(lambda_cons)
             for key, value in wann_maps.profile.items():
                 metrics_['client_{}_wann_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+
+        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+            metrics_['client_{}_rgftd_loss'.format(self.cid)] = float(loss_rgftd.detach().cpu().item())
+            metrics_['client_{}_rgftd_loss_seg'.format(self.cid)] = float(loss_rgftd_seg.detach().cpu().item())
+            metrics_['client_{}_rgftd_loss_aux'.format(self.cid)] = float(loss_rgftd_aux.detach().cpu().item())
+            metrics_['client_{}_rgftd_lambda'.format(self.cid)] = float(lambda_rgftd)
+            for key, value in rgftd_profile.items():
+                if key in ['loss', 'lambda']:
+                    continue
+                metrics_['client_{}_rgftd_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
 
         return loss.item(), metrics_
 
@@ -587,6 +691,8 @@ def main():
                         help='Dual branch initiallization for FedUniV2/FedUniV2.1')
     parser.add_argument('--label_prompt', type=int, default=0,
                         help='Whether use label prompt for FedUniV2/FedUniV2.1')
+    parser.add_argument('--ala_max_epochs', type=int, default=0,
+                        help='Maximum ALA initialization epochs; <=0 keeps the original unbounded behavior')
     # client
     parser.add_argument('--cid', type=int, default=0, help='Client CID (no default)')
 
@@ -666,6 +772,48 @@ def main():
                         help='Rampup iterations for WANN soft-band loss')
     parser.add_argument('--wann_cons_rampup_iters', type=int, default=800,
                         help='Rampup iterations for WANN consistency loss')
+    parser.add_argument('--rgftd_enabled', type=int, default=0,
+                        help='Enable reliability-gated federated teacher distillation')
+    parser.add_argument('--rgftd_lambda', type=float, default=0.1,
+                        help='Maximum RGFTD distillation loss weight')
+    parser.add_argument('--rgftd_warmup_iters', type=int, default=800,
+                        help='Iterations before RGFTD loss is released')
+    parser.add_argument('--rgftd_rampup_iters', type=int, default=800,
+                        help='Rampup iterations after RGFTD warmup')
+    parser.add_argument('--rgftd_teacher_ema_decay', type=float, default=0.99,
+                        help='Server EMA decay for RGFTD teacher')
+    parser.add_argument('--rgftd_teacher_conf_thresh', type=float, default=0.90,
+                        help='Teacher confidence threshold for RGFTD pixels')
+    parser.add_argument('--rgftd_teacher_foreground_radius', type=int, default=2,
+                        help='Foreground dilation radius for RGFTD teacher gating')
+    parser.add_argument('--rgftd_min_foreground_pixels', type=int, default=8,
+                        help='Minimum active foreground pixels required to keep RGFTD active')
+    parser.add_argument('--rgftd_min_foreground_ratio', type=float, default=0.05,
+                        help='Minimum active foreground ratio required to keep RGFTD active')
+    parser.add_argument('--rgftd_teacher_fg_prob_thresh', type=float, default=0.35,
+                        help='Teacher foreground probability threshold for RGFTD foreground anchoring')
+    parser.add_argument('--rgftd_teacher_fg_topk_ratio', type=float, default=0.002,
+                        help='Top-k ratio for fallback RGFTD foreground anchors inside WANN non-core regions')
+    parser.add_argument('--rgftd_teacher_fg_topk_min_pixels', type=int, default=8,
+                        help='Minimum fallback foreground-anchor pixels for RGFTD')
+    parser.add_argument('--rgftd_teacher_student_fg_margin', type=float, default=0.05,
+                        help='Teacher-student foreground probability margin for RGFTD foreground correction')
+    parser.add_argument('--rgftd_teacher_bg_conf_thresh', type=float, default=0.98,
+                        help='Teacher confidence threshold for accepted background pixels')
+    parser.add_argument('--rgftd_student_conf_thresh', type=float, default=0.80,
+                        help='Student maximum-confidence threshold for uncertainty gate')
+    parser.add_argument('--rgftd_student_entropy_thresh', type=float, default=0.35,
+                        help='Student normalized-entropy threshold for uncertainty gate')
+    parser.add_argument('--rgftd_low_r_thresh', type=float, default=0.25,
+                        help='WANN reliability threshold for RGFTD low-reliability region')
+    parser.add_argument('--rgftd_temperature', type=float, default=1.0,
+                        help='Temperature for RGFTD KL distillation')
+    parser.add_argument('--rgftd_use_soft_band', type=int, default=0,
+                        help='Whether RGFTD can also use WANN soft-band pixels')
+    parser.add_argument('--rgftd_background_weight', type=float, default=0.25,
+                        help='Relative weight for high-confidence teacher background pixels')
+    parser.add_argument('--rgftd_skip_background_only', type=int, default=1,
+                        help='Skip RGFTD when no active foreground pixels are present')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -733,6 +881,7 @@ def main():
     else:
         assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
     assert args.wann_enabled in [0, 1]
+    assert args.ala_max_epochs >= 0
     assert 0.0 <= args.wann_soft_thresh <= args.wann_core_thresh <= args.wann_r_max
     assert 0.0 <= args.wann_core_min_weight <= args.wann_r_max
     assert 0.0 <= args.wann_dilated_support_score <= 1.0
@@ -752,6 +901,30 @@ def main():
     assert args.wann_cons_lambda >= 0.0
     assert args.wann_soft_rampup_iters >= 0
     assert args.wann_cons_rampup_iters >= 0
+    assert args.rgftd_enabled in [0, 1]
+    if args.rgftd_enabled == 1:
+        assert args.wann_enabled == 1
+        assert args.strategy in ['FedUniV2', 'FedUniV2.1']
+    assert args.rgftd_lambda >= 0.0
+    assert args.rgftd_warmup_iters >= 0
+    assert args.rgftd_rampup_iters >= 0
+    assert 0.0 <= args.rgftd_teacher_ema_decay < 1.0
+    assert 0.0 <= args.rgftd_teacher_conf_thresh <= 1.0
+    assert args.rgftd_teacher_foreground_radius >= 0
+    assert args.rgftd_min_foreground_pixels >= 0
+    assert 0.0 <= args.rgftd_min_foreground_ratio <= 1.0
+    assert 0.0 <= args.rgftd_teacher_fg_prob_thresh <= 1.0
+    assert 0.0 <= args.rgftd_teacher_fg_topk_ratio <= 1.0
+    assert args.rgftd_teacher_fg_topk_min_pixels >= 0
+    assert args.rgftd_teacher_student_fg_margin >= 0.0
+    assert 0.0 <= args.rgftd_teacher_bg_conf_thresh <= 1.0
+    assert 0.0 <= args.rgftd_student_conf_thresh <= 1.0
+    assert 0.0 <= args.rgftd_student_entropy_thresh <= 1.0
+    assert 0.0 <= args.rgftd_low_r_thresh <= args.wann_r_max
+    assert args.rgftd_temperature > 0.0
+    assert args.rgftd_use_soft_band in [0, 1]
+    assert 0.0 <= args.rgftd_background_weight <= 1.0
+    assert args.rgftd_skip_background_only in [0, 1]
 
     # Configure logger
     if args.role == 'server':
@@ -876,6 +1049,35 @@ def main():
                 'wann_update_norm',
                 'wann_update_cos_loo',
                 'wann_update_conflict',
+            ]
+        if args.rgftd_enabled == 1:
+            train_scalar_metrics += [
+                'rgftd_loss',
+                'rgftd_loss_seg',
+                'rgftd_loss_aux',
+                'rgftd_lambda',
+                'rgftd_candidate_ratio',
+                'rgftd_active_ratio',
+                'rgftd_region_ratio',
+                'rgftd_teacher_accept_ratio',
+                'rgftd_student_uncertain_ratio',
+                'rgftd_teacher_conf_mean',
+                'rgftd_student_conf_mean',
+                'rgftd_student_entropy_mean',
+                'rgftd_kl_mean',
+                'rgftd_weight_mean',
+                'rgftd_teacher_foreground_ratio',
+                'rgftd_active_foreground_ratio',
+                'rgftd_active_background_ratio',
+                'rgftd_foreground_veto_ratio',
+                'rgftd_active_foreground_pixels',
+                'rgftd_active_background_pixels',
+            ]
+        if args.ala_max_epochs > 0:
+            train_scalar_metrics += [
+                'ala_epochs',
+                'ala_final_std',
+                'ala_hit_max_epochs',
             ]
         train_image_metrics = ['Image', 'Prediction', 'GroundTruth']
         if args.strategy in ['FedUniV2', 'FedUniV2.1']:

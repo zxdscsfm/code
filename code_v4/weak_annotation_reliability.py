@@ -13,6 +13,8 @@ class WannMaps:
     reliability: torch.Tensor
     core_weight: torch.Tensor
     soft_weight: torch.Tensor
+    support_mask: torch.Tensor
+    candidate_mask: torch.Tensor
     profile: dict
 
 
@@ -182,6 +184,8 @@ def build_wann_maps(image, label, logits, aux_logits, sup_type, img_class, num_c
         reliability=reliability,
         core_weight=core_weight,
         soft_weight=soft_weight,
+        support_mask=support,
+        candidate_mask=support_dilated,
         profile=profile,
     )
 
