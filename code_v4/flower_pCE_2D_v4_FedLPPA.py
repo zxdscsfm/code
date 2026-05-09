@@ -96,7 +96,10 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
     if rgftd_profile is not None:
         parts.extend([
             'rgftd_lambda=%.6f' % float(lambda_rgftd),
+            'rgftd_lambda_pre=%.6f' % _scalar_float(rgftd_profile.get('lambda_pre_safety', 0.0)),
+            'rgftd_lambda_safe=%.6f' % _scalar_float(rgftd_profile.get('lambda_after_safety', 0.0)),
             'rgftd_lambda_eff=%.6f' % _scalar_float(rgftd_profile.get('lambda_effective', lambda_rgftd)),
+            'rgftd_core_safe=%.6f' % _scalar_float(rgftd_profile.get('core_safety_factor', 0.0)),
             'rgftd_relf=%.6f' % _scalar_float(rgftd_profile.get('release_factor', 0.0)),
             'rgftd_relq=%.6f' % _scalar_float(rgftd_profile.get('release_quality', 0.0)),
             'rgftd_relmin=%.6f' % _scalar_float(rgftd_profile.get('release_min_effective', 0.0)),
@@ -123,8 +126,15 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rgftd_core_veto=%.1f' % _scalar_float(rgftd_profile.get('core_conflict_veto_ratio', 0.0)),
             'rgftd_fg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_budget', 0.0)),
             'rgftd_fg_budget=%.6f' % _scalar_float(rgftd_profile.get('foreground_budget_ratio', 0.0)),
+            'rgftd_fg_px_pre=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_return', 0.0)),
             'rgftd_fg_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0)),
+            'rgftd_bg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels_pre_budget', 0.0)),
+            'rgftd_bg_budget=%.6f' % _scalar_float(rgftd_profile.get('background_budget_ratio', 0.0)),
+            'rgftd_bg_px_pre=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels_pre_return', 0.0)),
             'rgftd_bg_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels', 0.0)),
+            'rgftd_bgfg=%.6f' % _scalar_float(rgftd_profile.get('background_foreground_ratio', 0.0)),
+            'rgftd_bg_bal=%.6f' % _scalar_float(rgftd_profile.get('background_balance_factor', 0.0)),
+            'rgftd_ret=%.1f' % _scalar_float(rgftd_profile.get('return_reason', 0.0)),
         ])
         for class_id in _rgftd_class_ids_from_profile(rgftd_profile):
             parts.extend([
@@ -921,6 +931,12 @@ def main():
                         help='Minimum active RGFTD foreground pixels kept after budget pruning')
     parser.add_argument('--rgftd_active_fg_topk_max_pixels', type=int, default=4096,
                         help='Maximum active RGFTD foreground pixels kept after budget pruning')
+    parser.add_argument('--rgftd_max_bg_fg_ratio', type=float, default=1.0,
+                        help='Maximum allowed active background-to-foreground pixel ratio for RGFTD')
+    parser.add_argument('--rgftd_allow_bg_without_fg', type=int, default=0,
+                        help='Whether RGFTD may keep background pixels when no foreground pixels survive')
+    parser.add_argument('--rgftd_lambda_eff_cap', type=float, default=0.02,
+                        help='Upper bound on effective RGFTD lambda after release and safety scaling')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -1052,6 +1068,9 @@ def main():
     assert args.rgftd_active_fg_topk_min_pixels >= 0
     assert args.rgftd_active_fg_topk_max_pixels >= 0
     assert args.rgftd_active_fg_topk_max_pixels == 0 or args.rgftd_active_fg_topk_max_pixels >= args.rgftd_active_fg_topk_min_pixels
+    assert args.rgftd_max_bg_fg_ratio >= 0.0
+    assert args.rgftd_allow_bg_without_fg in [0, 1]
+    assert args.rgftd_lambda_eff_cap >= 0.0
     assert args.rgftd_teacher_score_core_weight >= 0.0
     assert args.rgftd_teacher_score_support_weight >= 0.0
     assert args.rgftd_teacher_score_class_weight >= 0.0
@@ -1187,7 +1206,10 @@ def main():
                 'rgftd_loss_seg',
                 'rgftd_loss_aux',
                 'rgftd_lambda',
+                'rgftd_lambda_pre_safety',
+                'rgftd_lambda_after_safety',
                 'rgftd_lambda_effective',
+                'rgftd_core_safety_factor',
                 'rgftd_candidate_ratio',
                 'rgftd_active_ratio',
                 'rgftd_region_ratio',
@@ -1228,10 +1250,17 @@ def main():
                 'rgftd_active_background_ratio',
                 'rgftd_foreground_veto_ratio',
                 'rgftd_active_foreground_pixels_pre_budget',
+                'rgftd_active_background_pixels_pre_budget',
                 'rgftd_foreground_budget_ratio',
+                'rgftd_background_budget_ratio',
+                'rgftd_background_foreground_ratio',
+                'rgftd_background_balance_factor',
+                'rgftd_active_foreground_pixels_pre_return',
+                'rgftd_active_background_pixels_pre_return',
                 'rgftd_active_foreground_pixels',
                 'rgftd_active_background_pixels',
                 'rgftd_background_suppression_mean',
+                'rgftd_return_reason',
             ]
             for class_id in range(1, args.num_classes):
                 train_scalar_metrics += [

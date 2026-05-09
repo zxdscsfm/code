@@ -8,7 +8,10 @@ import torch.nn.functional as F
 RGFTD_PROFILE_KEYS = [
     "loss",
     "lambda",
+    "lambda_pre_safety",
+    "lambda_after_safety",
     "lambda_effective",
+    "core_safety_factor",
     "release_factor",
     "release_raw",
     "release_quality",
@@ -49,10 +52,17 @@ RGFTD_PROFILE_KEYS = [
     "active_background_ratio",
     "foreground_veto_ratio",
     "active_foreground_pixels_pre_budget",
+    "active_background_pixels_pre_budget",
     "foreground_budget_ratio",
+    "background_budget_ratio",
+    "background_foreground_ratio",
+    "background_balance_factor",
+    "active_foreground_pixels_pre_return",
+    "active_background_pixels_pre_return",
     "active_foreground_pixels",
     "active_background_pixels",
     "background_suppression_mean",
+    "return_reason",
 ]
 
 
@@ -87,8 +97,15 @@ def _topk_foreground_anchor(score, valid_mask, topk_ratio, min_pixels, max_pixel
         if valid_count <= 0:
             continue
         k = max(int(min_pixels), int(math.ceil(float(valid_count) * float(topk_ratio))))
-        if max_pixels is not None and int(max_pixels) > 0:
-            k = min(k, int(max_pixels))
+        if max_pixels is not None:
+            if torch.is_tensor(max_pixels):
+                batch_max_pixels = int(max_pixels[batch_idx].detach().cpu().item())
+            elif isinstance(max_pixels, (list, tuple)):
+                batch_max_pixels = int(max_pixels[batch_idx])
+            else:
+                batch_max_pixels = int(max_pixels)
+            if batch_max_pixels > 0:
+                k = min(k, batch_max_pixels)
         k = min(k, valid_count)
         if flat_preserve is None:
             masked_score = flat_score[batch_idx].masked_fill(~flat_valid[batch_idx], -1.0)
@@ -247,6 +264,9 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     active_fg_topk_ratio = float(getattr(args, "rgftd_active_fg_topk_ratio", 0.002))
     active_fg_topk_min_pixels = int(getattr(args, "rgftd_active_fg_topk_min_pixels", min_fg_pixels))
     active_fg_topk_max_pixels = int(getattr(args, "rgftd_active_fg_topk_max_pixels", 4096))
+    max_bg_fg_ratio = float(getattr(args, "rgftd_max_bg_fg_ratio", 1.0))
+    allow_bg_without_fg = int(getattr(args, "rgftd_allow_bg_without_fg", 0)) == 1
+    lambda_eff_cap = float(getattr(args, "rgftd_lambda_eff_cap", 0.02))
     teacher_student_fg_margin = float(getattr(args, "rgftd_teacher_student_fg_margin", 0.05))
     teacher_bg_conf_thresh = float(getattr(args, "rgftd_teacher_bg_conf_thresh", 0.98))
     bg_max_fg_prob = float(getattr(args, "rgftd_bg_max_fg_prob", 0.15))
@@ -404,6 +424,7 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         release_min_effective = torch.tensor(0.0, device=device)
         release_factor = torch.tensor(1.0, device=device)
         teacher_validation_veto = False
+        core_conflict_veto = False
 
     student_uncertain = (
         (student_conf <= float(getattr(args, "rgftd_student_conf_thresh", 0.80)))
@@ -422,6 +443,30 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         preserve_mask=foreground_correction & active_fg,
     )
     active_bg = region & teacher_bg_conf & teacher_bg_safe & (~teacher_fg_ready) & student_uncertain
+    active_bg_pre_budget = active_bg
+    bg_budget_score = teacher_bg_prob * student_entropy * (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+    flat_active_fg = active_fg.flatten(1)
+    flat_active_bg = active_bg.flatten(1)
+    max_bg_pixels = []
+    for batch_idx in range(active_bg.shape[0]):
+        fg_count = int(flat_active_fg[batch_idx].sum().detach().cpu().item())
+        bg_count = int(flat_active_bg[batch_idx].sum().detach().cpu().item())
+        if fg_count > 0:
+            max_bg_pixels.append(int(math.ceil(float(fg_count) * max(max_bg_fg_ratio, 0.0))))
+        elif allow_bg_without_fg:
+            max_bg_pixels.append(int(max(min_fg_pixels, bg_count)))
+        else:
+            max_bg_pixels.append(0)
+    if max(max_bg_pixels) <= 0:
+        active_bg = torch.zeros_like(active_bg, dtype=torch.bool)
+    else:
+        active_bg = _topk_foreground_anchor(
+            bg_budget_score,
+            active_bg,
+            topk_ratio=1.0,
+            min_pixels=0,
+            max_pixels=max_bg_pixels,
+        )
     active = active_fg | active_bg
 
     region_f = region.float()
@@ -431,14 +476,25 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     active_fg_mask = active_fg
     active_bg_mask = active_bg
     active_fg_pre_budget_pixels = active_fg_pre_budget.float().sum()
+    active_bg_pre_budget_pixels = active_bg_pre_budget.float().sum()
     active_fg_pixels = active_fg_mask.float().sum()
     active_bg_pixels = active_bg_mask.float().sum()
     active_total = active_sum.clamp_min(1.0)
     active_fg_ratio = active_fg_pixels / active_total
+    active_bg_ratio = active_bg_pixels / active_total
     if float(active_fg_pre_budget_pixels.detach().cpu().item()) > 0.0:
         foreground_budget_ratio = active_fg_pixels / active_fg_pre_budget_pixels.clamp_min(1.0)
     else:
         foreground_budget_ratio = active_fg_pixels * 0.0
+    if float(active_bg_pre_budget_pixels.detach().cpu().item()) > 0.0:
+        background_budget_ratio = active_bg_pixels / active_bg_pre_budget_pixels.clamp_min(1.0)
+    else:
+        background_budget_ratio = active_bg_pixels * 0.0
+    if float(active_fg_pixels.detach().cpu().item()) > 0.0:
+        background_foreground_ratio = active_bg_pixels / active_fg_pixels.clamp_min(1.0)
+    else:
+        background_foreground_ratio = active_bg_pixels * 0.0
+    background_balance_factor = active_fg_pixels / (active_fg_pixels + active_bg_pixels).clamp_min(1.0)
     foreground_veto = bool(
         skip_background_only and (
             active_fg_pixels.detach().cpu().item() < float(min_fg_pixels)
@@ -482,22 +538,51 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     profile["core_conflict_veto_ratio"] = torch.tensor(1.0 if teacher_validation_veto else 0.0, device=device)
     profile["foreground_veto_ratio"] = torch.tensor(1.0 if foreground_veto else 0.0, device=device)
     profile["active_foreground_ratio"] = active_fg_ratio.detach()
+    profile["active_background_ratio"] = active_bg_ratio.detach()
     profile["active_foreground_pixels_pre_budget"] = active_fg_pre_budget_pixels.detach()
+    profile["active_background_pixels_pre_budget"] = active_bg_pre_budget_pixels.detach()
     profile["foreground_budget_ratio"] = foreground_budget_ratio.detach()
+    profile["background_budget_ratio"] = background_budget_ratio.detach()
+    profile["background_foreground_ratio"] = background_foreground_ratio.detach()
+    profile["background_balance_factor"] = background_balance_factor.detach()
+    profile["active_foreground_pixels_pre_return"] = active_fg_pixels.detach()
+    profile["active_background_pixels_pre_return"] = active_bg_pixels.detach()
+    profile["active_foreground_pixels"] = active_fg_pixels.detach()
+    profile["active_background_pixels"] = active_bg_pixels.detach()
     for class_id in range(1, teacher_prob.shape[1]):
         class_release = ((active_fg & (teacher_pred == class_id)).float().sum() / region_sum).detach()
         profile["teacher_class{}_release_ratio".format(class_id)] = class_release
 
-    lambda_effective = (
+    lambda_pre_safety = (
         float(lambda_rgftd)
         * float(teacher_reliability.detach().cpu().item())
         * float(release_factor.detach().cpu().item())
     )
-    if validation_enabled and teacher_validation_veto:
-        lambda_effective = 0.0
+    if validation_enabled:
+        core_conflict_value = float(teacher_core_conflict.detach().cpu().item())
+        core_conflict_limit = float(max(getattr(args, "rgftd_teacher_max_core_conflict", 0.20), 1e-6))
+        core_safety_factor = max(0.0, min(1.0 - core_conflict_value / core_conflict_limit, 1.0))
+    else:
+        core_safety_factor = 1.0
+    lambda_after_safety = lambda_pre_safety * core_safety_factor
+    lambda_effective = lambda_after_safety
+    if lambda_eff_cap > 0.0:
+        lambda_effective = min(lambda_effective, lambda_eff_cap)
+    profile["lambda_pre_safety"] = torch.tensor(lambda_pre_safety, device=device)
+    profile["lambda_after_safety"] = torch.tensor(lambda_after_safety, device=device)
+    profile["core_safety_factor"] = torch.tensor(core_safety_factor, device=device)
     profile["lambda_effective"] = torch.tensor(lambda_effective, device=device)
 
-    if float(active_sum.detach().cpu().item()) <= 0.0 or foreground_veto or lambda_effective <= 0.0:
+    return_reason = 0.0
+    if float(active_sum.detach().cpu().item()) <= 0.0:
+        return_reason = 1.0
+    elif foreground_veto:
+        return_reason = 2.0
+    elif lambda_effective <= 0.0:
+        return_reason = 3.0
+    profile["return_reason"] = torch.tensor(return_reason, device=device)
+
+    if return_reason > 0.0:
         zero_loss = student_logits.sum() * 0.0
         profile["loss"] = zero_loss.detach()
         return zero_loss, lambda_effective, profile
@@ -517,6 +602,7 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     fg_loss = (per_pixel_kl * fg_weight).sum() / fg_denom
     if float(active_bg_pixels.detach().cpu().item()) > 0.0:
         bg_loss = (per_pixel_kl * bg_weight).sum() / bg_denom
+        bg_loss = bg_loss * background_balance_factor
     else:
         bg_loss = student_logits.sum() * 0.0
     loss = (fg_loss + background_weight * bg_loss) / (1.0 + background_weight if float(active_bg_pixels.detach().cpu().item()) > 0.0 else 1.0)
@@ -525,9 +611,6 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     profile["kl_mean"] = (per_pixel_kl * active_f).sum().detach() / active_sum.clamp_min(1.0)
     distill_weight = fg_weight + background_weight * bg_weight
     profile["weight_mean"] = distill_weight.mean().detach()
-    profile["active_background_ratio"] = (active_bg_pixels / active_sum.clamp_min(1.0)).detach()
-    profile["active_foreground_pixels"] = active_fg_pixels.detach()
-    profile["active_background_pixels"] = active_bg_pixels.detach()
     if float(active_bg_pixels.detach().cpu().item()) > 0.0:
         profile["background_suppression_mean"] = (
             (bg_suppression * active_bg_mask.float()).sum().detach() / active_bg_pixels.clamp_min(1.0)
