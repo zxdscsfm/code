@@ -13,7 +13,9 @@ class WannMaps:
     reliability: torch.Tensor
     core_weight: torch.Tensor
     soft_weight: torch.Tensor
+    valid_mask: torch.Tensor
     support_mask: torch.Tensor
+    seed_support_mask: torch.Tensor
     candidate_mask: torch.Tensor
     profile: dict
 
@@ -29,6 +31,15 @@ def _dilate(mask, radius):
     kernel = _odd_kernel(radius)
     x = mask.float().unsqueeze(1)
     y = F.max_pool2d(x, kernel_size=kernel, stride=1, padding=radius)
+    return y[:, 0] > 0.5
+
+
+def _erode(mask, radius):
+    if radius <= 0:
+        return mask
+    kernel = _odd_kernel(radius)
+    x = mask.float().unsqueeze(1)
+    y = -F.max_pool2d(-x, kernel_size=kernel, stride=1, padding=radius)
     return y[:, 0] > 0.5
 
 
@@ -100,11 +111,34 @@ def _radius_for_sup_type(sup_type, args):
     return int(getattr(args, "wann_mask_soft_radius", 1))
 
 
+def _build_seed_support_mask(label, valid, sup_type, num_classes, args):
+    sup_type = str(sup_type).lower()
+    if sup_type not in ["box", "block"]:
+        return valid
+
+    radius_name = "wann_seed_support_{}_erode_radius".format(sup_type)
+    radius = int(getattr(args, radius_name, getattr(args, "wann_seed_support_erode_radius", 1)))
+    if radius <= 0:
+        return valid
+
+    seed_support = torch.zeros_like(valid)
+    for class_id in range(int(num_classes)):
+        class_mask = valid & (label == class_id)
+        if not class_mask.any():
+            continue
+        class_seed = _erode(class_mask, radius)
+        if not class_seed.any():
+            class_seed = class_mask
+        seed_support = seed_support | class_seed
+    return seed_support
+
+
 def build_wann_maps(image, label, logits, aux_logits, sup_type, img_class, num_classes, iter_num, args, ref_logits=None):
     del img_class  # The current implementation is annotation-profile driven.
     label = label.long()
     valid = label != int(num_classes)
     support = valid
+    seed_support = _build_seed_support_mask(label, valid, sup_type, num_classes, args)
 
     soft_radius = _radius_for_sup_type(sup_type, args)
     support_dilated = _dilate(support, soft_radius)
@@ -184,7 +218,9 @@ def build_wann_maps(image, label, logits, aux_logits, sup_type, img_class, num_c
         reliability=reliability,
         core_weight=core_weight,
         soft_weight=soft_weight,
+        valid_mask=valid,
         support_mask=support,
+        seed_support_mask=seed_support,
         candidate_mask=support_dilated,
         profile=profile,
     )

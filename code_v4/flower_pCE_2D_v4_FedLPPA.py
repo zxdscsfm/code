@@ -67,6 +67,19 @@ def _scalar_float(value):
     return float(value)
 
 
+def _rgftd_class_ids_from_profile(rgftd_profile):
+    class_ids = []
+    if rgftd_profile is None:
+        return class_ids
+    for key in rgftd_profile.keys():
+        if not key.startswith('teacher_class') or not key.endswith('_reliability'):
+            continue
+        middle = key[len('teacher_class'):-len('_reliability')]
+        if middle.isdigit():
+            class_ids.append(int(middle))
+    return sorted(set(class_ids))
+
+
 def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile):
     parts = [
         'client %d : iteration %d : WANN/RGFTD' % (cid, iter_num),
@@ -83,16 +96,55 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
     if rgftd_profile is not None:
         parts.extend([
             'rgftd_lambda=%.6f' % float(lambda_rgftd),
+            'rgftd_lambda_eff=%.6f' % _scalar_float(rgftd_profile.get('lambda_effective', lambda_rgftd)),
+            'rgftd_relf=%.6f' % _scalar_float(rgftd_profile.get('release_factor', 0.0)),
+            'rgftd_relq=%.6f' % _scalar_float(rgftd_profile.get('release_quality', 0.0)),
+            'rgftd_relmin=%.6f' % _scalar_float(rgftd_profile.get('release_min_effective', 0.0)),
             'rgftd_loss=%.6f' % _scalar_float(rgftd_profile.get('loss', 0.0)),
             'rgftd_region=%.6f' % _scalar_float(rgftd_profile.get('region_ratio', 0.0)),
             'rgftd_active=%.6f' % _scalar_float(rgftd_profile.get('active_ratio', 0.0)),
+            'rgftd_t_rel=%.6f' % _scalar_float(rgftd_profile.get('teacher_reliability', 0.0)),
+            'rgftd_t_core=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_agreement', 0.0)),
+            'rgftd_t_core_cf=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_conflict', 0.0)),
+            'rgftd_t_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_agreement', 0.0)),
+            'rgftd_t_fg_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_fg_recall', 0.0)),
+            'rgftd_t_bg_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_bg_agreement', 0.0)),
+            'rgftd_t_seed_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_agreement', 0.0)),
+            'rgftd_t_seed_fg=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_recall', 0.0)),
+            'rgftd_t_seed_fgp=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_prob_mean', 0.0)),
+            'rgftd_t_seed_fgc=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_conf_mean', 0.0)),
+            'rgftd_t_seed_fgm=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_margin_mean', 0.0)),
+            'rgftd_t_seed_bg=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_bg_agreement', 0.0)),
             'rgftd_t_fg=%.6f' % _scalar_float(rgftd_profile.get('teacher_foreground_ratio', 0.0)),
             'rgftd_a_fg=%.6f' % _scalar_float(rgftd_profile.get('active_foreground_ratio', 0.0)),
             'rgftd_a_bg=%.6f' % _scalar_float(rgftd_profile.get('active_background_ratio', 0.0)),
+            'rgftd_bg_sup=%.6f' % _scalar_float(rgftd_profile.get('background_suppression_mean', 0.0)),
             'rgftd_veto=%.1f' % _scalar_float(rgftd_profile.get('foreground_veto_ratio', 0.0)),
+            'rgftd_core_veto=%.1f' % _scalar_float(rgftd_profile.get('core_conflict_veto_ratio', 0.0)),
+            'rgftd_fg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_budget', 0.0)),
+            'rgftd_fg_budget=%.6f' % _scalar_float(rgftd_profile.get('foreground_budget_ratio', 0.0)),
             'rgftd_fg_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0)),
             'rgftd_bg_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels', 0.0)),
         ])
+        for class_id in _rgftd_class_ids_from_profile(rgftd_profile):
+            parts.extend([
+                'rgftd_t_c%d=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_reliability'.format(class_id), 0.0)),
+                ),
+                'rgftd_t_c%d_sup=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_agreement'.format(class_id), 0.0)),
+                ),
+                'rgftd_t_c%d_core=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_core_agreement'.format(class_id), 0.0)),
+                ),
+                'rgftd_a_c%d=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_release_ratio'.format(class_id), 0.0)),
+                ),
+            ])
     return ', '.join(parts)
 
 
@@ -278,27 +330,30 @@ class MyClient(BaseClient):
                     loss_rgftd = outputs.sum() * 0.0
                     loss_rgftd_seg = outputs.sum() * 0.0
                     loss_rgftd_aux = outputs.sum() * 0.0
+                    lambda_rgftd_raw = 0.0
                     lambda_rgftd = 0.0
                     rgftd_profile = zero_rgftd_profile(outputs.device)
                     if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
-                        lambda_rgftd = get_rgftd_lambda(self.current_iter, self.args)
-                        if float(lambda_rgftd) > 0.0:
+                        lambda_rgftd_raw = get_rgftd_lambda(self.current_iter, self.args)
+                        if float(lambda_rgftd_raw) > 0.0:
                             with torch.no_grad():
                                 teacher_out = rgftd_teacher_model(volume_batch)
                                 teacher_logits = _primary_logits(teacher_out)
-                            loss_rgftd_seg, _, rgftd_profile_seg = rgftd_loss(
-                                outputs, teacher_logits, wann_maps, self.args, self.current_iter
+                            loss_rgftd_seg, lambda_rgftd_seg, rgftd_profile_seg = rgftd_loss(
+                                outputs, teacher_logits, label_batch, wann_maps, self.args, self.current_iter
                             )
-                            loss_rgftd_aux, _, rgftd_profile_aux = rgftd_loss(
-                                outputs_auxiliary, teacher_logits, wann_maps, self.args, self.current_iter
+                            loss_rgftd_aux, lambda_rgftd_aux, rgftd_profile_aux = rgftd_loss(
+                                outputs_auxiliary, teacher_logits, label_batch, wann_maps, self.args, self.current_iter
                             )
                             loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux)
+                            lambda_rgftd = 0.5 * (float(lambda_rgftd_seg) + float(lambda_rgftd_aux))
                             rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
                             loss_ce = loss_ce + float(lambda_rgftd) * loss_rgftd
                 else:
                     wann_maps = None
                     lambda_soft = 0.0
                     lambda_cons = 0.0
+                    lambda_rgftd_raw = 0.0
                     lambda_rgftd = 0.0
                     loss_hard = torch.tensor(0.0).cuda()
                     loss_soft = torch.tensor(0.0).cuda()
@@ -464,7 +519,7 @@ class MyClient(BaseClient):
                     self.cid,
                     self.current_iter,
                     wann_maps,
-                    lambda_rgftd,
+                    lambda_rgftd_raw,
                     rgftd_profile,
                 ))
 
@@ -550,11 +605,17 @@ class MyClient(BaseClient):
             metrics_['client_{}_rgftd_loss'.format(self.cid)] = float(loss_rgftd.detach().cpu().item())
             metrics_['client_{}_rgftd_loss_seg'.format(self.cid)] = float(loss_rgftd_seg.detach().cpu().item())
             metrics_['client_{}_rgftd_loss_aux'.format(self.cid)] = float(loss_rgftd_aux.detach().cpu().item())
-            metrics_['client_{}_rgftd_lambda'.format(self.cid)] = float(lambda_rgftd)
+            metrics_['client_{}_rgftd_lambda'.format(self.cid)] = float(lambda_rgftd_raw)
             for key, value in rgftd_profile.items():
                 if key in ['loss', 'lambda']:
                     continue
                 metrics_['client_{}_rgftd_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+            for class_id in range(1, self.args.num_classes):
+                for suffix in ['agreement', 'core_agreement', 'reliability', 'release_ratio']:
+                    profile_key = 'teacher_class{}_{}'.format(class_id, suffix)
+                    metrics_key = 'client_{}_rgftd_{}'.format(self.cid, profile_key)
+                    if metrics_key not in metrics_:
+                        metrics_[metrics_key] = float(_scalar_float(rgftd_profile.get(profile_key, 0.0)))
 
         return loss.item(), metrics_
 
@@ -764,6 +825,12 @@ def main():
                         help='Soft-band radius for box/block annotations')
     parser.add_argument('--wann_mask_soft_radius', type=int, default=1,
                         help='Soft-band radius for mask annotations')
+    parser.add_argument('--wann_seed_support_erode_radius', type=int, default=1,
+                        help='Default erosion radius used to build conservative seed support for box/block supervision')
+    parser.add_argument('--wann_seed_support_box_erode_radius', type=int, default=1,
+                        help='Erosion radius used to build conservative seed support for box supervision')
+    parser.add_argument('--wann_seed_support_block_erode_radius', type=int, default=1,
+                        help='Erosion radius used to build conservative seed support for block supervision')
     parser.add_argument('--wann_soft_lambda', type=float, default=0.2,
                         help='Maximum WANN soft-band loss weight')
     parser.add_argument('--wann_cons_lambda', type=float, default=0.05,
@@ -800,6 +867,8 @@ def main():
                         help='Teacher-student foreground probability margin for RGFTD foreground correction')
     parser.add_argument('--rgftd_teacher_bg_conf_thresh', type=float, default=0.98,
                         help='Teacher confidence threshold for accepted background pixels')
+    parser.add_argument('--rgftd_bg_max_fg_prob', type=float, default=0.15,
+                        help='Maximum teacher foreground probability allowed for accepted background pixels')
     parser.add_argument('--rgftd_student_conf_thresh', type=float, default=0.80,
                         help='Student maximum-confidence threshold for uncertainty gate')
     parser.add_argument('--rgftd_student_entropy_thresh', type=float, default=0.35,
@@ -814,6 +883,44 @@ def main():
                         help='Relative weight for high-confidence teacher background pixels')
     parser.add_argument('--rgftd_skip_background_only', type=int, default=1,
                         help='Skip RGFTD when no active foreground pixels are present')
+    parser.add_argument('--rgftd_teacher_validation_enabled', type=int, default=0,
+                        help='Enable RGFTD-v2 teacher reliability validation and release veto')
+    parser.add_argument('--rgftd_teacher_reliability_min', type=float, default=0.55,
+                        help='Legacy reliability threshold kept for RGFTD-v2 audit compatibility')
+    parser.add_argument('--rgftd_teacher_core_agree_floor', type=float, default=0.80,
+                        help='Agreement floor for teacher validation on WANN core pixels')
+    parser.add_argument('--rgftd_teacher_support_agree_floor', type=float, default=0.70,
+                        help='Agreement floor for teacher validation on weak-support foreground pixels')
+    parser.add_argument('--rgftd_teacher_support_prob_floor', type=float, default=0.35,
+                        help='Foreground-probability floor used in RGFTD-v2 teacher reliability support gate')
+    parser.add_argument('--rgftd_teacher_conf_floor', type=float, default=0.85,
+                        help='Confidence floor used when building RGFTD-v2 teacher reliability')
+    parser.add_argument('--rgftd_teacher_class_reliability_min', type=float, default=0.50,
+                        help='Minimum class-wise reliability required to release a teacher class')
+    parser.add_argument('--rgftd_teacher_max_core_conflict', type=float, default=0.20,
+                        help='Maximum tolerated teacher conflict ratio on WANN core before veto')
+    parser.add_argument('--rgftd_teacher_score_core_weight', type=float, default=0.35,
+                        help='Weight of core agreement in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_support_weight', type=float, default=0.30,
+                        help='Weight of support foreground agreement in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_class_weight', type=float, default=0.25,
+                        help='Weight of class-wise validation in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_conf_weight', type=float, default=0.10,
+                        help='Weight of teacher confidence in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_release_prob_floor', type=float, default=0.35,
+                        help='Foreground-probability floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_margin_floor', type=float, default=0.05,
+                        help='Foreground-vs-background margin floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_class_floor', type=float, default=0.50,
+                        help='Class-reliability floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_min', type=float, default=0.03,
+                        help='Maximum adaptive floor for RGFTD-v2 release after quality and schedule scaling')
+    parser.add_argument('--rgftd_active_fg_topk_ratio', type=float, default=0.002,
+                        help='Top-k ratio used to cap active RGFTD foreground pixels after gating')
+    parser.add_argument('--rgftd_active_fg_topk_min_pixels', type=int, default=8,
+                        help='Minimum active RGFTD foreground pixels kept after budget pruning')
+    parser.add_argument('--rgftd_active_fg_topk_max_pixels', type=int, default=4096,
+                        help='Maximum active RGFTD foreground pixels kept after budget pruning')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -897,6 +1004,9 @@ def main():
     assert args.wann_scribble_soft_radius >= 0
     assert args.wann_box_soft_radius >= 0
     assert args.wann_mask_soft_radius >= 0
+    assert args.wann_seed_support_erode_radius >= 0
+    assert args.wann_seed_support_box_erode_radius >= 0
+    assert args.wann_seed_support_block_erode_radius >= 0
     assert args.wann_soft_lambda >= 0.0
     assert args.wann_cons_lambda >= 0.0
     assert args.wann_soft_rampup_iters >= 0
@@ -918,6 +1028,7 @@ def main():
     assert args.rgftd_teacher_fg_topk_min_pixels >= 0
     assert args.rgftd_teacher_student_fg_margin >= 0.0
     assert 0.0 <= args.rgftd_teacher_bg_conf_thresh <= 1.0
+    assert 0.0 <= args.rgftd_bg_max_fg_prob <= 1.0
     assert 0.0 <= args.rgftd_student_conf_thresh <= 1.0
     assert 0.0 <= args.rgftd_student_entropy_thresh <= 1.0
     assert 0.0 <= args.rgftd_low_r_thresh <= args.wann_r_max
@@ -925,6 +1036,26 @@ def main():
     assert args.rgftd_use_soft_band in [0, 1]
     assert 0.0 <= args.rgftd_background_weight <= 1.0
     assert args.rgftd_skip_background_only in [0, 1]
+    assert args.rgftd_teacher_validation_enabled in [0, 1]
+    assert 0.0 <= args.rgftd_teacher_reliability_min <= 1.0
+    assert 0.0 <= args.rgftd_teacher_core_agree_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_support_agree_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_support_prob_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_conf_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_class_reliability_min <= 1.0
+    assert 0.0 <= args.rgftd_teacher_max_core_conflict <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_prob_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_margin_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_class_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_min <= 1.0
+    assert 0.0 <= args.rgftd_active_fg_topk_ratio <= 1.0
+    assert args.rgftd_active_fg_topk_min_pixels >= 0
+    assert args.rgftd_active_fg_topk_max_pixels >= 0
+    assert args.rgftd_active_fg_topk_max_pixels == 0 or args.rgftd_active_fg_topk_max_pixels >= args.rgftd_active_fg_topk_min_pixels
+    assert args.rgftd_teacher_score_core_weight >= 0.0
+    assert args.rgftd_teacher_score_support_weight >= 0.0
+    assert args.rgftd_teacher_score_class_weight >= 0.0
+    assert args.rgftd_teacher_score_conf_weight >= 0.0
 
     # Configure logger
     if args.role == 'server':
@@ -1056,23 +1187,59 @@ def main():
                 'rgftd_loss_seg',
                 'rgftd_loss_aux',
                 'rgftd_lambda',
+                'rgftd_lambda_effective',
                 'rgftd_candidate_ratio',
                 'rgftd_active_ratio',
                 'rgftd_region_ratio',
                 'rgftd_teacher_accept_ratio',
                 'rgftd_student_uncertain_ratio',
                 'rgftd_teacher_conf_mean',
+                'rgftd_teacher_reliability',
+                'rgftd_teacher_core_agreement',
+                'rgftd_teacher_core_conflict',
+                'rgftd_teacher_core_conf_mean',
+                'rgftd_teacher_support_agreement',
+                'rgftd_teacher_support_conflict',
+                'rgftd_teacher_support_conf_mean',
+                'rgftd_teacher_support_fg_recall',
+                'rgftd_teacher_support_bg_agreement',
+                'rgftd_teacher_seed_support_agreement',
+                'rgftd_teacher_seed_support_conflict',
+                'rgftd_teacher_seed_support_conf_mean',
+                'rgftd_teacher_seed_support_fg_recall',
+                'rgftd_teacher_seed_support_fg_prob_mean',
+                'rgftd_teacher_seed_support_fg_conf_mean',
+                'rgftd_teacher_seed_support_fg_margin_mean',
+                'rgftd_teacher_seed_support_bg_agreement',
+                'rgftd_core_conflict_veto_ratio',
                 'rgftd_student_conf_mean',
                 'rgftd_student_entropy_mean',
                 'rgftd_kl_mean',
                 'rgftd_weight_mean',
+                'rgftd_release_factor',
+                'rgftd_release_raw',
+                'rgftd_release_quality',
+                'rgftd_release_min_effective',
+                'rgftd_release_prob_gate',
+                'rgftd_release_conf_gate',
+                'rgftd_release_class_gate',
                 'rgftd_teacher_foreground_ratio',
                 'rgftd_active_foreground_ratio',
                 'rgftd_active_background_ratio',
                 'rgftd_foreground_veto_ratio',
+                'rgftd_active_foreground_pixels_pre_budget',
+                'rgftd_foreground_budget_ratio',
                 'rgftd_active_foreground_pixels',
                 'rgftd_active_background_pixels',
+                'rgftd_background_suppression_mean',
             ]
+            for class_id in range(1, args.num_classes):
+                train_scalar_metrics += [
+                    'rgftd_teacher_class{}_agreement'.format(class_id),
+                    'rgftd_teacher_class{}_core_agreement'.format(class_id),
+                    'rgftd_teacher_class{}_reliability'.format(class_id),
+                    'rgftd_teacher_class{}_release_ratio'.format(class_id),
+                ]
         if args.ala_max_epochs > 0:
             train_scalar_metrics += [
                 'ala_epochs',
