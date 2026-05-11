@@ -33,6 +33,7 @@ RGFTD_PROFILE_KEYS = [
     "teacher_reliability",
     "teacher_core_agreement",
     "teacher_core_conflict",
+    "teacher_core_valid",
     "teacher_core_conf_mean",
     "teacher_support_agreement",
     "teacher_support_conflict",
@@ -47,7 +48,17 @@ RGFTD_PROFILE_KEYS = [
     "teacher_seed_support_fg_conf_mean",
     "teacher_seed_support_fg_margin_mean",
     "teacher_seed_support_bg_agreement",
+    "seed_fg_support_pixels",
     "core_conflict_veto_ratio",
+    "spatial_support_ratio",
+    "foreground_candidate_ratio",
+    "spatial_weight_mean",
+    "spatial_weight_candidate_mean",
+    "spatial_weight_near_seed_mean",
+    "spatial_weight_far_mean",
+    "spatial_loss_scale",
+    "active_foreground_pixels_pre_spatial",
+    "active_foreground_spatial_keep_ratio",
     "active_foreground_ratio",
     "active_background_ratio",
     "foreground_veto_ratio",
@@ -61,8 +72,30 @@ RGFTD_PROFILE_KEYS = [
     "active_background_pixels_pre_return",
     "active_foreground_pixels",
     "active_background_pixels",
+    "active_fg_seed_precision",
+    "active_fg_seed_recall",
+    "active_fg_support_precision",
+    "active_fg_support_recall",
+    "active_fg_candidate_ratio",
+    "active_fg_fg_candidate_ratio",
+    "active_fg_near_seed_ratio",
+    "active_fg_pre_budget_seed_precision",
+    "active_fg_pre_budget_candidate_ratio",
     "background_suppression_mean",
     "return_reason",
+    "v3_pool_size",
+    "v3_no_teacher",
+    "v3_selected_teacher",
+    "v3_selected_score",
+    "v3_best_failed_teacher",
+    "v3_best_failed_score",
+    "v3_routing_score",
+    "v3_audit_seed_fg_prob_mean",
+    "v3_audit_seed_fg_margin_mean",
+    "v3_audit_seed_fg_recall",
+    "v3_audit_core_conflict",
+    "v3_audit_teacher_reliability",
+    "v3_audit_release_factor",
 ]
 
 
@@ -264,6 +297,14 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     active_fg_topk_ratio = float(getattr(args, "rgftd_active_fg_topk_ratio", 0.002))
     active_fg_topk_min_pixels = int(getattr(args, "rgftd_active_fg_topk_min_pixels", min_fg_pixels))
     active_fg_topk_max_pixels = int(getattr(args, "rgftd_active_fg_topk_max_pixels", 4096))
+    spatial_support_enabled = int(getattr(args, "rgftd_spatial_support_enabled", 1)) == 1
+    spatial_support_radius = int(getattr(args, "rgftd_spatial_support_radius", teacher_fg_radius))
+    spatial_candidate_weight = float(getattr(args, "rgftd_spatial_candidate_weight", 1.0))
+    spatial_near_seed_weight = float(getattr(args, "rgftd_spatial_near_seed_weight", 0.75))
+    spatial_far_weight = float(getattr(args, "rgftd_spatial_far_weight", 0.15))
+    spatial_candidate_weight = max(0.0, min(spatial_candidate_weight, 1.0))
+    spatial_near_seed_weight = max(0.0, min(spatial_near_seed_weight, 1.0))
+    spatial_far_weight = max(0.0, min(spatial_far_weight, 1.0))
     max_bg_fg_ratio = float(getattr(args, "rgftd_max_bg_fg_ratio", 1.0))
     allow_bg_without_fg = int(getattr(args, "rgftd_allow_bg_without_fg", 0)) == 1
     lambda_eff_cap = float(getattr(args, "rgftd_lambda_eff_cap", 0.02))
@@ -314,9 +355,16 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     teacher_bg_context = teacher_fg_context & teacher_bg_conf
     region = region & (teacher_fg_context | teacher_bg_context)
 
-    teacher_core_agreement = _masked_ratio((teacher_pred == label) & core_mask, core_mask).detach()
-    teacher_core_conflict = (1.0 - teacher_core_agreement).detach()
-    teacher_core_conf_mean = _masked_mean(teacher_conf, core_mask).detach()
+    core_pixels = core_mask.float().sum().detach()
+    core_valid = bool(float(core_pixels.cpu().item()) > 0.0)
+    if core_valid:
+        teacher_core_agreement = _masked_ratio((teacher_pred == label) & core_mask, core_mask).detach()
+        teacher_core_conflict = (1.0 - teacher_core_agreement).detach()
+        teacher_core_conf_mean = _masked_mean(teacher_conf, core_mask).detach()
+    else:
+        teacher_core_agreement = teacher_conf.mean().detach() * 0.0
+        teacher_core_conflict = teacher_conf.mean().detach() * 0.0
+        teacher_core_conf_mean = teacher_conf.mean().detach() * 0.0
     teacher_support_agreement = _masked_ratio((teacher_pred == label) & support_mask, support_mask).detach()
     teacher_support_conflict = (1.0 - teacher_support_agreement).detach()
     teacher_support_conf_mean = _masked_mean(teacher_conf, support_mask).detach()
@@ -330,6 +378,7 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     teacher_seed_support_fg_conf_mean = _masked_mean(teacher_conf, seed_fg_support).detach()
     teacher_seed_support_fg_margin_mean = _masked_mean(teacher_fg_margin, seed_fg_support).detach()
     teacher_seed_support_bg_agreement = _masked_ratio((teacher_pred == 0) & seed_bg_support, seed_bg_support).detach()
+    seed_fg_support_pixels = seed_fg_support.float().sum().detach()
 
     class_weight_map = torch.ones_like(teacher_conf)
     class_reliability_mean = teacher_conf.mean() * 0.0
@@ -353,10 +402,13 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         profile.setdefault("teacher_class{}_reliability".format(class_id), teacher_conf.mean() * 0.0)
 
     if validation_enabled:
-        core_gate = _normalize_gate(
-            teacher_core_agreement,
-            float(getattr(args, "rgftd_teacher_core_agree_floor", 0.80)),
-        )
+        if core_valid:
+            core_gate = _normalize_gate(
+                teacher_core_agreement,
+                float(getattr(args, "rgftd_teacher_core_agree_floor", 0.80)),
+            )
+        else:
+            core_gate = torch.tensor(1.0, device=device)
         support_gate = _normalize_gate(
             teacher_seed_support_fg_prob_mean,
             teacher_support_prob_floor,
@@ -431,9 +483,32 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         | (student_entropy >= float(getattr(args, "rgftd_student_entropy_thresh", 0.35)))
     )
     foreground_correction = teacher_fg_ready & ((teacher_fg_prob - student_fg_prob) >= teacher_student_fg_margin)
-    active_fg = region & teacher_fg_ready & (student_uncertain | foreground_correction)
+    seed_fg_spatial_context = _dilate_mask(seed_fg_support, spatial_support_radius)
+    fg_support_context = _dilate_mask(fg_support, spatial_support_radius)
+    foreground_candidate_mask = candidate_mask & fg_support_context
+    spatial_support_gate = (foreground_candidate_mask | seed_fg_spatial_context) & region
+    active_fg_pre_spatial = region & teacher_fg_ready & (student_uncertain | foreground_correction)
+    if spatial_support_enabled:
+        spatial_weight = region.float() * spatial_far_weight
+        spatial_weight = torch.maximum(
+            spatial_weight,
+            seed_fg_spatial_context.float() * spatial_near_seed_weight,
+        )
+        spatial_weight = torch.maximum(
+            spatial_weight,
+            foreground_candidate_mask.float() * spatial_candidate_weight,
+        )
+        spatial_weight = spatial_weight * region.float()
+    else:
+        spatial_weight = region.float()
+    active_fg = active_fg_pre_spatial
     active_fg_pre_budget = active_fg
-    fg_budget_score = teacher_fg_prob * student_entropy * (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+    fg_budget_score = (
+        teacher_fg_prob
+        * student_entropy
+        * (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+        * spatial_weight
+    )
     active_fg = _topk_foreground_anchor(
         fg_budget_score,
         active_fg,
@@ -479,6 +554,8 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     active_bg_pre_budget_pixels = active_bg_pre_budget.float().sum()
     active_fg_pixels = active_fg_mask.float().sum()
     active_bg_pixels = active_bg_mask.float().sum()
+    active_fg_pre_spatial_pixels = active_fg_pre_spatial.float().sum()
+    active_fg_hard_spatial_pixels = (active_fg_pre_spatial & spatial_support_gate).float().sum()
     active_total = active_sum.clamp_min(1.0)
     active_fg_ratio = active_fg_pixels / active_total
     active_bg_ratio = active_bg_pixels / active_total
@@ -495,6 +572,21 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     else:
         background_foreground_ratio = active_bg_pixels * 0.0
     background_balance_factor = active_fg_pixels / (active_fg_pixels + active_bg_pixels).clamp_min(1.0)
+    if float(active_fg_pre_spatial_pixels.detach().cpu().item()) > 0.0:
+        active_fg_spatial_keep_ratio = active_fg_hard_spatial_pixels / active_fg_pre_spatial_pixels.clamp_min(1.0)
+    else:
+        active_fg_spatial_keep_ratio = active_fg_pre_spatial_pixels * 0.0
+    seed_fg_context = _dilate_mask(seed_fg_support, teacher_fg_radius)
+    active_fg_seed_precision = _masked_ratio(active_fg_mask & seed_fg_support, active_fg_mask)
+    active_fg_seed_recall = _masked_ratio(active_fg_mask & seed_fg_support, seed_fg_support)
+    active_fg_support_precision = _masked_ratio(active_fg_mask & fg_support, active_fg_mask)
+    active_fg_support_recall = _masked_ratio(active_fg_mask & fg_support, fg_support)
+    active_fg_candidate_ratio = _masked_ratio(active_fg_mask & candidate_mask, active_fg_mask)
+    active_fg_fg_candidate_ratio = _masked_ratio(active_fg_mask & foreground_candidate_mask, active_fg_mask)
+    active_fg_near_seed_ratio = _masked_ratio(active_fg_mask & seed_fg_context, active_fg_mask)
+    active_fg_pre_budget_seed_precision = _masked_ratio(active_fg_pre_budget & seed_fg_support, active_fg_pre_budget)
+    active_fg_pre_budget_candidate_ratio = _masked_ratio(active_fg_pre_budget & candidate_mask, active_fg_pre_budget)
+    spatial_loss_scale = _masked_mean(spatial_weight, active_fg_mask).detach()
     foreground_veto = bool(
         skip_background_only and (
             active_fg_pixels.detach().cpu().item() < float(min_fg_pixels)
@@ -521,6 +613,7 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     profile["release_class_gate"] = release_class_gate.detach()
     profile["teacher_core_agreement"] = teacher_core_agreement
     profile["teacher_core_conflict"] = teacher_core_conflict
+    profile["teacher_core_valid"] = torch.tensor(1.0 if core_valid else 0.0, device=device)
     profile["teacher_core_conf_mean"] = teacher_core_conf_mean
     profile["teacher_support_agreement"] = teacher_support_agreement
     profile["teacher_support_conflict"] = teacher_support_conflict
@@ -535,7 +628,26 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     profile["teacher_seed_support_fg_conf_mean"] = teacher_seed_support_fg_conf_mean
     profile["teacher_seed_support_fg_margin_mean"] = teacher_seed_support_fg_margin_mean
     profile["teacher_seed_support_bg_agreement"] = teacher_seed_support_bg_agreement
+    profile["seed_fg_support_pixels"] = seed_fg_support_pixels
     profile["core_conflict_veto_ratio"] = torch.tensor(1.0 if teacher_validation_veto else 0.0, device=device)
+    profile["spatial_support_ratio"] = spatial_support_gate.float().mean().detach()
+    profile["foreground_candidate_ratio"] = foreground_candidate_mask.float().mean().detach()
+    profile["spatial_weight_mean"] = _masked_mean(spatial_weight, active_fg_mask).detach()
+    profile["spatial_weight_candidate_mean"] = _masked_mean(
+        spatial_weight,
+        active_fg_mask & foreground_candidate_mask,
+    ).detach()
+    profile["spatial_weight_near_seed_mean"] = _masked_mean(
+        spatial_weight,
+        active_fg_mask & seed_fg_context,
+    ).detach()
+    profile["spatial_weight_far_mean"] = _masked_mean(
+        spatial_weight,
+        active_fg_mask & (~spatial_support_gate),
+    ).detach()
+    profile["spatial_loss_scale"] = spatial_loss_scale.detach()
+    profile["active_foreground_pixels_pre_spatial"] = active_fg_pre_spatial_pixels.detach()
+    profile["active_foreground_spatial_keep_ratio"] = active_fg_spatial_keep_ratio.detach()
     profile["foreground_veto_ratio"] = torch.tensor(1.0 if foreground_veto else 0.0, device=device)
     profile["active_foreground_ratio"] = active_fg_ratio.detach()
     profile["active_background_ratio"] = active_bg_ratio.detach()
@@ -549,6 +661,15 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
     profile["active_background_pixels_pre_return"] = active_bg_pixels.detach()
     profile["active_foreground_pixels"] = active_fg_pixels.detach()
     profile["active_background_pixels"] = active_bg_pixels.detach()
+    profile["active_fg_seed_precision"] = active_fg_seed_precision.detach()
+    profile["active_fg_seed_recall"] = active_fg_seed_recall.detach()
+    profile["active_fg_support_precision"] = active_fg_support_precision.detach()
+    profile["active_fg_support_recall"] = active_fg_support_recall.detach()
+    profile["active_fg_candidate_ratio"] = active_fg_candidate_ratio.detach()
+    profile["active_fg_fg_candidate_ratio"] = active_fg_fg_candidate_ratio.detach()
+    profile["active_fg_near_seed_ratio"] = active_fg_near_seed_ratio.detach()
+    profile["active_fg_pre_budget_seed_precision"] = active_fg_pre_budget_seed_precision.detach()
+    profile["active_fg_pre_budget_candidate_ratio"] = active_fg_pre_budget_candidate_ratio.detach()
     for class_id in range(1, teacher_prob.shape[1]):
         class_release = ((active_fg & (teacher_pred == class_id)).float().sum() / region_sum).detach()
         profile["teacher_class{}_release_ratio".format(class_id)] = class_release
@@ -559,13 +680,16 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         * float(release_factor.detach().cpu().item())
     )
     if validation_enabled:
-        core_conflict_value = float(teacher_core_conflict.detach().cpu().item())
-        core_conflict_limit = float(max(getattr(args, "rgftd_teacher_max_core_conflict", 0.20), 1e-6))
-        core_safety_factor = max(0.0, min(1.0 - core_conflict_value / core_conflict_limit, 1.0))
+        if core_valid:
+            core_conflict_value = float(teacher_core_conflict.detach().cpu().item())
+            core_conflict_limit = float(max(getattr(args, "rgftd_teacher_max_core_conflict", 0.20), 1e-6))
+            core_safety_factor = max(0.0, min(1.0 - core_conflict_value / core_conflict_limit, 1.0))
+        else:
+            core_safety_factor = 1.0
     else:
         core_safety_factor = 1.0
     lambda_after_safety = lambda_pre_safety * core_safety_factor
-    lambda_effective = lambda_after_safety
+    lambda_effective = lambda_after_safety * float(spatial_loss_scale.cpu().item())
     if lambda_eff_cap > 0.0:
         lambda_effective = min(lambda_effective, lambda_eff_cap)
     profile["lambda_pre_safety"] = torch.tensor(lambda_pre_safety, device=device)
@@ -594,7 +718,13 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         fg_teacher_weight = (class_weight_map * teacher_conf).clamp(0.0, 1.0)
     else:
         fg_teacher_weight = (0.5 * class_weight_map + 0.5 * teacher_fg_prob).clamp(0.0, 1.0)
-    fg_weight = (1.0 - wann_maps.reliability).clamp(0.0, 1.0) * active_fg_mask.float() * fg_teacher_weight * teacher_reliability
+    fg_weight = (
+        (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+        * active_fg_mask.float()
+        * fg_teacher_weight
+        * teacher_reliability
+        * spatial_weight
+    )
     bg_suppression = ((bg_max_fg_prob - teacher_fg_prob) / max(bg_max_fg_prob, 1e-6)).clamp(0.0, 1.0)
     bg_weight = (1.0 - wann_maps.reliability).clamp(0.0, 1.0) * active_bg_mask.float() * teacher_reliability * bg_suppression
     fg_denom = fg_weight.sum().clamp_min(1.0)

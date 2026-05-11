@@ -341,6 +341,11 @@ def build_parser():
     parser.add_argument("--rgftd_active_fg_topk_ratio", type=float, default=0.002)
     parser.add_argument("--rgftd_active_fg_topk_min_pixels", type=int, default=8)
     parser.add_argument("--rgftd_active_fg_topk_max_pixels", type=int, default=4096)
+    parser.add_argument("--rgftd_spatial_support_enabled", type=int, default=1)
+    parser.add_argument("--rgftd_spatial_support_radius", type=int, default=2)
+    parser.add_argument("--rgftd_spatial_candidate_weight", type=float, default=1.0)
+    parser.add_argument("--rgftd_spatial_near_seed_weight", type=float, default=0.75)
+    parser.add_argument("--rgftd_spatial_far_weight", type=float, default=0.15)
     parser.add_argument("--rgftd_max_bg_fg_ratio", type=float, default=1.0)
     parser.add_argument("--rgftd_allow_bg_without_fg", type=int, default=0)
     parser.add_argument("--rgftd_lambda_eff_cap", type=float, default=0.02)
@@ -527,8 +532,33 @@ def main():
         "teacher_seed_support_fg_margin_mean",
         "active_foreground_ratio",
         "active_background_ratio",
+        "spatial_support_ratio",
+        "foreground_candidate_ratio",
+        "spatial_weight_mean",
+        "spatial_weight_candidate_mean",
+        "spatial_weight_near_seed_mean",
+        "spatial_weight_far_mean",
+        "spatial_loss_scale",
+        "active_foreground_pixels_pre_spatial",
+        "active_foreground_spatial_keep_ratio",
+        "active_foreground_pixels_pre_budget",
+        "active_foreground_pixels",
+        "active_background_pixels",
+        "foreground_budget_ratio",
+        "background_foreground_ratio",
+        "active_fg_seed_precision",
+        "active_fg_seed_recall",
+        "active_fg_support_precision",
+        "active_fg_support_recall",
+        "active_fg_candidate_ratio",
+        "active_fg_fg_candidate_ratio",
+        "active_fg_near_seed_ratio",
+        "active_fg_pre_budget_seed_precision",
+        "active_fg_pre_budget_candidate_ratio",
         "teacher_foreground_ratio",
         "return_reason_0_ratio",
+        "return_reason_1_ratio",
+        "return_reason_2_ratio",
         "return_reason_3_ratio",
     ]
     saved_matrices = {}

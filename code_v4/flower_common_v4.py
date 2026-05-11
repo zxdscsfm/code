@@ -316,6 +316,8 @@ class MyServer(Server):
         self.train_image_metrics = train_image_metrics
         self.val_metrics = val_metrics
         self.rgftd_teacher_ndarrays = None
+        self.rgftd_teacher_bank_ndarrays = {}
+        self._missing_train_metric_warnings = set()
 
     # pylint: disable=too-many-locals
     def fit(self, num_rounds, timeout):
@@ -326,6 +328,8 @@ class MyServer(Server):
         log(INFO, 'Initializing global parameters')
         self.parameters = self._get_initial_parameters(timeout=timeout)
         if self._rgftd_enabled():
+            if self._rgftd_v3_enabled():
+                self._init_rgftd_teacher_bank(self.parameters)
             self.rgftd_teacher_ndarrays = [
                 array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
             ]
@@ -423,6 +427,8 @@ class MyServer(Server):
                 self._append_wann_update_diagnostics(metrics_prime, results_prime, parameters_before_fit)
             self.parameters = parameters_prime
             if self._rgftd_enabled():
+                if self._rgftd_v3_enabled():
+                    self._update_rgftd_teacher_bank(results_prime)
                 self._update_rgftd_teacher(self.parameters)
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
@@ -430,7 +436,19 @@ class MyServer(Server):
 
             for client_id in client_id_list:
                 for metric_name in self.train_scalar_metrics:
-                    self.writer.add_scalar('info/client_{}_{}'.format(client_id, metric_name), metrics_prime['client_{}_{}'.format(client_id, metric_name)], iter_num)
+                    metric_key = 'client_{}_{}'.format(client_id, metric_name)
+                    if metric_key not in metrics_prime:
+                        if metric_name.startswith('rgftd_v3_'):
+                            warn_key = (client_id, metric_name)
+                            if warn_key not in self._missing_train_metric_warnings:
+                                log(WARNING, 'Missing optional RGFTD-v3 metric %s; writing 0.0 to keep training alive', metric_key)
+                                self._missing_train_metric_warnings.add(warn_key)
+                            metric_value = 0.0
+                        else:
+                            raise KeyError(metric_key)
+                    else:
+                        metric_value = metrics_prime[metric_key]
+                    self.writer.add_scalar('info/client_{}_{}'.format(client_id, metric_name), metric_value, iter_num)
                 for metric_name in self.train_image_metrics:
                     images.append(fl.common.bytes_to_ndarray(metrics_prime['client_{}_{}'.format(client_id, metric_name)]))
 
@@ -671,11 +689,27 @@ class MyServer(Server):
                 prompts_array = np.mean(prompts_list, axis=0)
                 weight_list.append(prompts_array)
                 if self._rgftd_enabled():
-                    if self.rgftd_teacher_ndarrays is None:
-                        self.rgftd_teacher_ndarrays = [
-                            array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
-                        ]
-                    weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
+                    if self._rgftd_v3_enabled():
+                        if not self.rgftd_teacher_bank_ndarrays:
+                            self._init_rgftd_teacher_bank(self.parameters)
+                        for client_id in client_id_list:
+                            teacher_arrays = self.rgftd_teacher_bank_ndarrays.get(client_id, None)
+                            if teacher_arrays is None:
+                                teacher_arrays = [
+                                    array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                                ]
+                            weight_list += [array.copy() for array in teacher_arrays]
+                        if self.rgftd_teacher_ndarrays is None:
+                            self.rgftd_teacher_ndarrays = [
+                                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                            ]
+                        weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
+                    else:
+                        if self.rgftd_teacher_ndarrays is None:
+                            self.rgftd_teacher_ndarrays = [
+                                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                            ]
+                        weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
                 self.parameters = ndarrays_to_parameters(weight_list)
                 '''print(iter_num, 'val_dice_list', val_dice_list)
                 print(iter_num, 'performance_array', performance_array)'''
@@ -693,6 +727,9 @@ class MyServer(Server):
     def _rgftd_enabled(self):
         return int(getattr(self.args, 'rgftd_enabled', 0)) == 1
 
+    def _rgftd_v3_enabled(self):
+        return self._rgftd_enabled() and int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1
+
     def _extract_global_ndarrays_for_rgftd(self, parameters):
         arrays = parameters_to_ndarrays(parameters)
         num_weights = len(self.state_dict_keys)
@@ -703,6 +740,42 @@ class MyServer(Server):
         if len(arrays) >= end_idx:
             return arrays[start_idx:end_idx]
         return arrays[:num_weights]
+
+    def _init_rgftd_teacher_bank(self, parameters):
+        global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
+        self.rgftd_teacher_bank_ndarrays = {
+            client_id: [array.copy() for array in global_arrays]
+            for client_id in range(self.args.min_num_clients)
+        }
+
+    def _client_id_from_fit_metrics(self, metrics):
+        for client_id in range(self.args.min_num_clients):
+            if 'client_{}_lr'.format(client_id) in metrics:
+                return client_id
+        return None
+
+    def _update_rgftd_teacher_bank(self, results_prime):
+        if not self.rgftd_teacher_bank_ndarrays:
+            self._init_rgftd_teacher_bank(self.parameters)
+        decay = float(getattr(self.args, 'rgftd_teacher_ema_decay', 0.99))
+        for _, fit_res in results_prime:
+            client_id = self._client_id_from_fit_metrics(fit_res.metrics)
+            if client_id is None:
+                continue
+            client_arrays = parameters_to_ndarrays(fit_res.parameters)
+            teacher_arrays = self.rgftd_teacher_bank_ndarrays.get(client_id, None)
+            if teacher_arrays is None or len(teacher_arrays) != len(client_arrays):
+                self.rgftd_teacher_bank_ndarrays[client_id] = [array.copy() for array in client_arrays]
+                continue
+            updated = []
+            for teacher_array, client_array in zip(teacher_arrays, client_arrays):
+                if teacher_array.shape != client_array.shape:
+                    updated.append(client_array.copy())
+                elif np.issubdtype(client_array.dtype, np.floating):
+                    updated.append((decay * teacher_array + (1.0 - decay) * client_array).astype(client_array.dtype))
+                else:
+                    updated.append(client_array.copy())
+            self.rgftd_teacher_bank_ndarrays[client_id] = updated
 
     def _update_rgftd_teacher(self, parameters):
         global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
@@ -1366,6 +1439,7 @@ class MyModel(nn.Module):
         self.valloader = valloader
         self.amp=(args.amp == 1)
         self.rgftd_teacher_state_dict = None
+        self.rgftd_teacher_state_dicts = {}
         self.ala_last_epochs = 0
         self.ala_last_std = 0.0
         self.ala_hit_max_epochs = 0
@@ -1427,6 +1501,7 @@ class MyModel(nn.Module):
     def set_weights(self, weights, config):
         # print('Setting weights')
         self.rgftd_teacher_state_dict = None
+        self.rgftd_teacher_state_dicts = {}
         # MetaFed
         if self.args.strategy == 'MetaFed':
             def get_teacher_id_v1(weight_dict):
@@ -1583,10 +1658,46 @@ class MyModel(nn.Module):
                         num_weights = len(self.model.state_dict().items())
                         print(num_weights)
                         expected_without_rgftd = (self.args.min_num_clients + 1) * num_weights + 2
-                        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and len(weights) >= expected_without_rgftd + num_weights:
-                            self.rgftd_teacher_state_dict = OrderedDict({
-                                k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), weights[-num_weights:])
-                            })
+                        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+                            if int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1:
+                                expected_with_bank = expected_without_rgftd + self.args.min_num_clients * num_weights
+                                if len(weights) >= expected_with_bank:
+                                    teacher_bank_start = expected_without_rgftd
+                                    for teacher_client_id in self.client_id_list:
+                                        start_teacher = teacher_bank_start + teacher_client_id * num_weights
+                                        end_teacher = start_teacher + num_weights
+                                        self.rgftd_teacher_state_dicts[teacher_client_id] = OrderedDict({
+                                            k: torch.tensor(v)
+                                            for k, v in zip(
+                                                self.model.state_dict().keys(),
+                                                weights[start_teacher:end_teacher],
+                                            )
+                                        })
+                                expected_with_bank_and_fallback = expected_with_bank + num_weights
+                                if len(weights) >= expected_with_bank_and_fallback:
+                                    fallback_start = expected_with_bank
+                                    fallback_end = fallback_start + num_weights
+                                    self.rgftd_teacher_state_dict = OrderedDict({
+                                        k: torch.tensor(v)
+                                        for k, v in zip(
+                                            self.model.state_dict().keys(),
+                                            weights[fallback_start:fallback_end],
+                                        )
+                                    })
+                                else:
+                                    server_start = self.args.min_num_clients * num_weights
+                                    server_end = server_start + num_weights
+                                    self.rgftd_teacher_state_dict = OrderedDict({
+                                        k: torch.tensor(v)
+                                        for k, v in zip(
+                                            self.model.state_dict().keys(),
+                                            weights[server_start:server_end],
+                                        )
+                                    })
+                            elif len(weights) >= expected_without_rgftd + num_weights:
+                                self.rgftd_teacher_state_dict = OrderedDict({
+                                    k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), weights[-num_weights:])
+                                })
                         for client_id in self.client_id_list:
                             start_idx = 0 + client_id * num_weights
                             end_idx = num_weights + client_id * num_weights

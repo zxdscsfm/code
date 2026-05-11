@@ -433,7 +433,7 @@ if __name__ == '__main__':
     
     FLAGS = parser.parse_args()
     total = 0.0
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '3')
     seed = 2022 
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

@@ -54,6 +54,14 @@ def _primary_logits(model_out):
     return model_out[0]
 
 
+def _aux_logits(model_out):
+    if torch.is_tensor(model_out):
+        return model_out
+    if isinstance(model_out, (list, tuple)) and len(model_out) >= 9:
+        return model_out[8]
+    return model_out[0]
+
+
 def _average_rgftd_profiles(profile_a, profile_b):
     return {
         key: 0.5 * (profile_a[key] + profile_b[key])
@@ -65,6 +73,57 @@ def _scalar_float(value):
     if torch.is_tensor(value):
         return float(value.detach().cpu().item())
     return float(value)
+
+
+def _normalize_gate_scalar(score, floor):
+    floor = float(max(min(floor, 0.999999), 0.0))
+    return max(0.0, min((float(score) - floor) / max(1.0 - floor, 1e-6), 1.0))
+
+
+def _default_rgftd_v3_status():
+    return {
+        'v3_pool_size': 0.0,
+        'v3_no_teacher': 1.0,
+        'v3_fallback_teacher': 0.0,
+        'v3_teacher_source': 0.0,
+        'v3_selected_teacher': -1.0,
+        'v3_selected_score': 0.0,
+        'v3_best_failed_teacher': -1.0,
+        'v3_best_failed_score': 0.0,
+        'v3_routing_score': 0.0,
+        'v3_audit_seed_fg_prob_mean': 0.0,
+        'v3_audit_seed_fg_margin_mean': 0.0,
+        'v3_audit_seed_fg_recall': 0.0,
+        'v3_audit_core_conflict': 0.0,
+        'v3_audit_core_valid': 0.0,
+        'v3_audit_teacher_reliability': 0.0,
+        'v3_audit_release_factor': 0.0,
+        'v3_lease_active': 0.0,
+        'v3_lease_age': 0.0,
+        'v3_benefit_score': 1.0,
+        'v3_window_score': 1.0,
+        'v3_stability_score': 1.0,
+        'v3_teacher_renew': 0.0,
+        'v3_teacher_revoke': 0.0,
+        'v3_teacher_decay': 0.0,
+        'v3_cap_current': 0.0,
+        'v3_cap_scale': 1.0,
+        'v3_ret0_ratio': 0.0,
+        'v3_cap_hit_ratio': 0.0,
+        'v3_bgfg_window': 0.0,
+        'v3_lowmaxp_delta': 0.0,
+        'v3_wann_mass_delta': 0.0,
+    }
+
+
+def _attach_rgftd_v3_status(profile, status, device):
+    merged = dict(profile)
+    full_status = _default_rgftd_v3_status()
+    if status is not None:
+        full_status.update(status)
+    for key, value in full_status.items():
+        merged[key] = torch.tensor(float(value), device=device)
+    return merged
 
 
 def _rgftd_class_ids_from_profile(rgftd_profile):
@@ -124,8 +183,20 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rgftd_bg_sup=%.6f' % _scalar_float(rgftd_profile.get('background_suppression_mean', 0.0)),
             'rgftd_veto=%.1f' % _scalar_float(rgftd_profile.get('foreground_veto_ratio', 0.0)),
             'rgftd_core_veto=%.1f' % _scalar_float(rgftd_profile.get('core_conflict_veto_ratio', 0.0)),
+            'rgftd_spatial=%.6f' % _scalar_float(rgftd_profile.get('spatial_support_ratio', 0.0)),
+            'rgftd_spw=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_mean', 0.0)),
+            'rgftd_spw_cand=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_candidate_mean', 0.0)),
+            'rgftd_spw_near=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_near_seed_mean', 0.0)),
+            'rgftd_spw_far=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_far_mean', 0.0)),
+            'rgftd_sp_loss=%.6f' % _scalar_float(rgftd_profile.get('spatial_loss_scale', 0.0)),
+            'rgftd_fg_pre_sp=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_spatial', 0.0)),
+            'rgftd_fg_sp_keep=%.6f' % _scalar_float(rgftd_profile.get('active_foreground_spatial_keep_ratio', 0.0)),
             'rgftd_fg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_budget', 0.0)),
             'rgftd_fg_budget=%.6f' % _scalar_float(rgftd_profile.get('foreground_budget_ratio', 0.0)),
+            'rgftd_fg_cand=%.6f' % _scalar_float(rgftd_profile.get('active_fg_candidate_ratio', 0.0)),
+            'rgftd_fg_fgcand=%.6f' % _scalar_float(rgftd_profile.get('active_fg_fg_candidate_ratio', 0.0)),
+            'rgftd_fg_near_seed=%.6f' % _scalar_float(rgftd_profile.get('active_fg_near_seed_ratio', 0.0)),
+            'rgftd_fg_seed_p=%.6f' % _scalar_float(rgftd_profile.get('active_fg_seed_precision', 0.0)),
             'rgftd_fg_px_pre=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_return', 0.0)),
             'rgftd_fg_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0)),
             'rgftd_bg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels_pre_budget', 0.0)),
@@ -136,6 +207,39 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rgftd_bg_bal=%.6f' % _scalar_float(rgftd_profile.get('background_balance_factor', 0.0)),
             'rgftd_ret=%.1f' % _scalar_float(rgftd_profile.get('return_reason', 0.0)),
         ])
+        if 'v3_pool_size' in rgftd_profile:
+            parts.extend([
+                'rgftd_v3_pool=%.1f' % _scalar_float(rgftd_profile.get('v3_pool_size', 0.0)),
+                'rgftd_v3_silent=%.1f' % _scalar_float(rgftd_profile.get('v3_no_teacher', 1.0)),
+                'rgftd_v3_fb=%.1f' % _scalar_float(rgftd_profile.get('v3_fallback_teacher', 0.0)),
+                'rgftd_v3_src=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_source', 0.0)),
+                'rgftd_v3_tid=%.1f' % _scalar_float(rgftd_profile.get('v3_selected_teacher', -1.0)),
+                'rgftd_v3_score=%.6f' % _scalar_float(rgftd_profile.get('v3_selected_score', 0.0)),
+                'rgftd_v3_fail_tid=%.1f' % _scalar_float(rgftd_profile.get('v3_best_failed_teacher', -1.0)),
+                'rgftd_v3_fail_score=%.6f' % _scalar_float(rgftd_profile.get('v3_best_failed_score', 0.0)),
+                'rgftd_v3_seed_fgp=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_prob_mean', 0.0)),
+                'rgftd_v3_seed_fgm=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_margin_mean', 0.0)),
+                'rgftd_v3_seed_fg=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_recall', 0.0)),
+                'rgftd_v3_core_cf=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_core_conflict', 0.0)),
+                'rgftd_v3_core_valid=%.1f' % _scalar_float(rgftd_profile.get('v3_audit_core_valid', 0.0)),
+                'rgftd_v3_trel=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_teacher_reliability', 0.0)),
+                'rgftd_v3_relf=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_release_factor', 0.0)),
+                'rgftd_v3_lease=%.1f' % _scalar_float(rgftd_profile.get('v3_lease_active', 0.0)),
+                'rgftd_v3_lease_age=%.1f' % _scalar_float(rgftd_profile.get('v3_lease_age', 0.0)),
+                'rgftd_v3_benefit=%.6f' % _scalar_float(rgftd_profile.get('v3_benefit_score', 1.0)),
+                'rgftd_v3_win=%.6f' % _scalar_float(rgftd_profile.get('v3_window_score', 1.0)),
+                'rgftd_v3_stab=%.6f' % _scalar_float(rgftd_profile.get('v3_stability_score', 1.0)),
+                'rgftd_v3_renew=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_renew', 0.0)),
+                'rgftd_v3_revoke=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_revoke', 0.0)),
+                'rgftd_v3_decay=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_decay', 0.0)),
+                'rgftd_v3_cap=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_current', 0.0)),
+                'rgftd_v3_cap_scale=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_scale', 1.0)),
+                'rgftd_v3_ret0=%.6f' % _scalar_float(rgftd_profile.get('v3_ret0_ratio', 0.0)),
+                'rgftd_v3_cap_hit=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_hit_ratio', 0.0)),
+                'rgftd_v3_bgfg_win=%.6f' % _scalar_float(rgftd_profile.get('v3_bgfg_window', 0.0)),
+                'rgftd_v3_lowmaxp_d=%.6f' % _scalar_float(rgftd_profile.get('v3_lowmaxp_delta', 0.0)),
+                'rgftd_v3_mass_d=%.6f' % _scalar_float(rgftd_profile.get('v3_wann_mass_delta', 0.0)),
+            ])
         for class_id in _rgftd_class_ids_from_profile(rgftd_profile):
             parts.extend([
                 'rgftd_t_c%d=%.6f' % (
@@ -166,6 +270,426 @@ class MyClient(BaseClient):
         if self.amp:
             self.scaler = GradScaler()
         self.best_performance = 0.0
+        self.rgftd_v3_last_audit_iter = -1
+        self.rgftd_v3_selected_teacher_id = None
+        self.rgftd_v3_status = _default_rgftd_v3_status()
+        self.rgftd_v3_active_key = None
+        self.rgftd_v3_lease_start_iter = -1
+        self.rgftd_v3_benefit_scores = {}
+        self.rgftd_v3_stability_scores = {}
+        self.rgftd_v3_last_window_scores = {}
+        self.rgftd_v3_last_wann_mass = {}
+        self.rgftd_v3_last_wann_lowmaxp = {}
+
+    def _rgftd_v3_enabled(self):
+        return (
+            int(getattr(self.args, 'rgftd_enabled', 0)) == 1
+            and int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1
+        )
+
+    def _move_batch_to_cuda(self, sampled_batch):
+        if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
+            volume_batch = sampled_batch['image'].unsqueeze(1).cuda()
+            label_batch = sampled_batch['label'].cuda()
+        elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+            volume_batch = sampled_batch['image'].cuda()
+            label_batch = sampled_batch['label'].cuda()
+        else:
+            raise ValueError('Unsupported img_class: {}'.format(self.args.img_class))
+        return volume_batch, label_batch
+
+    def _build_teacher_model_from_state_dict(self, teacher_state_dict):
+        teacher_model = copy.deepcopy(self.model.model).cuda()
+        teacher_model.load_state_dict(teacher_state_dict, strict=False)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        return teacher_model
+
+    def _rgftd_v3_pair_key(self, teacher_source, teacher_id):
+        return '{}:{}'.format(int(teacher_source), int(teacher_id))
+
+    def _rgftd_v3_get_score(self, storage, key, default=1.0):
+        return float(storage.get(key, default))
+
+    def _rgftd_v3_cap_scale_for_score(self, benefit_score):
+        if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) != 1:
+            return 1.0
+        good_thresh = float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        min_scale = float(getattr(self.args, 'rgftd_v3_min_cap_scale', 0.25))
+        if benefit_score >= good_thresh:
+            return 1.0
+        if benefit_score >= decay_thresh:
+            return float(getattr(self.args, 'rgftd_v3_decay_cap_scale', 0.50))
+        return min_scale
+
+    def _rgftd_v3_routing_benefit(self, key):
+        benefit = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        floor = float(getattr(self.args, 'rgftd_v3_routing_benefit_floor', 0.25))
+        return max(benefit, floor)
+
+    def _rgftd_v3_base_cap(self, fallback_teacher=False):
+        if fallback_teacher:
+            return float(getattr(
+                self.args,
+                'rgftd_v3_fallback_lambda_eff_cap',
+                min(float(getattr(self.args, 'rgftd_lambda_eff_cap', 0.02)), 0.01),
+            ))
+        return float(getattr(self.args, 'rgftd_lambda_eff_cap', 0.02))
+
+    def _rgftd_args_for_teacher_source(self, fallback_teacher=False, cap_scale=1.0):
+        cap_scale = max(float(cap_scale), 0.0)
+        if not fallback_teacher:
+            if abs(cap_scale - 1.0) < 1e-8:
+                return self.args
+            routed_args = copy.copy(self.args)
+            routed_args.rgftd_lambda_eff_cap = self._rgftd_v3_base_cap(False) * cap_scale
+            return routed_args
+        fallback_args = copy.copy(self.args)
+        fallback_cap = self._rgftd_v3_base_cap(True) * cap_scale
+        fallback_args.rgftd_lambda_eff_cap = fallback_cap
+        return fallback_args
+
+    def _rgftd_v3_fill_runtime_status(self, status, teacher_source, teacher_id, cap_current):
+        status = dict(status)
+        key = self._rgftd_v3_pair_key(teacher_source, teacher_id)
+        if self.rgftd_v3_active_key != key:
+            self.rgftd_v3_active_key = key
+            self.rgftd_v3_lease_start_iter = self.current_iter
+        benefit_score = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        stability_score = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, key, 1.0)
+        window_score = self._rgftd_v3_get_score(self.rgftd_v3_last_window_scores, key, 1.0)
+        revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        teacher_revoke = 1.0 if benefit_score < revoke_thresh else 0.0
+        teacher_decay = 1.0 if revoke_thresh <= benefit_score < decay_thresh else 0.0
+        if int(teacher_source) == 2:
+            teacher_revoke = 0.0
+            teacher_decay = 1.0 if benefit_score < decay_thresh else 0.0
+        status.update({
+            'v3_lease_active': 1.0,
+            'v3_lease_age': float(max(self.current_iter - self.rgftd_v3_lease_start_iter, 0)),
+            'v3_benefit_score': benefit_score,
+            'v3_window_score': window_score,
+            'v3_stability_score': stability_score,
+            'v3_teacher_renew': 1.0 if benefit_score >= float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70)) else 0.0,
+            'v3_teacher_revoke': teacher_revoke,
+            'v3_teacher_decay': teacher_decay,
+            'v3_cap_current': float(cap_current),
+            'v3_cap_scale': self._rgftd_v3_cap_scale_for_score(benefit_score),
+        })
+        return status
+
+    def _rgftd_v3_update_online_benefit(self, status, rgftd_profile, wann_maps):
+        if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) != 1:
+            return status
+        source = int(float(status.get('v3_teacher_source', 0.0)))
+        teacher_id = int(float(status.get('v3_selected_teacher', -1.0)))
+        if source not in [1, 2]:
+            return status
+
+        key = self._rgftd_v3_pair_key(source, teacher_id)
+        ret = _scalar_float(rgftd_profile.get('return_reason', 3.0))
+        ret0 = 1.0 if ret <= 0.0 else 0.0
+        fg_px = _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0))
+        bgfg = _scalar_float(rgftd_profile.get('background_foreground_ratio', 0.0))
+        lambda_eff = _scalar_float(rgftd_profile.get('lambda_effective', 0.0))
+        cap_current = max(float(status.get('v3_cap_current', 0.0)), 0.0)
+        cap_hit = 1.0 if cap_current > 0.0 and lambda_eff >= 0.95 * cap_current else 0.0
+
+        wann_mass = 0.0
+        wann_lowmaxp = 0.0
+        if wann_maps is not None:
+            wann_profile = wann_maps.profile
+            wann_mass = _scalar_float(wann_profile.get('effective_supervision_mass', 0.0))
+            wann_lowmaxp = _scalar_float(wann_profile.get('max_prob_low_r', 0.0))
+        last_mass = self.rgftd_v3_last_wann_mass.get(key, None)
+        last_lowmaxp = self.rgftd_v3_last_wann_lowmaxp.get(key, None)
+        if last_mass is None:
+            mass_delta = 0.0
+        else:
+            mass_delta = wann_mass - last_mass
+        if last_lowmaxp is None:
+            lowmaxp_delta = 0.0
+        else:
+            lowmaxp_delta = wann_lowmaxp - last_lowmaxp
+        self.rgftd_v3_last_wann_mass[key] = wann_mass
+        self.rgftd_v3_last_wann_lowmaxp[key] = wann_lowmaxp
+
+        min_fg = float(getattr(self.args, 'rgftd_min_foreground_pixels', 8))
+        if ret0 > 0.0 and fg_px >= min_fg:
+            release_score = 1.0
+        elif ret0 > 0.0:
+            release_score = 0.65
+        elif ret in [1.0, 2.0]:
+            release_score = 0.45
+        else:
+            release_score = 0.30
+
+        stability = 1.0
+        bgfg_bad = bgfg > float(getattr(self.args, 'rgftd_v3_bgfg_warn_thresh', 0.75))
+        lowmaxp_bad = lowmaxp_delta > float(getattr(self.args, 'rgftd_v3_lowmaxp_delta_thresh', 0.02))
+        mass_bad = mass_delta < -float(getattr(self.args, 'rgftd_v3_wann_mass_drop_thresh', 0.05))
+        if bgfg_bad:
+            stability -= 0.20
+        if cap_hit > 0.0 and (bgfg_bad or lowmaxp_bad or mass_bad):
+            stability -= float(getattr(self.args, 'rgftd_v3_cap_hit_penalty', 0.20))
+        if lowmaxp_bad:
+            stability -= 0.20
+        if mass_bad:
+            stability -= 0.20
+        stability = max(0.0, min(stability, 1.0))
+        window_score = max(0.0, min(release_score * stability, 1.0))
+
+        momentum = float(getattr(self.args, 'rgftd_v3_benefit_momentum', 0.80))
+        momentum = max(0.0, min(momentum, 0.999))
+        prev_benefit = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        prev_stability = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, key, 1.0)
+        benefit = momentum * prev_benefit + (1.0 - momentum) * window_score
+        stability_ema = momentum * prev_stability + (1.0 - momentum) * stability
+        self.rgftd_v3_benefit_scores[key] = benefit
+        self.rgftd_v3_stability_scores[key] = stability_ema
+        self.rgftd_v3_last_window_scores[key] = window_score
+
+        revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        good_thresh = float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70))
+        teacher_revoke = 1.0 if benefit < revoke_thresh else 0.0
+        teacher_decay = 1.0 if revoke_thresh <= benefit < decay_thresh else 0.0
+        if source == 2:
+            teacher_revoke = 0.0
+            teacher_decay = 1.0 if benefit < decay_thresh else 0.0
+        status.update({
+            'v3_benefit_score': benefit,
+            'v3_window_score': window_score,
+            'v3_stability_score': stability_ema,
+            'v3_teacher_renew': 1.0 if benefit >= good_thresh else 0.0,
+            'v3_teacher_revoke': teacher_revoke,
+            'v3_teacher_decay': teacher_decay,
+            'v3_cap_scale': self._rgftd_v3_cap_scale_for_score(benefit),
+            'v3_ret0_ratio': ret0,
+            'v3_cap_hit_ratio': cap_hit,
+            'v3_bgfg_window': bgfg,
+            'v3_lowmaxp_delta': lowmaxp_delta,
+            'v3_wann_mass_delta': mass_delta,
+        })
+        return status
+
+    def _should_run_rgftd_v3_audit(self):
+        if not self._rgftd_v3_enabled():
+            return False
+        audit_start = int(getattr(self.args, 'rgftd_v3_audit_start_iters', getattr(self.args, 'rgftd_warmup_iters', 800)))
+        if self.current_iter < audit_start:
+            return False
+        lease_iters = int(getattr(self.args, 'rgftd_v3_lease_iters', 1000))
+        if (
+            lease_iters > 0
+            and self.rgftd_v3_selected_teacher_id is not None
+            and self.rgftd_v3_lease_start_iter >= 0
+            and (self.current_iter - self.rgftd_v3_lease_start_iter) < lease_iters
+        ):
+            return False
+        audit_interval = int(getattr(self.args, 'rgftd_v3_audit_interval_iters', 1000))
+        if self.rgftd_v3_last_audit_iter < 0:
+            return True
+        if audit_interval <= 0:
+            return False
+        return (self.current_iter - self.rgftd_v3_last_audit_iter) >= audit_interval
+
+    def _run_rgftd_v3_routing_audit(self, wann_ref_model):
+        status = _default_rgftd_v3_status()
+        teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
+        if not teacher_state_dicts:
+            self.rgftd_v3_selected_teacher_id = None
+            self.rgftd_v3_last_audit_iter = self.current_iter
+            self.rgftd_v3_status = status
+            return status
+
+        candidate_ids = [
+            teacher_id for teacher_id in sorted(teacher_state_dicts.keys())
+            if int(teacher_id) != int(self.cid)
+        ]
+        if not candidate_ids:
+            self.rgftd_v3_selected_teacher_id = None
+            self.rgftd_v3_last_audit_iter = self.current_iter
+            self.rgftd_v3_status = status
+            return status
+
+        audit_batches = max(int(getattr(self.args, 'rgftd_v3_audit_batches', 4)), 1)
+        teacher_probe_model = copy.deepcopy(self.model.model).cuda()
+        teacher_probe_model.eval()
+        for param in teacher_probe_model.parameters():
+            param.requires_grad = False
+
+        profile_keys = [
+            'teacher_seed_support_fg_prob_mean',
+            'teacher_seed_support_fg_margin_mean',
+            'teacher_seed_support_fg_recall',
+            'teacher_core_conflict',
+            'teacher_core_valid',
+            'teacher_reliability',
+            'release_factor',
+        ]
+        fg_weighted_profile_keys = [
+            'teacher_seed_support_fg_prob_mean',
+            'teacher_seed_support_fg_margin_mean',
+            'teacher_seed_support_fg_recall',
+        ]
+        core_weighted_profile_keys = [
+            'teacher_core_conflict',
+            'teacher_core_valid',
+        ]
+        teacher_sums = {
+            teacher_id: {key: 0.0 for key in profile_keys}
+            for teacher_id in candidate_ids
+        }
+        teacher_weights = {
+            teacher_id: {key: 0.0 for key in profile_keys}
+            for teacher_id in candidate_ids
+        }
+
+        previous_mode = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, sampled_batch in enumerate(self.trainloader):
+                if batch_idx >= audit_batches:
+                    break
+                volume_batch, label_batch = self._move_batch_to_cuda(sampled_batch)
+                student_out = self.model(volume_batch)
+                student_logits = _primary_logits(student_out)
+                student_aux_logits = _aux_logits(student_out)
+                ref_out = wann_ref_model(volume_batch)
+                ref_logits = _primary_logits(ref_out)
+                wann_maps = build_wann_maps(
+                    image=volume_batch,
+                    label=label_batch,
+                    logits=student_logits,
+                    aux_logits=student_aux_logits,
+                    sup_type=self.args.sup_type,
+                    img_class=self.args.img_class,
+                    num_classes=self.args.num_classes,
+                    iter_num=self.current_iter,
+                    args=self.args,
+                    ref_logits=ref_logits,
+                )
+                for teacher_id in candidate_ids:
+                    teacher_probe_model.load_state_dict(teacher_state_dicts[teacher_id], strict=False)
+                    teacher_logits = _primary_logits(teacher_probe_model(volume_batch))
+                    _, _, audit_profile = rgftd_loss(
+                        student_logits,
+                        teacher_logits,
+                        label_batch,
+                        wann_maps,
+                        self.args,
+                        self.current_iter,
+                    )
+                    for key in profile_keys:
+                        metric_value = _scalar_float(audit_profile.get(key, 0.0))
+                        if key in fg_weighted_profile_keys:
+                            metric_weight = _scalar_float(audit_profile.get('seed_fg_support_pixels', 0.0))
+                        elif key in core_weighted_profile_keys:
+                            metric_weight = _scalar_float(audit_profile.get('teacher_core_valid', 0.0))
+                        else:
+                            metric_weight = 1.0
+                        if metric_weight <= 0.0:
+                            continue
+                        teacher_sums[teacher_id][key] += metric_value * metric_weight
+                        teacher_weights[teacher_id][key] += metric_weight
+        if previous_mode:
+            self.model.train()
+
+        prob_floor = float(getattr(self.args, 'rgftd_teacher_release_prob_floor', getattr(self.args, 'rgftd_teacher_fg_prob_thresh', 0.35)))
+        margin_floor = float(getattr(self.args, 'rgftd_teacher_release_margin_floor', 0.05))
+        max_core_conflict = float(max(getattr(self.args, 'rgftd_teacher_max_core_conflict', 0.20), 1e-6))
+        score_thresh = float(getattr(self.args, 'rgftd_v3_audit_score_thresh', 0.05))
+        reliability_min = float(getattr(self.args, 'rgftd_v3_audit_teacher_reliability_min', 0.30))
+
+        passed = []
+        best_teacher_status = dict(status)
+        for teacher_id in candidate_ids:
+            mean_profile = {
+                key: (
+                    teacher_sums[teacher_id][key] / teacher_weights[teacher_id][key]
+                    if teacher_weights[teacher_id][key] > 0.0 else 0.0
+                )
+                for key in profile_keys
+            }
+            foreground_gate = (
+                _normalize_gate_scalar(mean_profile['teacher_seed_support_fg_prob_mean'], prob_floor)
+                * _normalize_gate_scalar(mean_profile['teacher_seed_support_fg_margin_mean'], margin_floor)
+            )
+            if mean_profile['teacher_core_valid'] > 0.0:
+                safety_gate = max(0.0, min(1.0 - mean_profile['teacher_core_conflict'] / max_core_conflict, 1.0))
+            else:
+                safety_gate = 1.0
+            audit_score = foreground_gate * safety_gate
+            pair_key = self._rgftd_v3_pair_key(1, teacher_id)
+            benefit_score = self._rgftd_v3_routing_benefit(pair_key)
+            stability_score = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, pair_key, 1.0)
+            routing_score = audit_score * benefit_score * stability_score
+            recover_thresh = float(getattr(self.args, 'rgftd_v3_recover_audit_score_thresh', 0.60))
+            if (
+                audit_score >= recover_thresh
+                and self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, pair_key, 1.0) < benefit_score
+            ):
+                self.rgftd_v3_benefit_scores[pair_key] = benefit_score
+            teacher_status = {
+                'v3_pool_size': 0.0,
+                'v3_no_teacher': 0.0,
+                'v3_fallback_teacher': 0.0,
+                'v3_teacher_source': 1.0,
+                'v3_selected_teacher': float(teacher_id),
+                'v3_selected_score': float(routing_score),
+                'v3_best_failed_teacher': -1.0,
+                'v3_best_failed_score': 0.0,
+                'v3_routing_score': float(routing_score),
+                'v3_audit_seed_fg_prob_mean': float(mean_profile['teacher_seed_support_fg_prob_mean']),
+                'v3_audit_seed_fg_margin_mean': float(mean_profile['teacher_seed_support_fg_margin_mean']),
+                'v3_audit_seed_fg_recall': float(mean_profile['teacher_seed_support_fg_recall']),
+                'v3_audit_core_conflict': float(mean_profile['teacher_core_conflict']),
+                'v3_audit_core_valid': float(mean_profile['teacher_core_valid']),
+                'v3_audit_teacher_reliability': float(mean_profile['teacher_reliability']),
+                'v3_audit_release_factor': float(mean_profile['release_factor']),
+                'v3_benefit_score': float(benefit_score),
+                'v3_stability_score': float(stability_score),
+            }
+            if teacher_id == candidate_ids[0] or routing_score > best_teacher_status['v3_selected_score']:
+                best_teacher_status = teacher_status
+            if (
+                routing_score >= score_thresh
+                and mean_profile['teacher_reliability'] >= reliability_min
+                and (
+                    mean_profile['teacher_core_valid'] <= 0.0
+                    or mean_profile['teacher_core_conflict'] <= max_core_conflict
+                )
+            ):
+                passed.append((routing_score, teacher_id, teacher_status))
+
+        passed.sort(key=lambda item: item[0], reverse=True)
+        top_k = int(getattr(self.args, 'rgftd_v3_teacher_pool_topk', 1))
+        if top_k != 1:
+            raise ValueError('RGFTD-v3 first full version currently only supports top_k=1')
+
+        if passed:
+            _, selected_teacher_id, selected_status = passed[0]
+            selected_status['v3_pool_size'] = float(len(passed))
+            selected_status['v3_no_teacher'] = 0.0
+            self.rgftd_v3_selected_teacher_id = selected_teacher_id
+            status = selected_status
+        else:
+            status = best_teacher_status
+            status['v3_pool_size'] = 0.0
+            status['v3_no_teacher'] = 1.0
+            status['v3_selected_teacher'] = -1.0
+            status['v3_selected_score'] = 0.0
+            status['v3_best_failed_teacher'] = best_teacher_status['v3_selected_teacher']
+            status['v3_best_failed_score'] = best_teacher_status['v3_selected_score']
+            self.rgftd_v3_selected_teacher_id = None
+
+        self.rgftd_v3_last_audit_iter = self.current_iter
+        self.rgftd_v3_status = status
+        return status
 
 
     def _train(self, config):
@@ -217,14 +741,78 @@ class MyClient(BaseClient):
             for param in wann_ref_model.parameters():
                 param.requires_grad = False
         rgftd_teacher_model = None
+        rgftd_teacher_args = self.args
+        rgftd_v3_status = _default_rgftd_v3_status()
         if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
-            teacher_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
-            if teacher_state_dict is not None:
-                rgftd_teacher_model = copy.deepcopy(self.model.model).cuda()
-                rgftd_teacher_model.load_state_dict(teacher_state_dict, strict=False)
-                rgftd_teacher_model.eval()
-                for param in rgftd_teacher_model.parameters():
-                    param.requires_grad = False
+            if self._rgftd_v3_enabled():
+                if self._should_run_rgftd_v3_audit():
+                    rgftd_v3_status = self._run_rgftd_v3_routing_audit(wann_ref_model)
+                else:
+                    rgftd_v3_status = dict(getattr(self, 'rgftd_v3_status', _default_rgftd_v3_status()))
+                teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
+                selected_teacher_id = getattr(self, 'rgftd_v3_selected_teacher_id', None)
+                if selected_teacher_id is not None and selected_teacher_id in teacher_state_dicts:
+                    pair_key = self._rgftd_v3_pair_key(1, selected_teacher_id)
+                    benefit_score = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, pair_key, 1.0)
+                    revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+                    if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) == 1 and benefit_score < revoke_thresh:
+                        rgftd_v3_status['v3_no_teacher'] = 1.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 0.0
+                        rgftd_v3_status['v3_selected_teacher'] = -1.0
+                        rgftd_v3_status['v3_teacher_revoke'] = 1.0
+                        self.rgftd_v3_selected_teacher_id = None
+                    else:
+                        cap_scale = self._rgftd_v3_cap_scale_for_score(benefit_score)
+                        cap_current = self._rgftd_v3_base_cap(False) * cap_scale
+                        rgftd_teacher_args = self._rgftd_args_for_teacher_source(
+                            fallback_teacher=False,
+                            cap_scale=cap_scale,
+                        )
+                        rgftd_teacher_model = self._build_teacher_model_from_state_dict(
+                            teacher_state_dicts[selected_teacher_id]
+                        )
+                        rgftd_v3_status['v3_no_teacher'] = 0.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 1.0
+                        rgftd_v3_status = self._rgftd_v3_fill_runtime_status(
+                            rgftd_v3_status,
+                            1,
+                            selected_teacher_id,
+                            cap_current,
+                        )
+                else:
+                    fallback_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
+                    if fallback_state_dict is not None:
+                        pair_key = self._rgftd_v3_pair_key(2, -2)
+                        benefit_score = self._rgftd_v3_routing_benefit(pair_key)
+                        cap_scale = self._rgftd_v3_cap_scale_for_score(benefit_score)
+                        cap_current = self._rgftd_v3_base_cap(True) * cap_scale
+                        rgftd_teacher_model = self._build_teacher_model_from_state_dict(fallback_state_dict)
+                        rgftd_teacher_args = self._rgftd_args_for_teacher_source(
+                            fallback_teacher=True,
+                            cap_scale=cap_scale,
+                        )
+                        rgftd_v3_status['v3_no_teacher'] = 0.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 1.0
+                        rgftd_v3_status['v3_teacher_source'] = 2.0
+                        rgftd_v3_status['v3_selected_teacher'] = -2.0
+                        rgftd_v3_status['v3_selected_score'] = 0.0
+                        rgftd_v3_status = self._rgftd_v3_fill_runtime_status(
+                            rgftd_v3_status,
+                            2,
+                            -2,
+                            cap_current,
+                        )
+                    else:
+                        rgftd_v3_status['v3_no_teacher'] = 1.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 0.0
+                        rgftd_v3_status['v3_selected_teacher'] = -1.0
+            else:
+                teacher_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
+                if teacher_state_dict is not None:
+                    rgftd_teacher_model = self._build_teacher_model_from_state_dict(teacher_state_dict)
         
         for i_iter in range(config['iters']):
             # genearate sampled batches
@@ -343,22 +931,30 @@ class MyClient(BaseClient):
                     lambda_rgftd_raw = 0.0
                     lambda_rgftd = 0.0
                     rgftd_profile = zero_rgftd_profile(outputs.device)
-                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
                         lambda_rgftd_raw = get_rgftd_lambda(self.current_iter, self.args)
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
                         if float(lambda_rgftd_raw) > 0.0:
                             with torch.no_grad():
                                 teacher_out = rgftd_teacher_model(volume_batch)
                                 teacher_logits = _primary_logits(teacher_out)
                             loss_rgftd_seg, lambda_rgftd_seg, rgftd_profile_seg = rgftd_loss(
-                                outputs, teacher_logits, label_batch, wann_maps, self.args, self.current_iter
+                                outputs, teacher_logits, label_batch, wann_maps, rgftd_teacher_args, self.current_iter
                             )
                             loss_rgftd_aux, lambda_rgftd_aux, rgftd_profile_aux = rgftd_loss(
-                                outputs_auxiliary, teacher_logits, label_batch, wann_maps, self.args, self.current_iter
+                                outputs_auxiliary, teacher_logits, label_batch, wann_maps, rgftd_teacher_args, self.current_iter
                             )
                             loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux)
                             lambda_rgftd = 0.5 * (float(lambda_rgftd_seg) + float(lambda_rgftd_aux))
                             rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
                             loss_ce = loss_ce + float(lambda_rgftd) * loss_rgftd
+                            if self._rgftd_v3_enabled():
+                                rgftd_v3_status = self._rgftd_v3_update_online_benefit(
+                                    rgftd_v3_status,
+                                    rgftd_profile,
+                                    wann_maps,
+                                )
+                    rgftd_profile = _attach_rgftd_v3_status(rgftd_profile, rgftd_v3_status, outputs.device)
                 else:
                     wann_maps = None
                     lambda_soft = 0.0
@@ -372,6 +968,7 @@ class MyClient(BaseClient):
                     loss_rgftd_seg = torch.tensor(0.0).cuda()
                     loss_rgftd_aux = torch.tensor(0.0).cuda()
                     rgftd_profile = zero_rgftd_profile(loss_rgftd.device)
+                    rgftd_profile = _attach_rgftd_v3_status(rgftd_profile, rgftd_v3_status, loss_rgftd.device)
                     loss_ce_seg = ce_loss(outputs, label_batch[:].long())
                     loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
                     loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
@@ -931,12 +1528,66 @@ def main():
                         help='Minimum active RGFTD foreground pixels kept after budget pruning')
     parser.add_argument('--rgftd_active_fg_topk_max_pixels', type=int, default=4096,
                         help='Maximum active RGFTD foreground pixels kept after budget pruning')
+    parser.add_argument('--rgftd_spatial_support_enabled', type=int, default=1,
+                        help='Softly weight RGFTD foreground release by target-side WANN candidate or seed-near support')
+    parser.add_argument('--rgftd_spatial_support_radius', type=int, default=2,
+                        help='Dilation radius around target foreground seed support for RGFTD spatial weighting')
+    parser.add_argument('--rgftd_spatial_candidate_weight', type=float, default=1.0,
+                        help='Soft spatial weight for teacher foreground pixels in target foreground candidate regions')
+    parser.add_argument('--rgftd_spatial_near_seed_weight', type=float, default=0.75,
+                        help='Soft spatial weight for teacher foreground pixels near target foreground seeds')
+    parser.add_argument('--rgftd_spatial_far_weight', type=float, default=0.15,
+                        help='Soft spatial weight for teacher foreground pixels far from target support but inside RGFTD region')
     parser.add_argument('--rgftd_max_bg_fg_ratio', type=float, default=1.0,
                         help='Maximum allowed active background-to-foreground pixel ratio for RGFTD')
     parser.add_argument('--rgftd_allow_bg_without_fg', type=int, default=0,
                         help='Whether RGFTD may keep background pixels when no foreground pixels survive')
     parser.add_argument('--rgftd_lambda_eff_cap', type=float, default=0.02,
                         help='Upper bound on effective RGFTD lambda after release and safety scaling')
+    parser.add_argument('--rgftd_v3_enabled', type=int, default=0,
+                        help='Enable RGFTD-v3 target-aware teacher routing')
+    parser.add_argument('--rgftd_v3_teacher_pool_topk', type=int, default=1,
+                        help='Top-k teachers kept by RGFTD-v3 routing; first full version uses top_k=1')
+    parser.add_argument('--rgftd_v3_audit_start_iters', type=int, default=800,
+                        help='Iteration after which RGFTD-v3 starts target-side routing audit')
+    parser.add_argument('--rgftd_v3_audit_interval_iters', type=int, default=1000,
+                        help='Low-frequency routing audit interval in iterations; <=0 means one-shot')
+    parser.add_argument('--rgftd_v3_audit_batches', type=int, default=4,
+                        help='Number of local batches used by each RGFTD-v3 routing audit')
+    parser.add_argument('--rgftd_v3_audit_score_thresh', type=float, default=0.05,
+                        help='Minimum routing score required for a teacher to enter the RGFTD-v3 pool')
+    parser.add_argument('--rgftd_v3_audit_teacher_reliability_min', type=float, default=0.30,
+                        help='Minimum teacher reliability required by RGFTD-v3 routing audit')
+    parser.add_argument('--rgftd_v3_fallback_lambda_eff_cap', type=float, default=0.01,
+                        help='Effective lambda cap used when RGFTD-v3 falls back to the server EMA teacher')
+    parser.add_argument('--rgftd_v3_benefit_enabled', type=int, default=1,
+                        help='Enable RGFTD-v3.2 online benefit-aware teacher lease')
+    parser.add_argument('--rgftd_v3_lease_iters', type=int, default=1000,
+                        help='Teacher lease length in iterations; routing audit is skipped while the lease is active')
+    parser.add_argument('--rgftd_v3_benefit_momentum', type=float, default=0.80,
+                        help='EMA momentum for RGFTD-v3.2 online benefit score')
+    parser.add_argument('--rgftd_v3_benefit_good_thresh', type=float, default=0.70,
+                        help='Benefit score threshold for renewing a teacher at full cap')
+    parser.add_argument('--rgftd_v3_benefit_decay_thresh', type=float, default=0.50,
+                        help='Benefit score threshold below which the teacher cap is decayed')
+    parser.add_argument('--rgftd_v3_benefit_revoke_thresh', type=float, default=0.35,
+                        help='Benefit score threshold below which the selected teacher is revoked')
+    parser.add_argument('--rgftd_v3_routing_benefit_floor', type=float, default=0.25,
+                        help='Minimum benefit multiplier used by routing audit so teachers can recover after new audits')
+    parser.add_argument('--rgftd_v3_recover_audit_score_thresh', type=float, default=0.60,
+                        help='Audit score threshold that can restore a previously decayed teacher to the routing floor')
+    parser.add_argument('--rgftd_v3_decay_cap_scale', type=float, default=0.50,
+                        help='Lambda cap scale for a decayed RGFTD-v3.2 teacher')
+    parser.add_argument('--rgftd_v3_min_cap_scale', type=float, default=0.25,
+                        help='Minimum lambda cap scale before a teacher is fully revoked')
+    parser.add_argument('--rgftd_v3_bgfg_warn_thresh', type=float, default=0.75,
+                        help='Background/foreground ratio threshold used by RGFTD-v3.2 stability scoring')
+    parser.add_argument('--rgftd_v3_cap_hit_penalty', type=float, default=0.20,
+                        help='Stability penalty when effective lambda repeatedly hits the cap')
+    parser.add_argument('--rgftd_v3_lowmaxp_delta_thresh', type=float, default=0.02,
+                        help='Allowed positive delta of WANN low-R max probability before stability penalty')
+    parser.add_argument('--rgftd_v3_wann_mass_drop_thresh', type=float, default=0.05,
+                        help='Allowed WANN effective-mass drop before stability penalty')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -1068,13 +1719,43 @@ def main():
     assert args.rgftd_active_fg_topk_min_pixels >= 0
     assert args.rgftd_active_fg_topk_max_pixels >= 0
     assert args.rgftd_active_fg_topk_max_pixels == 0 or args.rgftd_active_fg_topk_max_pixels >= args.rgftd_active_fg_topk_min_pixels
+    assert args.rgftd_spatial_support_enabled in [0, 1]
+    assert args.rgftd_spatial_support_radius >= 0
+    assert 0.0 <= args.rgftd_spatial_candidate_weight <= 1.0
+    assert 0.0 <= args.rgftd_spatial_near_seed_weight <= 1.0
+    assert 0.0 <= args.rgftd_spatial_far_weight <= 1.0
     assert args.rgftd_max_bg_fg_ratio >= 0.0
     assert args.rgftd_allow_bg_without_fg in [0, 1]
     assert args.rgftd_lambda_eff_cap >= 0.0
+    assert args.rgftd_v3_enabled in [0, 1]
+    assert args.rgftd_v3_teacher_pool_topk >= 1
+    assert args.rgftd_v3_audit_start_iters >= 0
+    assert args.rgftd_v3_audit_interval_iters >= 0 or args.rgftd_v3_audit_interval_iters == -1
+    assert args.rgftd_v3_audit_batches >= 1
+    assert 0.0 <= args.rgftd_v3_audit_score_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_audit_teacher_reliability_min <= 1.0
+    assert args.rgftd_v3_fallback_lambda_eff_cap >= 0.0
+    assert args.rgftd_v3_benefit_enabled in [0, 1]
+    assert args.rgftd_v3_lease_iters >= 0
+    assert 0.0 <= args.rgftd_v3_benefit_momentum < 1.0
+    assert 0.0 <= args.rgftd_v3_benefit_revoke_thresh <= args.rgftd_v3_benefit_decay_thresh <= args.rgftd_v3_benefit_good_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_routing_benefit_floor <= 1.0
+    assert 0.0 <= args.rgftd_v3_recover_audit_score_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_decay_cap_scale <= 1.0
+    assert 0.0 <= args.rgftd_v3_min_cap_scale <= 1.0
+    assert args.rgftd_v3_min_cap_scale <= args.rgftd_v3_decay_cap_scale
+    assert args.rgftd_v3_bgfg_warn_thresh >= 0.0
+    assert 0.0 <= args.rgftd_v3_cap_hit_penalty <= 1.0
+    assert args.rgftd_v3_lowmaxp_delta_thresh >= 0.0
+    assert args.rgftd_v3_wann_mass_drop_thresh >= 0.0
     assert args.rgftd_teacher_score_core_weight >= 0.0
     assert args.rgftd_teacher_score_support_weight >= 0.0
     assert args.rgftd_teacher_score_class_weight >= 0.0
     assert args.rgftd_teacher_score_conf_weight >= 0.0
+    if args.rgftd_v3_enabled == 1:
+        assert args.rgftd_enabled == 1
+        assert args.rgftd_v3_teacher_pool_topk == 1
+        assert args.rgftd_teacher_validation_enabled == 1
 
     # Configure logger
     if args.role == 'server':
@@ -1246,6 +1927,15 @@ def main():
                 'rgftd_release_conf_gate',
                 'rgftd_release_class_gate',
                 'rgftd_teacher_foreground_ratio',
+                'rgftd_spatial_support_ratio',
+                'rgftd_foreground_candidate_ratio',
+                'rgftd_spatial_weight_mean',
+                'rgftd_spatial_weight_candidate_mean',
+                'rgftd_spatial_weight_near_seed_mean',
+                'rgftd_spatial_weight_far_mean',
+                'rgftd_spatial_loss_scale',
+                'rgftd_active_foreground_pixels_pre_spatial',
+                'rgftd_active_foreground_spatial_keep_ratio',
                 'rgftd_active_foreground_ratio',
                 'rgftd_active_background_ratio',
                 'rgftd_foreground_veto_ratio',
@@ -1259,8 +1949,46 @@ def main():
                 'rgftd_active_background_pixels_pre_return',
                 'rgftd_active_foreground_pixels',
                 'rgftd_active_background_pixels',
+                'rgftd_active_fg_seed_precision',
+                'rgftd_active_fg_seed_recall',
+                'rgftd_active_fg_support_precision',
+                'rgftd_active_fg_support_recall',
+                'rgftd_active_fg_candidate_ratio',
+                'rgftd_active_fg_fg_candidate_ratio',
+                'rgftd_active_fg_near_seed_ratio',
                 'rgftd_background_suppression_mean',
                 'rgftd_return_reason',
+                'rgftd_v3_pool_size',
+                'rgftd_v3_no_teacher',
+                'rgftd_v3_fallback_teacher',
+                'rgftd_v3_teacher_source',
+                'rgftd_v3_selected_teacher',
+                'rgftd_v3_selected_score',
+                'rgftd_v3_best_failed_teacher',
+                'rgftd_v3_best_failed_score',
+                'rgftd_v3_routing_score',
+                'rgftd_v3_audit_seed_fg_prob_mean',
+                'rgftd_v3_audit_seed_fg_margin_mean',
+                'rgftd_v3_audit_seed_fg_recall',
+                'rgftd_v3_audit_core_conflict',
+                'rgftd_v3_audit_core_valid',
+                'rgftd_v3_audit_teacher_reliability',
+                'rgftd_v3_audit_release_factor',
+                'rgftd_v3_lease_active',
+                'rgftd_v3_lease_age',
+                'rgftd_v3_benefit_score',
+                'rgftd_v3_window_score',
+                'rgftd_v3_stability_score',
+                'rgftd_v3_teacher_renew',
+                'rgftd_v3_teacher_revoke',
+                'rgftd_v3_teacher_decay',
+                'rgftd_v3_cap_current',
+                'rgftd_v3_cap_scale',
+                'rgftd_v3_ret0_ratio',
+                'rgftd_v3_cap_hit_ratio',
+                'rgftd_v3_bgfg_window',
+                'rgftd_v3_lowmaxp_delta',
+                'rgftd_v3_wann_mass_delta',
             ]
             for class_id in range(1, args.num_classes):
                 train_scalar_metrics += [
