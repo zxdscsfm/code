@@ -1,4 +1,5 @@
 # -*- coding:utf-8 -*-
+import io
 import os
 import numpy as np
 import torch
@@ -236,6 +237,14 @@ def tsne(n_components, data, label, site_labels):
 
 
 VAL_METRICS = ['dice', 'hd95', 'recall', 'precision', 'jc', 'specificity', 'ravd']
+
+
+def _unpack_rgftd_stable_snapshot(blob):
+    with np.load(io.BytesIO(blob)) as payload:
+        keys = sorted(payload.files, key=lambda item: int(item.split('_')[-1]))
+        return [payload[key].copy() for key in keys]
+
+
 def evaluate(args, model, dataloader, amp=False):
     metric_list = 0.0
     metrics_ = {}
@@ -317,6 +326,9 @@ class MyServer(Server):
         self.val_metrics = val_metrics
         self.rgftd_teacher_ndarrays = None
         self.rgftd_teacher_bank_ndarrays = {}
+        self.rgftd_stable_teacher_bank_ndarrays = {}
+        self.rgftd_stable_teacher_valids = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
+        self.rgftd_stable_teacher_scores = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
         self._missing_train_metric_warnings = set()
 
     # pylint: disable=too-many-locals
@@ -329,7 +341,14 @@ class MyServer(Server):
         self.parameters = self._get_initial_parameters(timeout=timeout)
         if self._rgftd_enabled():
             if self._rgftd_v3_enabled():
-                self._init_rgftd_teacher_bank(self.parameters)
+                if self._rgftd_v3_stable_enabled():
+                    global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+                    self.rgftd_stable_teacher_bank_ndarrays = {
+                        client_id: [array.copy() for array in global_arrays]
+                        for client_id in range(self.args.min_num_clients)
+                    }
+                else:
+                    self._init_rgftd_teacher_bank(self.parameters)
             self.rgftd_teacher_ndarrays = [
                 array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
             ]
@@ -428,7 +447,10 @@ class MyServer(Server):
             self.parameters = parameters_prime
             if self._rgftd_enabled():
                 if self._rgftd_v3_enabled():
-                    self._update_rgftd_teacher_bank(results_prime)
+                    if self._rgftd_v3_stable_enabled():
+                        self._update_rgftd_stable_teacher_bank(results_prime)
+                    else:
+                        self._update_rgftd_teacher_bank(results_prime)
                 self._update_rgftd_teacher(self.parameters)
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
@@ -438,10 +460,10 @@ class MyServer(Server):
                 for metric_name in self.train_scalar_metrics:
                     metric_key = 'client_{}_{}'.format(client_id, metric_name)
                     if metric_key not in metrics_prime:
-                        if metric_name.startswith('rgftd_v3_'):
+                        if metric_name.startswith('rgftd_v3_') or metric_name.startswith('rgftd_refine_'):
                             warn_key = (client_id, metric_name)
                             if warn_key not in self._missing_train_metric_warnings:
-                                log(WARNING, 'Missing optional RGFTD-v3 metric %s; writing 0.0 to keep training alive', metric_key)
+                                log(WARNING, 'Missing optional RGFTD metric %s; writing 0.0 to keep training alive', metric_key)
                                 self._missing_train_metric_warnings.add(warn_key)
                             metric_value = 0.0
                         else:
@@ -690,15 +712,28 @@ class MyServer(Server):
                 weight_list.append(prompts_array)
                 if self._rgftd_enabled():
                     if self._rgftd_v3_enabled():
-                        if not self.rgftd_teacher_bank_ndarrays:
-                            self._init_rgftd_teacher_bank(self.parameters)
+                        if self._rgftd_v3_stable_enabled():
+                            if not self.rgftd_stable_teacher_bank_ndarrays:
+                                global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+                                self.rgftd_stable_teacher_bank_ndarrays = {
+                                    client_id: [array.copy() for array in global_arrays]
+                                    for client_id in client_id_list
+                                }
+                            teacher_bank = self.rgftd_stable_teacher_bank_ndarrays
+                        else:
+                            if not self.rgftd_teacher_bank_ndarrays:
+                                self._init_rgftd_teacher_bank(self.parameters)
+                            teacher_bank = self.rgftd_teacher_bank_ndarrays
                         for client_id in client_id_list:
-                            teacher_arrays = self.rgftd_teacher_bank_ndarrays.get(client_id, None)
+                            teacher_arrays = teacher_bank.get(client_id, None)
                             if teacher_arrays is None:
                                 teacher_arrays = [
                                     array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
                                 ]
                             weight_list += [array.copy() for array in teacher_arrays]
+                        if self._rgftd_v3_stable_enabled():
+                            weight_list.append(self.rgftd_stable_teacher_valids.astype(np.float32).copy())
+                            weight_list.append(self.rgftd_stable_teacher_scores.astype(np.float32).copy())
                         if self.rgftd_teacher_ndarrays is None:
                             self.rgftd_teacher_ndarrays = [
                                 array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
@@ -729,6 +764,9 @@ class MyServer(Server):
 
     def _rgftd_v3_enabled(self):
         return self._rgftd_enabled() and int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1
+
+    def _rgftd_v3_stable_enabled(self):
+        return self._rgftd_v3_enabled() and int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
 
     def _extract_global_ndarrays_for_rgftd(self, parameters):
         arrays = parameters_to_ndarrays(parameters)
@@ -776,6 +814,54 @@ class MyServer(Server):
                 else:
                     updated.append(client_array.copy())
             self.rgftd_teacher_bank_ndarrays[client_id] = updated
+
+    def _update_rgftd_stable_teacher_bank(self, results_prime):
+        if not self.rgftd_stable_teacher_bank_ndarrays:
+            global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+            self.rgftd_stable_teacher_bank_ndarrays = {
+                client_id: [array.copy() for array in global_arrays]
+                for client_id in range(self.args.min_num_clients)
+            }
+        for _, fit_res in results_prime:
+            client_id = self._client_id_from_fit_metrics(fit_res.metrics)
+            if client_id is None:
+                continue
+            valid_key = 'client_{}_rgftd_stable_valid'.format(client_id)
+            score_key = 'client_{}_rgftd_stable_best_score'.format(client_id)
+            updated_key = 'client_{}_rgftd_stable_updated'.format(client_id)
+            snapshot_key = 'client_{}_rgftd_stable_snapshot'.format(client_id)
+            stable_valid = float(fit_res.metrics.get(valid_key, 0.0))
+            stable_score = float(fit_res.metrics.get(score_key, 0.0))
+            stable_updated = float(fit_res.metrics.get(updated_key, 0.0))
+            if stable_updated <= 0.5:
+                if stable_valid > 0.5 and self.rgftd_stable_teacher_valids[client_id] > 0.5:
+                    self.rgftd_stable_teacher_scores[client_id] = max(
+                        float(self.rgftd_stable_teacher_scores[client_id]),
+                        stable_score,
+                    )
+                continue
+            if snapshot_key not in fit_res.metrics:
+                log(WARNING, 'Missing RGFTD stable snapshot for updated client %s; keeping previous teacher bank entry', client_id)
+                continue
+            try:
+                client_arrays = _unpack_rgftd_stable_snapshot(fit_res.metrics[snapshot_key])
+            except Exception as exc:  # pylint: disable=broad-except
+                log(WARNING, 'Failed to unpack RGFTD stable snapshot for client %s: %s', client_id, exc)
+                continue
+            if len(client_arrays) != len(self.state_dict_keys):
+                log(
+                    WARNING,
+                    'Invalid RGFTD stable snapshot length for client %s: %s != %s',
+                    client_id,
+                    len(client_arrays),
+                    len(self.state_dict_keys),
+                )
+                continue
+            self.rgftd_stable_teacher_bank_ndarrays[client_id] = [
+                array.copy() for array in client_arrays
+            ]
+            self.rgftd_stable_teacher_scores[client_id] = stable_score
+            self.rgftd_stable_teacher_valids[client_id] = 1.0
 
     def _update_rgftd_teacher(self, parameters):
         global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
@@ -1440,6 +1526,8 @@ class MyModel(nn.Module):
         self.amp=(args.amp == 1)
         self.rgftd_teacher_state_dict = None
         self.rgftd_teacher_state_dicts = {}
+        self.rgftd_teacher_valids = {}
+        self.rgftd_teacher_scores = {}
         self.ala_last_epochs = 0
         self.ala_last_std = 0.0
         self.ala_hit_max_epochs = 0
@@ -1502,6 +1590,8 @@ class MyModel(nn.Module):
         # print('Setting weights')
         self.rgftd_teacher_state_dict = None
         self.rgftd_teacher_state_dicts = {}
+        self.rgftd_teacher_valids = {}
+        self.rgftd_teacher_scores = {}
         # MetaFed
         if self.args.strategy == 'MetaFed':
             def get_teacher_id_v1(weight_dict):
@@ -1673,9 +1763,34 @@ class MyModel(nn.Module):
                                                 weights[start_teacher:end_teacher],
                                             )
                                         })
-                                expected_with_bank_and_fallback = expected_with_bank + num_weights
+                                metadata_start = expected_with_bank
+                                if (
+                                    int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
+                                    and len(weights) >= expected_with_bank + 2
+                                ):
+                                    valid_array = np.asarray(weights[metadata_start]).reshape(-1)
+                                    score_array = np.asarray(weights[metadata_start + 1]).reshape(-1)
+                                    self.rgftd_teacher_valids = {
+                                        client_id: float(valid_array[client_id])
+                                        if client_id < len(valid_array) else 0.0
+                                        for client_id in self.client_id_list
+                                    }
+                                    self.rgftd_teacher_scores = {
+                                        client_id: float(score_array[client_id])
+                                        if client_id < len(score_array) else 0.0
+                                        for client_id in self.client_id_list
+                                    }
+                                    metadata_start += 2
+                                else:
+                                    self.rgftd_teacher_valids = {
+                                        client_id: 1.0 for client_id in self.client_id_list
+                                    }
+                                    self.rgftd_teacher_scores = {
+                                        client_id: 0.0 for client_id in self.client_id_list
+                                    }
+                                expected_with_bank_and_fallback = metadata_start + num_weights
                                 if len(weights) >= expected_with_bank_and_fallback:
-                                    fallback_start = expected_with_bank
+                                    fallback_start = metadata_start
                                     fallback_end = fallback_start + num_weights
                                     self.rgftd_teacher_state_dict = OrderedDict({
                                         k: torch.tensor(v)

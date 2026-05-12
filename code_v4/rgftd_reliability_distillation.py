@@ -81,6 +81,22 @@ RGFTD_PROFILE_KEYS = [
     "active_fg_near_seed_ratio",
     "active_fg_pre_budget_seed_precision",
     "active_fg_pre_budget_candidate_ratio",
+    "refine_enabled",
+    "refine_silent",
+    "refine_roi_ratio",
+    "refine_affinity_mean",
+    "refine_teacher_q_kl",
+    "refine_q_entropy_mean",
+    "refine_q_fg_mass",
+    "refine_q_fg_ratio",
+    "refine_q_fg_delta",
+    "refine_q_seed_precision",
+    "refine_q_seed_recall",
+    "refine_q_candidate_ratio",
+    "refine_q_near_seed_ratio",
+    "refine_unsupported_fg_ratio",
+    "refine_unsupported_fg_scale",
+    "refine_q_core_conflict",
     "background_suppression_mean",
     "return_reason",
     "v3_pool_size",
@@ -192,6 +208,253 @@ def _normalize_gate(score, floor):
     return ((score - floor) / max(1.0 - floor, 1e-6)).clamp(0.0, 1.0)
 
 
+def _normalize_image_for_affinity(image):
+    if image is None:
+        return None
+    if image.dim() == 3:
+        image = image.unsqueeze(1)
+    gray = image.detach().float().mean(dim=1, keepdim=True)
+    flat = gray.flatten(1)
+    mean = flat.mean(dim=1).view(-1, 1, 1, 1)
+    std = flat.std(dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
+    return (gray - mean) / std
+
+
+def _shift_with_valid(x, direction):
+    b, c, h, w = x.shape
+    shifted = torch.zeros_like(x)
+    valid = torch.zeros(b, 1, h, w, dtype=torch.bool, device=x.device)
+    if direction == "up":
+        shifted[:, :, 1:, :] = x[:, :, :-1, :]
+        valid[:, :, 1:, :] = True
+    elif direction == "down":
+        shifted[:, :, :-1, :] = x[:, :, 1:, :]
+        valid[:, :, :-1, :] = True
+    elif direction == "left":
+        shifted[:, :, :, 1:] = x[:, :, :, :-1]
+        valid[:, :, :, 1:] = True
+    elif direction == "right":
+        shifted[:, :, :, :-1] = x[:, :, :, 1:]
+        valid[:, :, :, :-1] = True
+    else:
+        raise ValueError("Unsupported direction: {}".format(direction))
+    return shifted, valid
+
+
+def _local_affinity_refine(q, image, roi_mask, locked_mask, locked_q, args):
+    """Diffuse soft labels inside target-side ROI while keeping seeds/core fixed."""
+    gray = _normalize_image_for_affinity(image)
+    if gray is None:
+        return q, q[:, :1].sum() * 0.0
+
+    refine_iters = int(getattr(args, "rgftd_refine_iters", 3))
+    if refine_iters <= 0:
+        return q, q[:, :1].sum() * 0.0
+
+    sigma = float(getattr(args, "rgftd_refine_affinity_sigma", 0.75))
+    sigma = max(sigma, 1e-6)
+    mix = float(getattr(args, "rgftd_refine_affinity_mix", 0.35))
+    mix = max(0.0, min(mix, 1.0))
+    roi_f = roi_mask.float().unsqueeze(1)
+    locked_f = locked_mask.float().unsqueeze(1)
+    free_f = roi_f * (1.0 - locked_f)
+    if float(free_f.sum().detach().cpu().item()) <= 0.0:
+        return q, q[:, :1].sum() * 0.0
+
+    current = q
+    affinity_accum = q[:, :1].sum() * 0.0
+    affinity_count = 0
+    for _ in range(refine_iters):
+        weighted_sum = current * 0.0
+        weight_sum = current[:, :1] * 0.0
+        for direction in ["up", "down", "left", "right"]:
+            shifted_q, valid = _shift_with_valid(current, direction)
+            shifted_gray, _ = _shift_with_valid(gray, direction)
+            shifted_roi, _ = _shift_with_valid(roi_f, direction)
+            affinity = torch.exp(-((gray - shifted_gray) / sigma) ** 2).clamp(0.0, 1.0)
+            affinity = affinity * valid.float() * roi_f * shifted_roi
+            weighted_sum = weighted_sum + shifted_q * affinity
+            weight_sum = weight_sum + affinity
+            affinity_accum = affinity_accum + affinity.sum()
+            affinity_count += 1
+
+        smoothed = weighted_sum / weight_sum.clamp_min(1e-6)
+        updated = (1.0 - mix) * current + mix * smoothed
+        updated = torch.where(free_f > 0.0, updated, current)
+        current = torch.where(locked_f > 0.0, locked_q, updated)
+        current = current.clamp_min(1e-6)
+        current = current / current.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    denom = float(max(affinity_count, 1)) * roi_f.sum().clamp_min(1.0)
+    affinity_mean = affinity_accum / denom
+    return current.detach(), affinity_mean.detach()
+
+
+def _one_hot_label(label, num_classes, like):
+    safe_label = label.clamp(0, int(num_classes) - 1)
+    one_hot = torch.zeros_like(like)
+    one_hot.scatter_(1, safe_label.unsqueeze(1), 1.0)
+    return one_hot
+
+
+def _build_refined_teacher_target(
+    teacher_prob,
+    image,
+    label,
+    wann_maps,
+    args,
+    active_fg_mask,
+    active_bg_mask,
+    region,
+    candidate_mask,
+    foreground_candidate_mask,
+    seed_fg_support,
+    seed_bg_support,
+    core_mask,
+    seed_fg_context,
+    teacher_fg_prob,
+):
+    device = teacher_prob.device
+    profile = {}
+    num_classes = teacher_prob.shape[1]
+    enabled = int(getattr(args, "rgftd_refine_enabled", 0)) == 1
+    profile["refine_enabled"] = torch.tensor(1.0 if enabled else 0.0, device=device)
+    profile["refine_silent"] = torch.tensor(0.0, device=device)
+    if not enabled:
+        zero = teacher_prob[:, :1].sum() * 0.0
+        for key in [
+            "refine_roi_ratio",
+            "refine_affinity_mean",
+            "refine_teacher_q_kl",
+            "refine_q_entropy_mean",
+            "refine_q_fg_mass",
+            "refine_q_fg_ratio",
+            "refine_q_fg_delta",
+            "refine_q_seed_precision",
+            "refine_q_seed_recall",
+            "refine_q_candidate_ratio",
+            "refine_q_near_seed_ratio",
+            "refine_unsupported_fg_ratio",
+            "refine_unsupported_fg_scale",
+            "refine_q_core_conflict",
+        ]:
+            profile[key] = zero.detach()
+        return teacher_prob.detach(), False, profile
+
+    support_roi = active_fg_mask | active_bg_mask | seed_fg_context | (candidate_mask & region)
+    core_anchor_radius = int(getattr(args, "rgftd_refine_core_anchor_radius", 1))
+    core_anchor = core_mask & _dilate_mask(support_roi, core_anchor_radius)
+    refine_roi = support_roi | core_anchor | seed_fg_support
+    q = teacher_prob.detach().clone()
+    supported_fg_region = seed_fg_context | foreground_candidate_mask
+    unsupported_fg_region = active_fg_mask & (~supported_fg_region)
+
+    seed_fg_anchor = seed_fg_support & refine_roi
+    seed_bg_anchor = seed_bg_support & refine_roi
+    if num_classes > 1:
+        seed_strength = float(getattr(args, "rgftd_refine_seed_strength", 0.95))
+        seed_strength = max(0.0, min(seed_strength, 1.0))
+        weak_label_q = _one_hot_label(label, num_classes, q)
+        q = torch.where(
+            seed_fg_anchor.unsqueeze(1),
+            seed_strength * weak_label_q + (1.0 - seed_strength) * q,
+            q,
+        )
+        q = torch.where(seed_bg_anchor.unsqueeze(1), seed_strength * weak_label_q + (1.0 - seed_strength) * q, q)
+        q = q.clamp_min(1e-6)
+        q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    if core_mask.any():
+        core_q = _one_hot_label(label, num_classes, q)
+        q = torch.where(core_mask.unsqueeze(1), core_q, q)
+
+    locked_mask = core_anchor | seed_fg_anchor | seed_bg_anchor
+    locked_q = q.detach()
+    q, affinity_mean = _local_affinity_refine(q, image, refine_roi, locked_mask, locked_q, args)
+
+    fg_floor = float(getattr(args, "rgftd_refine_fg_floor", 0.02))
+    bg_ceiling = float(getattr(args, "rgftd_refine_bg_ceiling", 0.98))
+    fg_floor = max(0.0, min(fg_floor, 0.95))
+    bg_ceiling = max(0.0, min(bg_ceiling, 1.0))
+    if num_classes > 1:
+        fg_region = active_fg_mask | seed_fg_context
+        fg_mass = q[:, 1:].sum(dim=1)
+        if fg_floor > 0.0:
+            need_lift = fg_region & (fg_mass < fg_floor)
+            lift = (fg_floor - fg_mass).clamp_min(0.0)
+            q[:, 0] = torch.where(need_lift, (q[:, 0] - lift).clamp_min(1e-6), q[:, 0])
+            class_mass = q[:, 1:].sum(dim=1, keepdim=True).clamp_min(1e-6)
+            q[:, 1:] = torch.where(
+                need_lift.unsqueeze(1),
+                q[:, 1:] + lift.unsqueeze(1) * q[:, 1:] / class_mass,
+                q[:, 1:],
+            )
+        q[:, 0] = torch.where(refine_roi, q[:, 0].clamp(max=bg_ceiling), q[:, 0])
+        q = q.clamp_min(1e-6)
+        q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        unsupported_fg_scale = float(getattr(args, "rgftd_refine_unsupported_fg_scale", 0.25))
+        unsupported_fg_scale = max(0.0, min(unsupported_fg_scale, 1.0))
+        if unsupported_fg_scale < 1.0:
+            unsupported = unsupported_fg_region.unsqueeze(1)
+            old_fg = q[:, 1:].sum(dim=1, keepdim=True)
+            new_fg_classes = q[:, 1:] * unsupported_fg_scale
+            removed_fg = old_fg * (1.0 - unsupported_fg_scale)
+            q[:, 1:] = torch.where(unsupported, new_fg_classes, q[:, 1:])
+            q[:, 0:1] = torch.where(unsupported, q[:, 0:1] + removed_fg, q[:, 0:1])
+            q = q.clamp_min(1e-6)
+            q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    else:
+        unsupported_fg_scale = 1.0
+
+    q = torch.where(locked_mask.unsqueeze(1), locked_q, q)
+
+    q_fg_prob = q[:, 1:].sum(dim=1) if num_classes > 1 else q[:, 0] * 0.0
+    q_fg_mass = (q_fg_prob * active_fg_mask.float()).sum()
+    active_pixels = (active_fg_mask | active_bg_mask).float().sum().clamp_min(1.0)
+    q_fg_ratio = q_fg_mass / active_pixels
+    teacher_fg_mass = (teacher_fg_prob * active_fg_mask.float()).sum()
+    q_entropy = _normalized_entropy(q)
+    q_pred = q.argmax(dim=1)
+    q_seed_precision = _masked_mean(q_fg_prob, seed_fg_support & refine_roi)
+    q_seed_recall = _masked_ratio((q_fg_prob >= fg_floor) & seed_fg_support & refine_roi, seed_fg_support & refine_roi)
+    q_candidate_ratio = _masked_mean(q_fg_prob, candidate_mask & refine_roi)
+    q_near_seed_ratio = _masked_mean(q_fg_prob, seed_fg_context & refine_roi)
+    unsupported_fg_ratio = _masked_ratio(unsupported_fg_region, active_fg_mask)
+    if core_mask.any():
+        q_core_conflict = _masked_ratio((q_pred != label) & core_mask, core_mask)
+    else:
+        q_core_conflict = q[:, :1].sum() * 0.0
+    teacher_to_q_kl = F.kl_div(
+        torch.log(q.clamp_min(1e-6)),
+        teacher_prob,
+        reduction="none",
+    ).sum(dim=1)
+    roi_f = refine_roi.float()
+    profile["refine_roi_ratio"] = refine_roi.float().mean().detach()
+    profile["refine_affinity_mean"] = affinity_mean.detach()
+    profile["refine_teacher_q_kl"] = _masked_mean(teacher_to_q_kl, refine_roi).detach()
+    profile["refine_q_entropy_mean"] = _masked_mean(q_entropy, refine_roi).detach()
+    profile["refine_q_fg_mass"] = q_fg_mass.detach()
+    profile["refine_q_fg_ratio"] = q_fg_ratio.detach()
+    profile["refine_q_fg_delta"] = (q_fg_mass - teacher_fg_mass).detach()
+    profile["refine_q_seed_precision"] = q_seed_precision.detach()
+    profile["refine_q_seed_recall"] = q_seed_recall.detach()
+    profile["refine_q_candidate_ratio"] = q_candidate_ratio.detach()
+    profile["refine_q_near_seed_ratio"] = q_near_seed_ratio.detach()
+    profile["refine_unsupported_fg_ratio"] = unsupported_fg_ratio.detach()
+    profile["refine_unsupported_fg_scale"] = torch.tensor(unsupported_fg_scale, device=device)
+    profile["refine_q_core_conflict"] = q_core_conflict.detach()
+
+    min_fg_mass = float(getattr(args, "rgftd_refine_min_fg_mass", 1.0))
+    min_roi_pixels = float(getattr(args, "rgftd_refine_min_roi_pixels", 1.0))
+    silent = (
+        float(roi_f.sum().detach().cpu().item()) < min_roi_pixels
+        or float(q_fg_mass.detach().cpu().item()) < min_fg_mass
+    )
+    profile["refine_silent"] = torch.tensor(1.0 if silent else 0.0, device=device)
+    return q.detach(), silent, profile
+
+
 def _classwise_teacher_validation(
     teacher_pred,
     teacher_conf,
@@ -259,7 +522,7 @@ def get_rgftd_lambda(iter_num, args):
     return max_lambda * math.exp(-5.0 * phase * phase)
 
 
-def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num):
+def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num, image=None):
     """Reliability-gated teacher distillation on WANN non-core regions."""
     device = student_logits.device
     profile = zero_rgftd_profile(device)
@@ -711,8 +974,32 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num)
         profile["loss"] = zero_loss.detach()
         return zero_loss, lambda_effective, profile
 
+    refined_target, refine_silent, refine_profile = _build_refined_teacher_target(
+        teacher_prob=teacher_prob,
+        image=image,
+        label=label,
+        wann_maps=wann_maps,
+        args=args,
+        active_fg_mask=active_fg_mask,
+        active_bg_mask=active_bg_mask,
+        region=region,
+        candidate_mask=candidate_mask,
+        foreground_candidate_mask=foreground_candidate_mask,
+        seed_fg_support=seed_fg_support,
+        seed_bg_support=seed_bg_support,
+        core_mask=core_mask,
+        seed_fg_context=seed_fg_context,
+        teacher_fg_prob=teacher_fg_prob,
+    )
+    profile.update(refine_profile)
+    if refine_silent:
+        zero_loss = student_logits.sum() * 0.0
+        profile["return_reason"] = torch.tensor(4.0, device=device)
+        profile["loss"] = zero_loss.detach()
+        return zero_loss, lambda_effective, profile
+
     student_log_prob = F.log_softmax(student_logits / temperature, dim=1)
-    per_pixel_kl = F.kl_div(student_log_prob, teacher_prob, reduction="none").sum(dim=1) * temperature * temperature
+    per_pixel_kl = F.kl_div(student_log_prob, refined_target, reduction="none").sum(dim=1) * temperature * temperature
     background_weight = float(getattr(args, "rgftd_background_weight", 0.25))
     if validation_enabled and teacher_prob.shape[1] > 2:
         fg_teacher_weight = (class_weight_map * teacher_conf).clamp(0.0, 1.0)

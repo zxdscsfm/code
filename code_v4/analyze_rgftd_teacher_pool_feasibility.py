@@ -349,6 +349,17 @@ def build_parser():
     parser.add_argument("--rgftd_max_bg_fg_ratio", type=float, default=1.0)
     parser.add_argument("--rgftd_allow_bg_without_fg", type=int, default=0)
     parser.add_argument("--rgftd_lambda_eff_cap", type=float, default=0.02)
+    parser.add_argument("--rgftd_refine_enabled", type=int, default=0)
+    parser.add_argument("--rgftd_refine_iters", type=int, default=3)
+    parser.add_argument("--rgftd_refine_affinity_sigma", type=float, default=0.75)
+    parser.add_argument("--rgftd_refine_affinity_mix", type=float, default=0.35)
+    parser.add_argument("--rgftd_refine_seed_strength", type=float, default=0.95)
+    parser.add_argument("--rgftd_refine_core_anchor_radius", type=int, default=1)
+    parser.add_argument("--rgftd_refine_unsupported_fg_scale", type=float, default=0.25)
+    parser.add_argument("--rgftd_refine_fg_floor", type=float, default=0.02)
+    parser.add_argument("--rgftd_refine_bg_ceiling", type=float, default=0.98)
+    parser.add_argument("--rgftd_refine_min_fg_mass", type=float, default=1.0)
+    parser.add_argument("--rgftd_refine_min_roi_pixels", type=float, default=1.0)
     return parser
 
 
@@ -461,6 +472,7 @@ def main():
                         wann_maps,
                         args,
                         args.analysis_iter,
+                        image=volume_batch,
                     )
                     if student_aux_logits is not None:
                         loss_aux, lambda_aux, profile_aux = rgftd_loss(
@@ -470,6 +482,7 @@ def main():
                             wann_maps,
                             args,
                             args.analysis_iter,
+                            image=volume_batch,
                         )
                         loss_value = 0.5 * (_to_float(loss_seg) + _to_float(loss_aux))
                         lambda_value = 0.5 * (float(lambda_seg) + float(lambda_aux))
