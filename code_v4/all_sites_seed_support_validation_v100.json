@@ -1,0 +1,268 @@
+{
+  "iter_tag": 3800,
+  "model_dir": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022",
+  "sites": [
+    {
+      "site": "SiteA",
+      "client": "client1",
+      "cid": 0,
+      "sup_type": "scribble",
+      "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_0_iter_3800_dice_0.8855.pth",
+      "prototype_counts": {
+        "bg": 489,
+        "oc": 160,
+        "od_ring": 303
+      },
+      "oc": {
+        "count": 27848,
+        "pos_count": 1879,
+        "prevalence": 0.06747342646121979,
+        "pos_mean": 0.13964590430259705,
+        "neg_mean": -0.49613097310066223,
+        "top1_precision": 0.9426523447036743,
+        "top1_recall": 0.13996806812134113,
+        "top5_precision": 0.7214644551277161,
+        "top5_recall": 0.5348589675359233,
+        "top10_precision": 0.5317773818969727,
+        "top10_recall": 0.7881852048962213
+      },
+      "od_ring": {
+        "count": 27848,
+        "pos_count": 2301,
+        "prevalence": 0.08262711763381958,
+        "pos_mean": -0.05893421173095703,
+        "neg_mean": -0.21709412336349487,
+        "top1_precision": 0.6308243870735168,
+        "top1_recall": 0.07648848326814428,
+        "top5_precision": 0.3811916708946228,
+        "top5_recall": 0.23076923076923078,
+        "top10_precision": 0.26068222522735596,
+        "top10_recall": 0.3155149934810952
+      }
+    },
+    {
+      "site": "SiteB",
+      "client": "client2",
+      "cid": 1,
+      "sup_type": "scribble_noisy",
+      "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_1_iter_3800_dice_0.7523.pth",
+      "prototype_counts": {
+        "bg": 663,
+        "oc": 114,
+        "od_ring": 327
+      },
+      "oc": {
+        "count": 55920,
+        "pos_count": 1446,
+        "prevalence": 0.02585836872458458,
+        "pos_mean": 0.05708831548690796,
+        "neg_mean": -0.45589983463287354,
+        "top1_precision": 0.5660714507102966,
+        "top1_recall": 0.21922544951590595,
+        "top5_precision": 0.3419170379638672,
+        "top5_recall": 0.661134163208852,
+        "top10_precision": 0.2029685229063034,
+        "top10_recall": 0.784923928077455
+      },
+      "od_ring": {
+        "count": 55920,
+        "pos_count": 3827,
+        "prevalence": 0.06843705475330353,
+        "pos_mean": -0.07085742801427841,
+        "neg_mean": -0.27959275245666504,
+        "top1_precision": 0.6499999761581421,
+        "top1_recall": 0.09511366605696368,
+        "top5_precision": 0.3075822591781616,
+        "top5_recall": 0.2247191011235955,
+        "top10_precision": 0.21673819422721863,
+        "top10_recall": 0.3166971518160439
+      }
+    },
+    {
+      "site": "SiteC",
+      "client": "client3",
+      "cid": 2,
+      "sup_type": "scribble_noisy",
+      "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_2_iter_3800_dice_0.8911.pth",
+      "prototype_counts": {
+        "bg": 2158,
+        "oc": 452,
+        "od_ring": 1229
+      },
+      "oc": {
+        "count": 180481,
+        "pos_count": 5230,
+        "prevalence": 0.028978118672966957,
+        "pos_mean": 0.19973677396774292,
+        "neg_mean": -0.750791609287262,
+        "top1_precision": 0.9722991585731506,
+        "top1_recall": 0.3355640535372849,
+        "top5_precision": 0.4865373969078064,
+        "top5_recall": 0.8395793499043978,
+        "top10_precision": 0.26671838760375977,
+        "top10_recall": 0.9204588910133843
+      },
+      "od_ring": {
+        "count": 180481,
+        "pos_count": 14554,
+        "prevalence": 0.08064007014036179,
+        "pos_mean": 0.00969783030450344,
+        "neg_mean": -0.30910173058509827,
+        "top1_precision": 0.9030470848083496,
+        "top1_recall": 0.11199670193761166,
+        "top5_precision": 0.6684764623641968,
+        "top5_recall": 0.41452521643534423,
+        "top10_precision": 0.4850130081176758,
+        "top10_recall": 0.601484128074756
+      }
+    },
+    {
+      "site": "SiteD",
+      "client": "client4",
+      "cid": 3,
+      "sup_type": "keypoint",
+      "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_3_iter_3800_dice_0.861.pth",
+      "prototype_counts": {
+        "bg": 176,
+        "oc": 120,
+        "od_ring": 131
+      },
+      "oc": {
+        "count": 183893,
+        "pos_count": 3200,
+        "prevalence": 0.017401423305273056,
+        "pos_mean": 0.19944225251674652,
+        "neg_mean": -0.6247407793998718,
+        "top1_precision": 0.847199559211731,
+        "top1_recall": 0.486875,
+        "top5_precision": 0.3336595892906189,
+        "top5_recall": 0.95875,
+        "top10_precision": 0.1710168570280075,
+        "top10_recall": 0.9828125
+      },
+      "od_ring": {
+        "count": 183893,
+        "pos_count": 9309,
+        "prevalence": 0.05062182992696762,
+        "pos_mean": 0.12203682214021683,
+        "neg_mean": -0.34478461742401123,
+        "top1_precision": 0.7841218113899231,
+        "top1_recall": 0.15490385648297347,
+        "top5_precision": 0.5133224725723267,
+        "top5_recall": 0.5070362015254055,
+        "top10_precision": 0.36334964632987976,
+        "top10_recall": 0.7177999785154152
+      }
+    },
+    {
+      "site": "SiteE",
+      "client": "client5",
+      "cid": 4,
+      "sup_type": "block",
+      "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_4_iter_3800_dice_0.8705.pth",
+      "prototype_counts": {
+        "bg": 43465,
+        "oc": 859,
+        "od_ring": 2250
+      },
+      "oc": {
+        "count": 11026,
+        "pos_count": 781,
+        "prevalence": 0.07083258032798767,
+        "pos_mean": 0.0510566420853138,
+        "neg_mean": -0.38317281007766724,
+        "top1_precision": 0.7567567825317383,
+        "top1_recall": 0.10755441741357234,
+        "top5_precision": 0.4692029058933258,
+        "top5_recall": 0.33162612035851474,
+        "top10_precision": 0.37080690264701843,
+        "top10_recall": 0.5236875800256082
+      },
+      "od_ring": {
+        "count": 11026,
+        "pos_count": 1236,
+        "prevalence": 0.11209867894649506,
+        "pos_mean": 0.022324705496430397,
+        "neg_mean": -0.19663509726524353,
+        "top1_precision": 0.6126126050949097,
+        "top1_recall": 0.05501618122977346,
+        "top5_precision": 0.4836956560611725,
+        "top5_recall": 0.21601941747572814,
+        "top10_precision": 0.3689936399459839,
+        "top10_recall": 0.32928802588996764
+      }
+    }
+  ],
+  "summary": [
+    {
+      "site": "SiteA",
+      "client": "client1",
+      "sup_type": "scribble",
+      "oc_prevalence": 0.06747342646121979,
+      "oc_top1_precision": 0.9426523447036743,
+      "oc_top5_precision": 0.7214644551277161,
+      "oc_top10_precision": 0.5317773818969727,
+      "oc_top10_recall": 0.7881852048962213,
+      "od_top1_precision": 0.6308243870735168,
+      "od_top5_precision": 0.3811916708946228,
+      "od_top10_precision": 0.26068222522735596,
+      "od_top10_recall": 0.3155149934810952
+    },
+    {
+      "site": "SiteB",
+      "client": "client2",
+      "sup_type": "scribble_noisy",
+      "oc_prevalence": 0.02585836872458458,
+      "oc_top1_precision": 0.5660714507102966,
+      "oc_top5_precision": 0.3419170379638672,
+      "oc_top10_precision": 0.2029685229063034,
+      "oc_top10_recall": 0.784923928077455,
+      "od_top1_precision": 0.6499999761581421,
+      "od_top5_precision": 0.3075822591781616,
+      "od_top10_precision": 0.21673819422721863,
+      "od_top10_recall": 0.3166971518160439
+    },
+    {
+      "site": "SiteC",
+      "client": "client3",
+      "sup_type": "scribble_noisy",
+      "oc_prevalence": 0.028978118672966957,
+      "oc_top1_precision": 0.9722991585731506,
+      "oc_top5_precision": 0.4865373969078064,
+      "oc_top10_precision": 0.26671838760375977,
+      "oc_top10_recall": 0.9204588910133843,
+      "od_top1_precision": 0.9030470848083496,
+      "od_top5_precision": 0.6684764623641968,
+      "od_top10_precision": 0.4850130081176758,
+      "od_top10_recall": 0.601484128074756
+    },
+    {
+      "site": "SiteD",
+      "client": "client4",
+      "sup_type": "keypoint",
+      "oc_prevalence": 0.017401423305273056,
+      "oc_top1_precision": 0.847199559211731,
+      "oc_top5_precision": 0.3336595892906189,
+      "oc_top10_precision": 0.1710168570280075,
+      "oc_top10_recall": 0.9828125,
+      "od_top1_precision": 0.7841218113899231,
+      "od_top5_precision": 0.5133224725723267,
+      "od_top10_precision": 0.36334964632987976,
+      "od_top10_recall": 0.7177999785154152
+    },
+    {
+      "site": "SiteE",
+      "client": "client5",
+      "sup_type": "block",
+      "oc_prevalence": 0.07083258032798767,
+      "oc_top1_precision": 0.7567567825317383,
+      "oc_top5_precision": 0.4692029058933258,
+      "oc_top10_precision": 0.37080690264701843,
+      "oc_top10_recall": 0.5236875800256082,
+      "od_top1_precision": 0.6126126050949097,
+      "od_top5_precision": 0.4836956560611725,
+      "od_top10_precision": 0.3689936399459839,
+      "od_top10_recall": 0.32928802588996764
+    }
+  ]
+}

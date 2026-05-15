@@ -1,0 +1,8 @@
+All clients are included.
+Comparison is within the same client and same checkpoint.
+
+Metric: Background expansion error rate.
+Background expansion = within GT background pixels inside the unlabeled weak region, count the fraction predicted as foreground.
+Backbone-only = argmax(main decoder softmax).
+Blended = argmax(0.75 * main + 0.25 * auxiliary), matching the clean-baseline dual-branch pseudo-label rule.
+Max sampled train cases per client=0, checkpoint interval=500.

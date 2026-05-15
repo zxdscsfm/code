@@ -1,0 +1,176 @@
+# FedLPPA: Learning Personalized Prompt and Aggregation for Federated Weakly-supervised Medical Image Segmentation
+The official implementation of the paper: **FedLPPA: Learning Personalized Prompt and Aggregation for Federated Weakly-supervised Medical Image Segmentation**([arxiv](https://arxiv.org/abs/2402.17502), [Early Access](https://ieeexplore.ieee.org/document/10721443))
+
+# 🔔News
+- 2024-10-15, 🎉🎉 Our paper "[FedLPPA: Learning Personalized Prompt and Aggregation for Federated Weakly-supervised Medical Image Segmentation](https://arxiv.org/pdf/2402.17502)" has been accepted by **IEEE Transactions on Medical Imaging (TMI)**.
+
+# 💡Framework
+![TEL](image/framework.png)
+
+# 🌟 Motivation
+
+**Particularly Valuable for Addressing the Problems**:  
+   - Cross-institutional collaboration barriers ("data silos")  
+   - Limited expert annotations in clinical settings  
+   - Domain shift challenges in multi-center studies  
+   - Privacy-aware knowledge sharing paradigms
+
+**Provide Insights for Researchers Exploring the Directions**:
+
+   - 🔍 Federated learning in annotation-heterogeneous environments  
+   - 🏥 Multi-institutional medical imaging studies requiring privacy preservation  
+   - 🎯 Label-efficient segmentation with sparse supervision  
+   - 🖌️ Annotation cost reduction strategies for medical imaging  
+   - 🤝 Adaptive model personalization techniques in distributed systems  
+   - 🔒 Data security and interoperability solutions for healthcare AI  
+
+
+
+
+
+# Datasets
+## Download the Processed Datasets
+
+
+<table>
+  <tbody>
+    <tr>
+      <td align="center"></td>
+      <td align="center">Fundus</td>
+      <td align="center">OCTA</td>
+      <td align="center">Endoscopy</td>
+      <td align="center">Prostate MRI</td>
+    </tr>
+    <tr>
+      <td align="center"><i>.png</i></td>
+      <td align="center"><a href="https://drive.google.com/drive/folders/10lZwgMFT6gV-Tj6gpFfd-TVJC3b9_808?usp=drive_link">Download</a></td> 
+      <td align="center"><a href="https://drive.google.com/drive/folders/1HtHCYwpkqcuy5_BAt4gCiC5EN8ZUwMMW?usp=drive_link">Download</a></td>  
+      <td align="center"><a href="https://drive.google.com/drive/folders/1xB3X0oM3fg5QIZ86LQTpHjlgmHURREV3?usp=drive_link">Download</a></td>  
+      <td align="center"><a>N/A</a></td>  
+    </tr>
+    <tr>
+      <td align="center"><i>.h5</i></td>
+      <td align="center"><a href="https://github.com/llmir/FedICRA/tree/master/data">Download</a></td> 
+      <td align="center"><a href="https://github.com/llmir/FedICRA/tree/master/data">Download</a></td>  
+      <td align="center"><a href="https://drive.google.com/drive/folders/1GsaJXeE_5yNPmd4DLDx-POO2Qr24szLK?usp=drive_link">Download</a></td>  
+      <td align="center"><a href="https://drive.google.com/drive/folders/1rCQMrzSKPcsHjAGrgJUqszXityyho4JH?usp=drive_link">Download</a></td>  
+    </tr>
+
+  </tbody>
+</table>
+
+
+## Details of Training set
+The detailed information of datasets can be found in [paper](https://arxiv.org/abs/2402.17502)
+
+# Visualization Results
+
+![TEL](image/output.png)
+
+# Requirements
+Some important required packages are lised below:
+* Pytorch 1.10.2
+* cudatoolkit 11.3.1
+* efficientnet-pytorch 0.7.1
+* tensorboardx 2.5.1
+* medpy 0.4.0
+* scikit-image 0.19.3
+* simpleitk  2.1.1.2
+* flwr 1.0.0
+* Python >= 3.9
+# Usage
+## 1. Clone this project
+``` bash
+git clone https://github.com/llmir/FedLPPA.git
+cd FedLPPA/code_v4
+```
+
+## 2. Create a conda environment
+``` bash
+conda env create -n fed39v2 -f fedlppa.yaml
+conda activate fed39v2
+pip install tree_filter-0.1-cp39-cp39-linux_x86_64.whl
+```
+## 3. Data Preparation
+You can download the datasets with different formats of sparsely-supervised annotations to the dir '_FedLPPA/data_' in the form of _.h5_.
+
+Should you wish to use FedLPPA to train the models utilizing your own dataset, kindly proceed to restructure the implementation of ['_BaseDataSets()_'](https://github.com/llmir/FedLPPA/blob/master/code_v4/dataloaders/dataset.py).
+
+The automated scripts for generating sparsely-supervised annotations will be included in subsequent updates.
+
+
+## 4. Train the model
+We first disclose the FedAvg and FedLPPA in _train.sh_. All comparison methods in the article are implemented in the code, please refer to the file [_flower_common_v4.py_](https://github.com/llmir/FedLPPA/blob/master/code_v4/flower_common_v4.py). The other scripts with hyperparameters will be included in subsequent updates.
+``` bash
+##Server
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role server --client client_all --sup_type mask --gpu 0
+
+##Site A
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role client --cid 0 --client client1 --sup_type scribble_noisy --gpu 1
+
+##Site B
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role client --cid 1 --client client2 --sup_type keypoint --gpu 2
+
+##Site C
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role client --cid 2 --client client3 --sup_type block --gpu 3
+
+##Site D
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role client --cid 3 --client client4 --sup_type box --gpu 4
+
+##Site E
+python flower_pCE_2D_v4_FedLPPA.py --root_path ../data/FAZ_h5 --num_classes 2 --in_chns 1 --img_class faz --exp faz/FedLPPA_promptagg_v1 --model unet_univ5 --max_iterations 30000 --iters 5 --eval_iters 5 --tsne_iters 200 --batch_size 12 --base_lr 0.01 --amp 0 --server_address 127.0.0.1:8091 --strategy FedUniV2.1 --min_num_clients 5 --img_size 256 --alpha 0.1 --beta 0.5 --prompt universal --attention dual --dual_init aggregated --label_prompt 1 --prompt_agg similarity --prompt_affinity_mode raw --prompt_agg_keys basic --prompt_agg_temp 1.0 --prompt_agg_lambda 0.8 --role client --cid 4 --client client5 --sup_type scribble --gpu 5
+```
+- root_path: The dataset root path.
+- num_classes: The segmentation classes.
+- batch_size: 12.
+- image_size: Default value is 256.
+- exp: save_path of models and 'log' file.
+- server_address: Server communication port. If you train the server model and client models in one server, please set it to the similar format '127.0.0.1:8091' (
+note that different experiments cannot use the same port).
+- strategy: Choose a federated learning strategy, i.e., FedAvg, FedBN, FedRep and FedLPPA (FedUniv2.1).
+- prompt: employ learnable prompts or one-hot. Two formats 'universal' or 'onehot'.
+- attention: attention module selection.
+- dual_init: Select a aggregated strategy.
+- min_num_clients: The total number of clients.
+- label_prompt: 0 or 1 , use or not use the sparse label prompts.
+- role: 'Server' or 'Client'.
+- cid: client_id.
+- sup_type: Choose the format of sparse annotation.
+
+## 5. Test the model
+
+``` bash
+python -u test_client4onemod_FL_Personalize.py --client client1 --num_classes 2 --in_chns 1 --root_path ../data/FAZ_h5/test/ --img_class faz --exp faz/ --min_num_clients 5 --cid 1 --model unet_univ5
+```
+Other samples can be found in [here](https://github.com/llmir/FedLPPA/blob/master/code_v4/test.sh).
+
+Note: During testing, proceed by selecting the distinct model evaluation pathways ('_mode_save_path_') corresponding to your specific framework configuration. Some samples can be found in the '_test_client4onemod_FL_Personalize.py_' code at [line 330](https://github.com/llmir/FedLPPA/blob/master/code_v4/test_client4onemod_FL_Personalize.py). We use '_{}\__async_\_{}\_best_model.pth_' when testing personalized federated methods.
+
+You can alternatively employ the alternate pathway '_{}\_{}_\___best_model.pth_' to conduct testing, where the principal distinction lies in determining whether the federated models dispensed by the server undergone training iterations on localized datasets (i.e., a localized fine-tuning operation). It depends on how your FL experiments are set up.
+ 
+
+# Acknowledgement
+* [flower](https://github.com/mher/flower)
+* [WSL4MIS](https://github.com/HiLab-git/WSL4MIS)
+* [FedALA](https://github.com/TsingZ0/FedALA)
+* [FedLC](https://github.com/jcwang123/FedLC)
+
+# Citation
+If you find [FedLPPA](https://ieeexplore.ieee.org/document/10721443) useful in your research, please consider citing:
+```
+@ARTICLE{10721443,
+  author={Lin, Li and Liu, Yixiang and Wu, Jiewei and Cheng, Pujin and Cai, Zhiyuan and Wong, Kenneth K. Y. and Tang, Xiaoying},
+  journal={IEEE Transactions on Medical Imaging}, 
+  title={FedLPPA: Learning Personalized Prompt and Aggregation for Federated Weakly-supervised Medical Image Segmentation}, 
+  year={2024},
+  volume={},
+  number={},
+  pages={1-1},
+  keywords={Image segmentation;Data models;Training;Annotations;Computational modeling;Medical diagnostic imaging;Federated learning;Decoding;Costs;Context modeling;Federated learning;Prompt-driven personalization;Heterogeneous weak supervision;Learnable aggregation;Medical image segmentation},
+  doi={10.1109/TMI.2024.3483221}}
+
+```
+If you have any questions, please feel free to contact us😊.
+
+  
+

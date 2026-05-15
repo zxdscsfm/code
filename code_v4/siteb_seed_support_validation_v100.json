@@ -1,0 +1,37 @@
+{
+  "site": "SiteB",
+  "client": "client2",
+  "sup_type": "scribble_noisy",
+  "checkpoint": "/data/jianbingshen/yanghongji/FedLPPA/model/odoc/FedLPPA_v34_w1p_lgcalib_paper_r500_l10_odoc_20260419_083158_seed2022/client_1_iter_3800_dice_0.7523.pth",
+  "prototype_counts": {
+    "bg": 663,
+    "oc": 114,
+    "od_ring": 327
+  },
+  "oc": {
+    "count": 55920,
+    "pos_count": 1446,
+    "prevalence": 0.02585836872458458,
+    "pos_mean": 0.05708831548690796,
+    "neg_mean": -0.45589983463287354,
+    "top1_precision": 0.5660714507102966,
+    "top1_recall": 0.21922544951590595,
+    "top5_precision": 0.3419170379638672,
+    "top5_recall": 0.661134163208852,
+    "top10_precision": 0.2029685229063034,
+    "top10_recall": 0.784923928077455
+  },
+  "od_ring": {
+    "count": 55920,
+    "pos_count": 3827,
+    "prevalence": 0.06843705475330353,
+    "pos_mean": -0.07085742801427841,
+    "neg_mean": -0.27959275245666504,
+    "top1_precision": 0.6499999761581421,
+    "top1_recall": 0.09511366605696368,
+    "top5_precision": 0.3075822591781616,
+    "top5_recall": 0.2247191011235955,
+    "top10_precision": 0.21673819422721863,
+    "top10_recall": 0.3166971518160439
+  }
+}
