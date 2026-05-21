@@ -1145,6 +1145,8 @@ class UNet_UniV2(nn.Module):
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
             self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
+            self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
         self.prompt_type = prompt_type
@@ -1248,6 +1250,8 @@ class UNet_UniV3(nn.Module):
         if sup_type == 'box':
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
+            self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
             self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
@@ -1353,6 +1357,8 @@ class UNet_UniV4(nn.Module):
         if sup_type == 'box':
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
+            self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
             self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
@@ -1462,6 +1468,8 @@ class UNet_UniV5(nn.Module):
         if sup_type == 'box':
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
+            self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
             self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
@@ -1614,6 +1622,8 @@ class UNet_UniV5_WO_Uni_Prompt(nn.Module):
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
             self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
+            self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
         self.prompt_type = prompt_type
@@ -1740,6 +1750,8 @@ class UNet_UniV5_WO_Uni_Prompt(nn.Module):
         if sup_type == 'box':
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
+            self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
             self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type
@@ -1918,6 +1930,8 @@ class UNet_UniV5_AttentionConcat(nn.Module):
         if sup_type == 'box':
             self.sup_type = 'block'
         elif sup_type == 'scribble_noisy':
+            self.sup_type = 'scribble'
+        elif str(sup_type).startswith('sparse_scribble_'):
             self.sup_type = 'scribble'
         else:
             self.sup_type = sup_type

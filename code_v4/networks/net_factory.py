@@ -10,60 +10,65 @@ from networks.unet import UNet, UNet_320, UNet_DS, UNet_CCT, UNet_CCT_3H, UNet_H
 
 
 def net_factory(args, net_type="unet", in_chns=1, class_num=3):
+    device = getattr(args, "device", None)
+    if device is None:
+        device = "cuda" if getattr(args, "use_cuda", 1) == 1 else "cpu"
+    def _to_device(model):
+        return model.to(device)
     if net_type == "unet":
-        net = UNet(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_320":
-        net = UNet_320(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_320(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_cct":
-        net = UNet_CCT(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_CCT(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_cct_3h":
-        net = UNet_CCT_3H(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_CCT_3H(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_ds":
-        net = UNet_DS(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_DS(in_chns=in_chns, class_num=class_num))
     elif net_type == "efficient_unet":
-        net = Effi_UNet('efficientnet-b3', encoder_weights='imagenet',
-                        in_channels=in_chns, classes=class_num).cuda()
+        net = _to_device(Effi_UNet('efficientnet-b3', encoder_weights='imagenet',
+                        in_channels=in_chns, classes=class_num))
     elif net_type == "pnet":
-        net = PNet2D(in_chns, class_num, 64, [1, 2, 4, 8, 16]).cuda()
+        net = _to_device(PNet2D(in_chns, class_num, 64, [1, 2, 4, 8, 16]))
     elif net_type == "unet_head":
-        net = UNet_Head(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_Head(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_multihead":
-        net = UNet_MultiHead(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_MultiHead(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_lc":
-        net = UNet_LC(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
-                    client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_LC(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
+                    client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_lc_auxi":
-        net = UNet_LC_Auxi(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
-                    client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_LC_Auxi(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
+                    client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_lc_multihead":
-        net = UNet_LC_MultiHead(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
-                    client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_LC_MultiHead(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
+                    client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_lc_multihead_two":
-        net = UNet_LC_MultiHead_Two(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
-                    client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_LC_MultiHead_Two(in_chns=in_chns, class_num=class_num, pcs_num=1, emb_num=args.min_num_clients,
+                    client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_uni":
-        net = UNet_Uni(in_chns=in_chns, class_num=class_num, client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_Uni(in_chns=in_chns, class_num=class_num, client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_univ2":
-        net = UNet_UniV2(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid).cuda()
+        net = _to_device(UNet_UniV2(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid))
     elif net_type == "unet_univ3":
-        net = UNet_UniV3(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size).cuda()
+        net = _to_device(UNet_UniV3(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size))
     elif net_type == "unet_univ4":
-        net = UNet_UniV4(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size).cuda()
+        net = _to_device(UNet_UniV4(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size))
     
     elif net_type == "unet_univ5":
-        net = UNet_UniV5(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size).cuda()
+        net = _to_device(UNet_UniV5(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size))
     elif net_type == "unet_univ5_ablation":
-        net = UNet_Univ5_Ablation(in_chns=in_chns, class_num=class_num).cuda()
+        net = _to_device(UNet_Univ5_Ablation(in_chns=in_chns, class_num=class_num))
     elif net_type == "unet_univ5_wo_uniprompt":
-        net = UNet_UniV5_WO_Uni_Prompt(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size).cuda()
+        net = _to_device(UNet_UniV5_WO_Uni_Prompt(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size))
     elif net_type == "unet_univ5_attention_concat":
-        net = UNet_UniV5_AttentionConcat(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
-                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size).cuda()
+        net = _to_device(UNet_UniV5_AttentionConcat(in_chns=in_chns, class_num=class_num, prompt_type=args.prompt, attention_type=args.attention,
+                         sup_type=args.sup_type, use_label_prompt=args.label_prompt, client_num=args.min_num_clients, client_id=args.cid, img_size=args.img_size))
     
     else:
         net = None

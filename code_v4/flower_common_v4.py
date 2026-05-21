@@ -1,4 +1,5 @@
 # -*- coding:utf-8 -*-
+import io
 import os
 import numpy as np
 import torch
@@ -30,6 +31,21 @@ from networks.net_factory import net_factory
 from val_2D import test_single_volume, test_single_volume_ds
 from utils.TreeEnergyLoss.kernels.lib_tree_filter.modules.tree_filter import MinimumSpanningTree
 from utils.TreeEnergyLoss.kernels.lib_tree_filter.modules.tree_filter import TreeFilter2D
+
+
+def atomic_torch_save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = '{}.tmp.{}'.format(path, os.getpid())
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 from sklearn.manifold import TSNE
@@ -135,11 +151,15 @@ class BaseClient(fl.client.Client):
             save_mode_path = os.path.join(self.args.snapshot_path, 'client_{}_async_iter_{}_dice_{}.pth'.format(
                                         self.cid, self.current_iter, round(self.best_performance, 4)))
             save_best = os.path.join(self.args.snapshot_path, 'client_{}_async_{}_best_model.pth'.format(self.cid, self.args.model))
-            torch.save(state_dict, save_mode_path)
-            torch.save(state_dict, save_best)
-            log(INFO, 'save model to {}'.format(save_mode_path))
+            atomic_torch_save(state_dict, save_best)
+            if int(getattr(self.args, 'save_checkpoint_copies', 1)) == 1:
+                torch.save(state_dict, save_mode_path)
+                log(INFO, 'save model to {}'.format(save_mode_path))
+            else:
+                log(INFO, 'save best model to {}'.format(save_best))
 
         if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+            and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
             and (self.current_iter % self.args.tsne_iters == 0):
             tsne_feature_ = tsne_feature(self.args, self.model, self.valloader, self.amp)
             val_metrics['tsne_feature'] = fl.common.ndarray_to_bytes(tsne_feature_.cpu().numpy())
@@ -176,7 +196,18 @@ def tsne_feature(args, model, dataloader, amp=False):
     return all_feature_lc
 
 
-def tsne(n_components, data, label, list):
+def format_site_name(client_id):
+    if client_id < 26:
+        return f"Site {chr(ord('A') + client_id)}"
+    return f"Site {client_id + 1}"
+
+
+def build_site_markers(site_names):
+    marker_cycle = ["o", "v", "H", "s", "^", "P", "X", "D", "<", ">", "*", "p", "8"]
+    return {site_name: marker_cycle[idx % len(marker_cycle)] for idx, site_name in enumerate(site_names)}
+
+
+def tsne(n_components, data, label, site_labels):
     params = {
         'font.family':'',
         'font.serif':'',
@@ -193,15 +224,17 @@ def tsne(n_components, data, label, list):
 
         df = pd.DataFrame(z)
         df['label'] = label
-        df['list'] = list
-        # palet = sns.color_palette("hls",2)
-        # flatui = ['#f3a598', '#faaf42','#480080','#0fa14a','#7a7c7f']
-        flatui = ['#f3a598', '#66c7df','#faaf42','#9659ef','#11b855']
-        palet = sns.color_palette(flatui)
-        markers = {'Site A': "o", 'Site B': 'v', 'Site C': 'H', 'Site D': 's', 'Site E': '^'}
+        df['list'] = site_labels
+        site_names = list(dict.fromkeys(site_labels))
+        flatui = ['#f3a598', '#66c7df', '#faaf42', '#9659ef', '#11b855', '#7a7c7f', '#d65f5f', '#2f7f5f']
+        if len(site_names) <= len(flatui):
+            palet = sns.color_palette(flatui[:len(site_names)])
+        else:
+            palet = sns.color_palette("husl", len(site_names))
+        markers = build_site_markers(site_names)
         alpha = 0.8
 
-        sns.scatterplot(x=z[:,0], y=z[:,1], hue=list, style=list, markers=markers, linewidth = 0.1, 
+        sns.scatterplot(x=z[:,0], y=z[:,1], hue=site_labels, style=site_labels, markers=markers, linewidth = 0.1,
                         palette=palet, alpha=alpha, data=df)
 
         plt.xlim(-150, 150)
@@ -222,6 +255,14 @@ def tsne(n_components, data, label, list):
 
 
 VAL_METRICS = ['dice', 'hd95', 'recall', 'precision', 'jc', 'specificity', 'ravd']
+
+
+def _unpack_rgftd_stable_snapshot(blob):
+    with np.load(io.BytesIO(blob)) as payload:
+        keys = sorted(payload.files, key=lambda item: int(item.split('_')[-1]))
+        return [payload[key].copy() for key in keys]
+
+
 def evaluate(args, model, dataloader, amp=False):
     metric_list = 0.0
     metrics_ = {}
@@ -301,6 +342,12 @@ class MyServer(Server):
         self.train_scalar_metrics = train_scalar_metrics
         self.train_image_metrics = train_image_metrics
         self.val_metrics = val_metrics
+        self.rgftd_teacher_ndarrays = None
+        self.rgftd_teacher_bank_ndarrays = {}
+        self.rgftd_stable_teacher_bank_ndarrays = {}
+        self.rgftd_stable_teacher_valids = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
+        self.rgftd_stable_teacher_scores = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
+        self._missing_train_metric_warnings = set()
 
     # pylint: disable=too-many-locals
     def fit(self, num_rounds, timeout):
@@ -310,6 +357,19 @@ class MyServer(Server):
         # Initialize parameters
         log(INFO, 'Initializing global parameters')
         self.parameters = self._get_initial_parameters(timeout=timeout)
+        if self._rgftd_enabled():
+            if self._rgftd_v3_enabled():
+                if self._rgftd_v3_stable_enabled():
+                    global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+                    self.rgftd_stable_teacher_bank_ndarrays = {
+                        client_id: [array.copy() for array in global_arrays]
+                        for client_id in range(self.args.min_num_clients)
+                    }
+                else:
+                    self._init_rgftd_teacher_bank(self.parameters)
+            self.rgftd_teacher_ndarrays = [
+                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+            ]
         log(INFO, 'Evaluating initial parameters')
         res = self.strategy.evaluate(0, parameters=self.parameters)
         print(res)
@@ -393,20 +453,42 @@ class MyServer(Server):
         for current_round in iterator:
             iter_num = current_round
             # Train model and replace previous global model
+            parameters_before_fit = self.parameters
             res_fit = self.fit_round(server_round=current_round, timeout=timeout)
             if res_fit[0] is None:
                 log(INFO, 'round {}: fit failed'.format(current_round))
                 continue
 
             parameters_prime, metrics_prime, (results_prime, failtures_prime) = res_fit
+            if getattr(self.args, 'wann_enabled', 0) == 1:
+                self._append_wann_update_diagnostics(metrics_prime, results_prime, parameters_before_fit)
             self.parameters = parameters_prime
+            if self._rgftd_enabled():
+                if self._rgftd_v3_enabled():
+                    if self._rgftd_v3_stable_enabled():
+                        self._update_rgftd_stable_teacher_bank(results_prime)
+                    else:
+                        self._update_rgftd_teacher_bank(results_prime)
+                self._update_rgftd_teacher(self.parameters)
             images = []
             if self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
                 prompts_list = []
 
             for client_id in client_id_list:
                 for metric_name in self.train_scalar_metrics:
-                    self.writer.add_scalar('info/client_{}_{}'.format(client_id, metric_name), metrics_prime['client_{}_{}'.format(client_id, metric_name)], iter_num)
+                    metric_key = 'client_{}_{}'.format(client_id, metric_name)
+                    if metric_key not in metrics_prime:
+                        if metric_name.startswith('rgftd_v3_') or metric_name.startswith('rgftd_refine_'):
+                            warn_key = (client_id, metric_name)
+                            if warn_key not in self._missing_train_metric_warnings:
+                                log(WARNING, 'Missing optional RGFTD metric %s; writing 0.0 to keep training alive', metric_key)
+                                self._missing_train_metric_warnings.add(warn_key)
+                            metric_value = 0.0
+                        else:
+                            raise KeyError(metric_key)
+                    else:
+                        metric_value = metrics_prime[metric_key]
+                    self.writer.add_scalar('info/client_{}_{}'.format(client_id, metric_name), metric_value, iter_num)
                 for metric_name in self.train_image_metrics:
                     images.append(fl.common.bytes_to_ndarray(metrics_prime['client_{}_{}'.format(client_id, metric_name)]))
 
@@ -474,8 +556,8 @@ class MyServer(Server):
                                         evaluate_metrics_fed['client_{}_val_mean_dice'.format(client_id)], iter_num)
 
                 if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+                    and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
                     and (iter_num % self.args.tsne_iters == 0):
-                    site_list = ['Site A', 'Site B', 'Site C', 'Site D', 'Site E']
                     tsne_feature_list = []
                     labels = []
                     sites = []
@@ -483,7 +565,7 @@ class MyServer(Server):
                         tsne_feature = fl.common.bytes_to_ndarray(evaluate_metrics_fed['client_{}_tsne_feature'.format(client_id)])
                         tsne_feature_list.append(tsne_feature)
                         labels += [client_id + 1] * tsne_feature.shape[0]
-                        sites += [site_list[client_id]] * tsne_feature.shape[0]
+                        sites += [format_site_name(client_id)] * tsne_feature.shape[0]
 
                     all_tsne_feature = np.concatenate(tsne_feature_list, axis=0)
                     # print(labels, sites)
@@ -520,9 +602,12 @@ class MyServer(Server):
                         save_mode_path = os.path.join(snapshot_path, 'iter_{}_dice_{}.pth'.format(
                                                     iter_num, round(best_performance, 4)))
                         save_best = os.path.join(snapshot_path, '{}_best_model.pth'.format(self.args.model))
-                        torch.save(state_dict, save_mode_path)
-                        torch.save(state_dict, save_best)
-                        log(INFO, 'save model to {}'.format(save_mode_path))
+                        atomic_torch_save(state_dict, save_best)
+                        if int(getattr(self.args, 'save_checkpoint_copies', 1)) == 1:
+                            torch.save(state_dict, save_mode_path)
+                            log(INFO, 'save model to {}'.format(save_mode_path))
+                        else:
+                            log(INFO, 'save best model to {}'.format(save_best))
 
                     for client_id in client_id_list:
                         first_metric_name = 'client_{}_{}'.format(client_id, self.train_scalar_metrics[0])
@@ -538,11 +623,14 @@ class MyServer(Server):
                                 ))
                                 client_save_best = os.path.join(snapshot_path, 'client_{}_{}_best_model.pth'.format(
                                                                 client_id, self.args.model))
-                                torch.save(client_state_dict, client_save_mode_path)
-                                torch.save(client_state_dict, client_save_best)
-                                log(INFO, 'save model to {}'.format(client_save_mode_path))
+                                atomic_torch_save(client_state_dict, client_save_best)
+                                if int(getattr(self.args, 'save_checkpoint_copies', 1)) == 1:
+                                    torch.save(client_state_dict, client_save_mode_path)
+                                    log(INFO, 'save model to {}'.format(client_save_mode_path))
+                                else:
+                                    log(INFO, 'save best model to {}'.format(client_save_best))
 
-            if iter_num > 0 and iter_num % 3000 == 0:
+            if int(getattr(self.args, 'save_checkpoint_copies', 1)) == 1 and iter_num > 0 and iter_num % 3000 == 0:
                 if self.args.strategy not in PERSONALIZED_FL:
                     state_dict = parameters_to_state_dict(self.parameters)
                     save_mode_path = os.path.join(snapshot_path, 'iter_{}.pth'.format(iter_num))
@@ -646,6 +734,41 @@ class MyServer(Server):
                 weight_list.append(performance_array)
                 prompts_array = np.mean(prompts_list, axis=0)
                 weight_list.append(prompts_array)
+                if self._rgftd_enabled():
+                    if self._rgftd_v3_enabled():
+                        if self._rgftd_v3_stable_enabled():
+                            if not self.rgftd_stable_teacher_bank_ndarrays:
+                                global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+                                self.rgftd_stable_teacher_bank_ndarrays = {
+                                    client_id: [array.copy() for array in global_arrays]
+                                    for client_id in client_id_list
+                                }
+                            teacher_bank = self.rgftd_stable_teacher_bank_ndarrays
+                        else:
+                            if not self.rgftd_teacher_bank_ndarrays:
+                                self._init_rgftd_teacher_bank(self.parameters)
+                            teacher_bank = self.rgftd_teacher_bank_ndarrays
+                        for client_id in client_id_list:
+                            teacher_arrays = teacher_bank.get(client_id, None)
+                            if teacher_arrays is None:
+                                teacher_arrays = [
+                                    array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                                ]
+                            weight_list += [array.copy() for array in teacher_arrays]
+                        if self._rgftd_v3_stable_enabled():
+                            weight_list.append(self.rgftd_stable_teacher_valids.astype(np.float32).copy())
+                            weight_list.append(self.rgftd_stable_teacher_scores.astype(np.float32).copy())
+                        if self.rgftd_teacher_ndarrays is None:
+                            self.rgftd_teacher_ndarrays = [
+                                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                            ]
+                        weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
+                    else:
+                        if self.rgftd_teacher_ndarrays is None:
+                            self.rgftd_teacher_ndarrays = [
+                                array.copy() for array in self._extract_global_ndarrays_for_rgftd(self.parameters)
+                            ]
+                        weight_list += [array.copy() for array in self.rgftd_teacher_ndarrays]
                 self.parameters = ndarrays_to_parameters(weight_list)
                 '''print(iter_num, 'val_dice_list', val_dice_list)
                 print(iter_num, 'performance_array', performance_array)'''
@@ -659,6 +782,185 @@ class MyServer(Server):
         elapsed = end_time - start_time
         log(INFO, 'FL finished in %s', elapsed)
         return history
+
+    def _rgftd_enabled(self):
+        return int(getattr(self.args, 'rgftd_enabled', 0)) == 1
+
+    def _rgftd_v3_enabled(self):
+        return self._rgftd_enabled() and int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1
+
+    def _rgftd_v3_stable_enabled(self):
+        return self._rgftd_v3_enabled() and int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
+
+    def _extract_global_ndarrays_for_rgftd(self, parameters):
+        arrays = parameters_to_ndarrays(parameters)
+        num_weights = len(self.state_dict_keys)
+        if len(arrays) == num_weights:
+            return arrays
+        start_idx = self.args.min_num_clients * num_weights
+        end_idx = start_idx + num_weights
+        if len(arrays) >= end_idx:
+            return arrays[start_idx:end_idx]
+        return arrays[:num_weights]
+
+    def _init_rgftd_teacher_bank(self, parameters):
+        global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
+        self.rgftd_teacher_bank_ndarrays = {
+            client_id: [array.copy() for array in global_arrays]
+            for client_id in range(self.args.min_num_clients)
+        }
+
+    def _client_id_from_fit_metrics(self, metrics):
+        for client_id in range(self.args.min_num_clients):
+            if 'client_{}_lr'.format(client_id) in metrics:
+                return client_id
+        return None
+
+    def _update_rgftd_teacher_bank(self, results_prime):
+        if not self.rgftd_teacher_bank_ndarrays:
+            self._init_rgftd_teacher_bank(self.parameters)
+        decay = float(getattr(self.args, 'rgftd_teacher_ema_decay', 0.99))
+        for _, fit_res in results_prime:
+            client_id = self._client_id_from_fit_metrics(fit_res.metrics)
+            if client_id is None:
+                continue
+            client_arrays = parameters_to_ndarrays(fit_res.parameters)
+            teacher_arrays = self.rgftd_teacher_bank_ndarrays.get(client_id, None)
+            if teacher_arrays is None or len(teacher_arrays) != len(client_arrays):
+                self.rgftd_teacher_bank_ndarrays[client_id] = [array.copy() for array in client_arrays]
+                continue
+            updated = []
+            for teacher_array, client_array in zip(teacher_arrays, client_arrays):
+                if teacher_array.shape != client_array.shape:
+                    updated.append(client_array.copy())
+                elif np.issubdtype(client_array.dtype, np.floating):
+                    updated.append((decay * teacher_array + (1.0 - decay) * client_array).astype(client_array.dtype))
+                else:
+                    updated.append(client_array.copy())
+            self.rgftd_teacher_bank_ndarrays[client_id] = updated
+
+    def _update_rgftd_stable_teacher_bank(self, results_prime):
+        if not self.rgftd_stable_teacher_bank_ndarrays:
+            global_arrays = self._extract_global_ndarrays_for_rgftd(self.parameters)
+            self.rgftd_stable_teacher_bank_ndarrays = {
+                client_id: [array.copy() for array in global_arrays]
+                for client_id in range(self.args.min_num_clients)
+            }
+        for _, fit_res in results_prime:
+            client_id = self._client_id_from_fit_metrics(fit_res.metrics)
+            if client_id is None:
+                continue
+            valid_key = 'client_{}_rgftd_stable_valid'.format(client_id)
+            score_key = 'client_{}_rgftd_stable_best_score'.format(client_id)
+            updated_key = 'client_{}_rgftd_stable_updated'.format(client_id)
+            snapshot_key = 'client_{}_rgftd_stable_snapshot'.format(client_id)
+            stable_valid = float(fit_res.metrics.get(valid_key, 0.0))
+            stable_score = float(fit_res.metrics.get(score_key, 0.0))
+            stable_updated = float(fit_res.metrics.get(updated_key, 0.0))
+            if stable_updated <= 0.5:
+                if stable_valid > 0.5 and self.rgftd_stable_teacher_valids[client_id] > 0.5:
+                    self.rgftd_stable_teacher_scores[client_id] = max(
+                        float(self.rgftd_stable_teacher_scores[client_id]),
+                        stable_score,
+                    )
+                continue
+            if snapshot_key not in fit_res.metrics:
+                log(WARNING, 'Missing RGFTD stable snapshot for updated client %s; keeping previous teacher bank entry', client_id)
+                continue
+            try:
+                client_arrays = _unpack_rgftd_stable_snapshot(fit_res.metrics[snapshot_key])
+            except Exception as exc:  # pylint: disable=broad-except
+                log(WARNING, 'Failed to unpack RGFTD stable snapshot for client %s: %s', client_id, exc)
+                continue
+            if len(client_arrays) != len(self.state_dict_keys):
+                log(
+                    WARNING,
+                    'Invalid RGFTD stable snapshot length for client %s: %s != %s',
+                    client_id,
+                    len(client_arrays),
+                    len(self.state_dict_keys),
+                )
+                continue
+            self.rgftd_stable_teacher_bank_ndarrays[client_id] = [
+                array.copy() for array in client_arrays
+            ]
+            self.rgftd_stable_teacher_scores[client_id] = stable_score
+            self.rgftd_stable_teacher_valids[client_id] = 1.0
+
+    def _update_rgftd_teacher(self, parameters):
+        global_arrays = self._extract_global_ndarrays_for_rgftd(parameters)
+        if self.rgftd_teacher_ndarrays is None or len(self.rgftd_teacher_ndarrays) != len(global_arrays):
+            self.rgftd_teacher_ndarrays = [array.copy() for array in global_arrays]
+            return
+
+        decay = float(getattr(self.args, 'rgftd_teacher_ema_decay', 0.99))
+        updated = []
+        for teacher_array, global_array in zip(self.rgftd_teacher_ndarrays, global_arrays):
+            if teacher_array.shape != global_array.shape:
+                updated.append(global_array.copy())
+            elif np.issubdtype(global_array.dtype, np.floating):
+                updated.append((decay * teacher_array + (1.0 - decay) * global_array).astype(global_array.dtype))
+            else:
+                updated.append(global_array.copy())
+        self.rgftd_teacher_ndarrays = updated
+
+    def _append_wann_update_diagnostics(self, metrics_prime, results_prime, parameters_before_fit):
+        for client_id in range(self.args.min_num_clients):
+            metrics_prime.setdefault('client_{}_wann_update_norm'.format(client_id), 0.0)
+            metrics_prime.setdefault('client_{}_wann_update_cos_loo'.format(client_id), 0.0)
+            metrics_prime.setdefault('client_{}_wann_update_conflict'.format(client_id), 0.0)
+        if not results_prime or parameters_before_fit is None:
+            return
+
+        def client_id_from_metrics(metrics):
+            for client_id in range(self.args.min_num_clients):
+                if 'client_{}_lr'.format(client_id) in metrics:
+                    return client_id
+            return None
+
+        client_items = []
+        for _, fit_res in results_prime:
+            client_id = client_id_from_metrics(fit_res.metrics)
+            if client_id is not None:
+                client_items.append((client_id, parameters_to_ndarrays(fit_res.parameters)))
+        if len(client_items) < 2:
+            return
+
+        client_items = sorted(client_items, key=lambda item: item[0])
+        num_layers = len(client_items[0][1])
+        prev_arrays = parameters_to_ndarrays(parameters_before_fit)
+        if len(prev_arrays) == num_layers:
+            global_arrays = prev_arrays
+        elif len(prev_arrays) >= (self.args.min_num_clients + 1) * num_layers:
+            start_idx = self.args.min_num_clients * num_layers
+            global_arrays = prev_arrays[start_idx:start_idx + num_layers]
+        else:
+            return
+
+        deltas = []
+        for _, weights in client_items:
+            if len(weights) != num_layers:
+                return
+            flat_parts = []
+            for w_client, w_global in zip(weights, global_arrays):
+                if w_client.shape != w_global.shape or not np.issubdtype(w_client.dtype, np.number):
+                    continue
+                flat_parts.append((w_client.astype(np.float32) - w_global.astype(np.float32)).reshape(-1))
+            if not flat_parts:
+                return
+            deltas.append(np.concatenate(flat_parts))
+
+        for idx, (client_id, _) in enumerate(client_items):
+            delta_i = deltas[idx]
+            others = [deltas[j] for j in range(len(deltas)) if j != idx]
+            delta_without_i = np.mean(others, axis=0)
+            norm_i = float(np.linalg.norm(delta_i))
+            norm_without_i = float(np.linalg.norm(delta_without_i))
+            denom = max(norm_i * norm_without_i, 1e-12)
+            cos_loo = float(np.dot(delta_i, delta_without_i) / denom)
+            metrics_prime['client_{}_wann_update_norm'.format(client_id)] = norm_i
+            metrics_prime['client_{}_wann_update_cos_loo'.format(client_id)] = cos_loo
+            metrics_prime['client_{}_wann_update_conflict'.format(client_id)] = 1.0 if cos_loo < 0.0 else 0.0
 
 
 def fit_metrics_aggregation_fn(fit_metrics):
@@ -1246,6 +1548,13 @@ class MyModel(nn.Module):
         self.trainloader = trainloader
         self.valloader = valloader
         self.amp=(args.amp == 1)
+        self.rgftd_teacher_state_dict = None
+        self.rgftd_teacher_state_dicts = {}
+        self.rgftd_teacher_valids = {}
+        self.rgftd_teacher_scores = {}
+        self.ala_last_epochs = 0
+        self.ala_last_std = 0.0
+        self.ala_hit_max_epochs = 0
         if self.amp:
             self.scaler = GradScaler()
 
@@ -1303,6 +1612,10 @@ class MyModel(nn.Module):
 
     def set_weights(self, weights, config):
         # print('Setting weights')
+        self.rgftd_teacher_state_dict = None
+        self.rgftd_teacher_state_dicts = {}
+        self.rgftd_teacher_valids = {}
+        self.rgftd_teacher_scores = {}
         # MetaFed
         if self.args.strategy == 'MetaFed':
             def get_teacher_id_v1(weight_dict):
@@ -1458,6 +1771,72 @@ class MyModel(nn.Module):
                         all_state_dict_temp = {}
                         num_weights = len(self.model.state_dict().items())
                         print(num_weights)
+                        expected_without_rgftd = (self.args.min_num_clients + 1) * num_weights + 2
+                        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+                            if int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1:
+                                expected_with_bank = expected_without_rgftd + self.args.min_num_clients * num_weights
+                                if len(weights) >= expected_with_bank:
+                                    teacher_bank_start = expected_without_rgftd
+                                    for teacher_client_id in self.client_id_list:
+                                        start_teacher = teacher_bank_start + teacher_client_id * num_weights
+                                        end_teacher = start_teacher + num_weights
+                                        self.rgftd_teacher_state_dicts[teacher_client_id] = OrderedDict({
+                                            k: torch.tensor(v)
+                                            for k, v in zip(
+                                                self.model.state_dict().keys(),
+                                                weights[start_teacher:end_teacher],
+                                            )
+                                        })
+                                metadata_start = expected_with_bank
+                                if (
+                                    int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
+                                    and len(weights) >= expected_with_bank + 2
+                                ):
+                                    valid_array = np.asarray(weights[metadata_start]).reshape(-1)
+                                    score_array = np.asarray(weights[metadata_start + 1]).reshape(-1)
+                                    self.rgftd_teacher_valids = {
+                                        client_id: float(valid_array[client_id])
+                                        if client_id < len(valid_array) else 0.0
+                                        for client_id in self.client_id_list
+                                    }
+                                    self.rgftd_teacher_scores = {
+                                        client_id: float(score_array[client_id])
+                                        if client_id < len(score_array) else 0.0
+                                        for client_id in self.client_id_list
+                                    }
+                                    metadata_start += 2
+                                else:
+                                    self.rgftd_teacher_valids = {
+                                        client_id: 1.0 for client_id in self.client_id_list
+                                    }
+                                    self.rgftd_teacher_scores = {
+                                        client_id: 0.0 for client_id in self.client_id_list
+                                    }
+                                expected_with_bank_and_fallback = metadata_start + num_weights
+                                if len(weights) >= expected_with_bank_and_fallback:
+                                    fallback_start = metadata_start
+                                    fallback_end = fallback_start + num_weights
+                                    self.rgftd_teacher_state_dict = OrderedDict({
+                                        k: torch.tensor(v)
+                                        for k, v in zip(
+                                            self.model.state_dict().keys(),
+                                            weights[fallback_start:fallback_end],
+                                        )
+                                    })
+                                else:
+                                    server_start = self.args.min_num_clients * num_weights
+                                    server_end = server_start + num_weights
+                                    self.rgftd_teacher_state_dict = OrderedDict({
+                                        k: torch.tensor(v)
+                                        for k, v in zip(
+                                            self.model.state_dict().keys(),
+                                            weights[server_start:server_end],
+                                        )
+                                    })
+                            elif len(weights) >= expected_without_rgftd + num_weights:
+                                self.rgftd_teacher_state_dict = OrderedDict({
+                                    k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), weights[-num_weights:])
+                                })
                         for client_id in self.client_id_list:
                             start_idx = 0 + client_id * num_weights
                             end_idx = num_weights + client_id * num_weights
@@ -1635,6 +2014,10 @@ class MyModel(nn.Module):
             # weight learning
             losses = []
             count = 0
+            self.ala_last_epochs = 0
+            self.ala_last_std = 0.0
+            self.ala_hit_max_epochs = 0
+            ala_max_epochs = int(getattr(self.args, 'ala_max_epochs', 0))
             while True:
                 for i_batch, sampled_batch in enumerate(self.trainloader):
 
@@ -1675,17 +2058,26 @@ class MyModel(nn.Module):
 
                 losses.append(loss.item())
                 count += 1
+                current_std = float(np.std(losses[-num_pre_loss:]))
+                self.ala_last_epochs = count
+                self.ala_last_std = current_std
 
-                print('Client:', self.args.cid, '\tStd:', np.std(losses[-num_pre_loss:]),
+                print('Client:', self.args.cid, '\tStd:', current_std,
                     '\tALA epochs:', count, self.start_phase)
 
                 # only train one epoch in the subsequent iterations
                 if not self.start_phase:
                     break
 
+                if ala_max_epochs > 0 and count >= ala_max_epochs:
+                    self.ala_hit_max_epochs = 1
+                    print('Client:', self.args.cid, '\tStd:', current_std,
+                        '\tALA max epochs reached:', ala_max_epochs)
+                    break
+
                 # train the weight until convergence
-                if len(losses) > num_pre_loss and np.std(losses[-num_pre_loss:]) < threshold:
-                    print('Client:', self.args.cid, '\tStd:', np.std(losses[-num_pre_loss:]),
+                if len(losses) > num_pre_loss and current_std < threshold:
+                    print('Client:', self.args.cid, '\tStd:', current_std,
                         '\tALA epochs:', count)
                     break
 

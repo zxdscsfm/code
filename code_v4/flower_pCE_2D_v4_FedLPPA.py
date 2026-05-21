@@ -1,5 +1,6 @@
 # -*- coding:utf-8 -*-
 import argparse
+import io
 import logging
 import os
 import random
@@ -23,6 +24,26 @@ from torchvision import transforms
 import flwr as fl
 from flwr.common.logger import log
 from flwr.server import ServerConfig
+
+
+class NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def add_image(self, *args, **kwargs):
+        pass
+
+    def add_figure(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def build_summary_writer(args, log_dir):
+    if int(getattr(args, 'disable_tensorboard', 0)) == 1:
+        return NullSummaryWriter()
+    return SummaryWriter(log_dir)
 from flwr.server.client_manager import SimpleClientManager
 from collections import OrderedDict
 from logging import DEBUG, INFO
@@ -39,7 +60,270 @@ from utils.gate_crf_loss import ModelLossSemsegGatedCRF
 from flower_common_v4 import (BaseClient, MyModel, fit_metrics_aggregation_fn, TreeEnergyLoss, MScaleRecurveTreeEnergyLoss, evaluate, get_evaluate_fn,
                         get_strategy, MyServer, VAL_METRICS, get_fedrep_local_keys, get_evaluate_metrics_aggregation_fn,
                         get_bn_stats)
+from weak_annotation_reliability import (
+    build_wann_maps,
+    consistency_loss as wann_consistency_loss,
+    soft_band_loss as wann_soft_band_loss,
+    weighted_ce_loss as wann_weighted_ce_loss,
+)
+from rgftd_reliability_distillation import get_rgftd_lambda, rgftd_loss, zero_rgftd_profile
 
+
+def _primary_logits(model_out):
+    if torch.is_tensor(model_out):
+        return model_out
+    return model_out[0]
+
+
+def _aux_logits(model_out):
+    if torch.is_tensor(model_out):
+        return model_out
+    if isinstance(model_out, (list, tuple)) and len(model_out) >= 9:
+        return model_out[8]
+    return model_out[0]
+
+
+def _average_rgftd_profiles(profile_a, profile_b):
+    return {
+        key: 0.5 * (profile_a[key] + profile_b[key])
+        for key in profile_a.keys()
+    }
+
+
+def _scalar_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _normalize_gate_scalar(score, floor):
+    floor = float(max(min(floor, 0.999999), 0.0))
+    return max(0.0, min((float(score) - floor) / max(1.0 - floor, 1e-6), 1.0))
+
+
+def _pack_rgftd_stable_snapshot(arrays):
+    buffer = io.BytesIO()
+    payload = {'arr_{}'.format(idx): array for idx, array in enumerate(arrays)}
+    np.savez_compressed(buffer, **payload)
+    return buffer.getvalue()
+
+
+def _default_rgftd_v3_status():
+    return {
+        'v3_pool_size': 0.0,
+        'v3_pool_stable': 0.0,
+        'v3_no_teacher': 1.0,
+        'v3_fallback_teacher': 0.0,
+        'v3_teacher_source': 0.0,
+        'v3_selected_teacher': -1.0,
+        'v3_selected_score': 0.0,
+        'v3_selected_stable_score': 0.0,
+        'v3_best_failed_teacher': -1.0,
+        'v3_best_failed_score': 0.0,
+        'v3_routing_score': 0.0,
+        'v3_audit_seed_fg_prob_mean': 0.0,
+        'v3_audit_seed_fg_margin_mean': 0.0,
+        'v3_audit_seed_fg_recall': 0.0,
+        'v3_audit_core_conflict': 0.0,
+        'v3_audit_core_valid': 0.0,
+        'v3_audit_teacher_reliability': 0.0,
+        'v3_audit_release_factor': 0.0,
+        'v3_lease_active': 0.0,
+        'v3_lease_age': 0.0,
+        'v3_benefit_score': 1.0,
+        'v3_window_score': 1.0,
+        'v3_stability_score': 1.0,
+        'v3_teacher_renew': 0.0,
+        'v3_teacher_revoke': 0.0,
+        'v3_teacher_decay': 0.0,
+        'v3_cap_current': 0.0,
+        'v3_cap_scale': 1.0,
+        'v3_ret0_ratio': 0.0,
+        'v3_cap_hit_ratio': 0.0,
+        'v3_bgfg_window': 0.0,
+        'v3_lowmaxp_delta': 0.0,
+        'v3_wann_mass_delta': 0.0,
+        'stable_valid': 0.0,
+        'stable_score': 0.0,
+        'stable_best_score': 0.0,
+        'stable_updated': 0.0,
+    }
+
+
+def _attach_rgftd_v3_status(profile, status, device):
+    merged = dict(profile)
+    full_status = _default_rgftd_v3_status()
+    if status is not None:
+        full_status.update(status)
+    for key, value in full_status.items():
+        merged[key] = torch.tensor(float(value), device=device)
+    return merged
+
+
+def _rgftd_class_ids_from_profile(rgftd_profile):
+    class_ids = []
+    if rgftd_profile is None:
+        return class_ids
+    for key in rgftd_profile.keys():
+        if not key.startswith('teacher_class') or not key.endswith('_reliability'):
+            continue
+        middle = key[len('teacher_class'):-len('_reliability')]
+        if middle.isdigit():
+            class_ids.append(int(middle))
+    return sorted(set(class_ids))
+
+
+def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile):
+    parts = [
+        'client %d : iteration %d : WANN/RGFTD' % (cid, iter_num),
+    ]
+    if wann_maps is not None:
+        wann_profile = wann_maps.profile
+        parts.extend([
+            'wann_mass=%.4f' % _scalar_float(wann_profile.get('effective_supervision_mass', 0.0)),
+            'wann_core=%.4f' % _scalar_float(wann_profile.get('core_ratio', 0.0)),
+            'wann_soft=%.4f' % _scalar_float(wann_profile.get('soft_ratio', 0.0)),
+            'wann_low=%.4f' % _scalar_float(wann_profile.get('low_weight_ratio', 0.0)),
+            'wann_low_maxp=%.4f' % _scalar_float(wann_profile.get('max_prob_low_r', 0.0)),
+        ])
+    if rgftd_profile is not None:
+        parts.extend([
+            'rgftd_lambda=%.6f' % float(lambda_rgftd),
+            'rgftd_lambda_pre=%.6f' % _scalar_float(rgftd_profile.get('lambda_pre_safety', 0.0)),
+            'rgftd_lambda_safe=%.6f' % _scalar_float(rgftd_profile.get('lambda_after_safety', 0.0)),
+            'rgftd_lambda_eff=%.6f' % _scalar_float(rgftd_profile.get('lambda_effective', lambda_rgftd)),
+            'rgftd_core_safe=%.6f' % _scalar_float(rgftd_profile.get('core_safety_factor', 0.0)),
+            'rgftd_relf=%.6f' % _scalar_float(rgftd_profile.get('release_factor', 0.0)),
+            'rgftd_relq=%.6f' % _scalar_float(rgftd_profile.get('release_quality', 0.0)),
+            'rgftd_relmin=%.6f' % _scalar_float(rgftd_profile.get('release_min_effective', 0.0)),
+            'rgftd_loss=%.6f' % _scalar_float(rgftd_profile.get('loss', 0.0)),
+            'rgftd_teacher_active_loss=%.6f' % _scalar_float(rgftd_profile.get('teacher_active_loss', 0.0)),
+            'rgftd_region=%.6f' % _scalar_float(rgftd_profile.get('region_ratio', 0.0)),
+            'rgftd_risk_region_ratio=%.6f' % _scalar_float(rgftd_profile.get('risk_region_ratio', 0.0)),
+            'rgftd_preserve_region_ratio=%.6f' % _scalar_float(rgftd_profile.get('preserve_region_ratio', 0.0)),
+            'rgftd_active=%.6f' % _scalar_float(rgftd_profile.get('active_ratio', 0.0)),
+            'rgftd_teacher_accept_ratio=%.6f' % _scalar_float(rgftd_profile.get('teacher_accept_ratio', 0.0)),
+            'rgftd_teacher_reject_ratio=%.6f' % _scalar_float(rgftd_profile.get('teacher_reject_ratio', 0.0)),
+            'rgftd_reject_by_support=%.6f' % _scalar_float(rgftd_profile.get('reject_by_support', 0.0)),
+            'rgftd_reject_by_core_conflict=%.6f' % _scalar_float(rgftd_profile.get('reject_by_core_conflict', 0.0)),
+            'rgftd_reject_by_fg_ratio=%.6f' % _scalar_float(rgftd_profile.get('reject_by_fg_ratio', 0.0)),
+            'rgftd_t_rel=%.6f' % _scalar_float(rgftd_profile.get('teacher_reliability', 0.0)),
+            'rgftd_t_core=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_agreement', 0.0)),
+            'rgftd_t_core_cf=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_conflict', 0.0)),
+            'rgftd_t_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_agreement', 0.0)),
+            'rgftd_t_fg_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_fg_recall', 0.0)),
+            'rgftd_t_bg_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_support_bg_agreement', 0.0)),
+            'rgftd_t_seed_sup=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_agreement', 0.0)),
+            'rgftd_t_seed_fg=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_recall', 0.0)),
+            'rgftd_t_seed_fgp=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_prob_mean', 0.0)),
+            'rgftd_t_seed_fgc=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_conf_mean', 0.0)),
+            'rgftd_t_seed_fgm=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_fg_margin_mean', 0.0)),
+            'rgftd_t_seed_bg=%.6f' % _scalar_float(rgftd_profile.get('teacher_seed_support_bg_agreement', 0.0)),
+            'rgftd_t_fg=%.6f' % _scalar_float(rgftd_profile.get('teacher_foreground_ratio', 0.0)),
+            'rgftd_a_fg=%.6f' % _scalar_float(rgftd_profile.get('active_foreground_ratio', 0.0)),
+            'rgftd_a_bg=%.6f' % _scalar_float(rgftd_profile.get('active_background_ratio', 0.0)),
+            'rgftd_bg_sup=%.6f' % _scalar_float(rgftd_profile.get('background_suppression_mean', 0.0)),
+            'rgftd_veto=%.1f' % _scalar_float(rgftd_profile.get('foreground_veto_ratio', 0.0)),
+            'rgftd_core_veto=%.1f' % _scalar_float(rgftd_profile.get('core_conflict_veto_ratio', 0.0)),
+            'rgftd_spatial=%.6f' % _scalar_float(rgftd_profile.get('spatial_support_ratio', 0.0)),
+            'rgftd_spw=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_mean', 0.0)),
+            'rgftd_spw_cand=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_candidate_mean', 0.0)),
+            'rgftd_spw_near=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_near_seed_mean', 0.0)),
+            'rgftd_spw_far=%.6f' % _scalar_float(rgftd_profile.get('spatial_weight_far_mean', 0.0)),
+            'rgftd_sp_loss=%.6f' % _scalar_float(rgftd_profile.get('spatial_loss_scale', 0.0)),
+            'rgftd_fg_pre_sp=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_spatial', 0.0)),
+            'rgftd_fg_sp_keep=%.6f' % _scalar_float(rgftd_profile.get('active_foreground_spatial_keep_ratio', 0.0)),
+            'rgftd_fg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_budget', 0.0)),
+            'rgftd_fg_budget=%.6f' % _scalar_float(rgftd_profile.get('foreground_budget_ratio', 0.0)),
+            'rgftd_fg_cand=%.6f' % _scalar_float(rgftd_profile.get('active_fg_candidate_ratio', 0.0)),
+            'rgftd_fg_fgcand=%.6f' % _scalar_float(rgftd_profile.get('active_fg_fg_candidate_ratio', 0.0)),
+            'rgftd_fg_near_seed=%.6f' % _scalar_float(rgftd_profile.get('active_fg_near_seed_ratio', 0.0)),
+            'rgftd_fg_seed_p=%.6f' % _scalar_float(rgftd_profile.get('active_fg_seed_precision', 0.0)),
+            'rgftd_ref=%.1f' % _scalar_float(rgftd_profile.get('refine_enabled', 0.0)),
+            'rgftd_ref_silent=%.1f' % _scalar_float(rgftd_profile.get('refine_silent', 0.0)),
+            'rgftd_ref_roi=%.6f' % _scalar_float(rgftd_profile.get('refine_roi_ratio', 0.0)),
+            'rgftd_ref_aff=%.6f' % _scalar_float(rgftd_profile.get('refine_affinity_mean', 0.0)),
+            'rgftd_tq_kl=%.6f' % _scalar_float(rgftd_profile.get('refine_teacher_q_kl', 0.0)),
+            'rgftd_q_ent=%.6f' % _scalar_float(rgftd_profile.get('refine_q_entropy_mean', 0.0)),
+            'rgftd_q_fg_mass=%.6f' % _scalar_float(rgftd_profile.get('refine_q_fg_mass', 0.0)),
+            'rgftd_q_fg_ratio=%.6f' % _scalar_float(rgftd_profile.get('refine_q_fg_ratio', 0.0)),
+            'rgftd_q_fg_delta=%.6f' % _scalar_float(rgftd_profile.get('refine_q_fg_delta', 0.0)),
+            'rgftd_q_seed_p=%.6f' % _scalar_float(rgftd_profile.get('refine_q_seed_precision', 0.0)),
+            'rgftd_q_seed_r=%.6f' % _scalar_float(rgftd_profile.get('refine_q_seed_recall', 0.0)),
+            'rgftd_q_cand=%.6f' % _scalar_float(rgftd_profile.get('refine_q_candidate_ratio', 0.0)),
+            'rgftd_q_near=%.6f' % _scalar_float(rgftd_profile.get('refine_q_near_seed_ratio', 0.0)),
+            'rgftd_q_unsup_fg=%.6f' % _scalar_float(rgftd_profile.get('refine_unsupported_fg_ratio', 0.0)),
+            'rgftd_q_unsup_s=%.6f' % _scalar_float(rgftd_profile.get('refine_unsupported_fg_scale', 0.0)),
+            'rgftd_q_core_cf=%.6f' % _scalar_float(rgftd_profile.get('refine_q_core_conflict', 0.0)),
+            'rgftd_fg_px_pre=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels_pre_return', 0.0)),
+            'rgftd_fg_px=%.1f' % _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0)),
+            'rgftd_bg_pre_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels_pre_budget', 0.0)),
+            'rgftd_bg_budget=%.6f' % _scalar_float(rgftd_profile.get('background_budget_ratio', 0.0)),
+            'rgftd_bg_px_pre=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels_pre_return', 0.0)),
+            'rgftd_bg_px=%.1f' % _scalar_float(rgftd_profile.get('active_background_pixels', 0.0)),
+            'rgftd_bgfg=%.6f' % _scalar_float(rgftd_profile.get('background_foreground_ratio', 0.0)),
+            'rgftd_bg_bal=%.6f' % _scalar_float(rgftd_profile.get('background_balance_factor', 0.0)),
+            'rgftd_ret=%.1f' % _scalar_float(rgftd_profile.get('return_reason', 0.0)),
+        ])
+        if 'v3_pool_size' in rgftd_profile:
+            parts.extend([
+                'rgftd_v3_pool=%.1f' % _scalar_float(rgftd_profile.get('v3_pool_size', 0.0)),
+                'rgftd_v3_pool_stable=%.1f' % _scalar_float(rgftd_profile.get('v3_pool_stable', 0.0)),
+                'rgftd_v3_silent=%.1f' % _scalar_float(rgftd_profile.get('v3_no_teacher', 1.0)),
+                'rgftd_v3_fb=%.1f' % _scalar_float(rgftd_profile.get('v3_fallback_teacher', 0.0)),
+                'rgftd_v3_src=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_source', 0.0)),
+                'rgftd_v3_tid=%.1f' % _scalar_float(rgftd_profile.get('v3_selected_teacher', -1.0)),
+                'rgftd_v3_score=%.6f' % _scalar_float(rgftd_profile.get('v3_selected_score', 0.0)),
+                'rgftd_v3_sel_stable=%.6f' % _scalar_float(rgftd_profile.get('v3_selected_stable_score', 0.0)),
+                'rgftd_v3_fail_tid=%.1f' % _scalar_float(rgftd_profile.get('v3_best_failed_teacher', -1.0)),
+                'rgftd_v3_fail_score=%.6f' % _scalar_float(rgftd_profile.get('v3_best_failed_score', 0.0)),
+                'rgftd_v3_seed_fgp=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_prob_mean', 0.0)),
+                'rgftd_v3_seed_fgm=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_margin_mean', 0.0)),
+                'rgftd_v3_seed_fg=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_seed_fg_recall', 0.0)),
+                'rgftd_v3_core_cf=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_core_conflict', 0.0)),
+                'rgftd_v3_core_valid=%.1f' % _scalar_float(rgftd_profile.get('v3_audit_core_valid', 0.0)),
+                'rgftd_v3_trel=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_teacher_reliability', 0.0)),
+                'rgftd_v3_relf=%.6f' % _scalar_float(rgftd_profile.get('v3_audit_release_factor', 0.0)),
+                'rgftd_v3_lease=%.1f' % _scalar_float(rgftd_profile.get('v3_lease_active', 0.0)),
+                'rgftd_v3_lease_age=%.1f' % _scalar_float(rgftd_profile.get('v3_lease_age', 0.0)),
+                'rgftd_v3_benefit=%.6f' % _scalar_float(rgftd_profile.get('v3_benefit_score', 1.0)),
+                'rgftd_v3_win=%.6f' % _scalar_float(rgftd_profile.get('v3_window_score', 1.0)),
+                'rgftd_v3_stab=%.6f' % _scalar_float(rgftd_profile.get('v3_stability_score', 1.0)),
+                'rgftd_v3_renew=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_renew', 0.0)),
+                'rgftd_v3_revoke=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_revoke', 0.0)),
+                'rgftd_v3_decay=%.1f' % _scalar_float(rgftd_profile.get('v3_teacher_decay', 0.0)),
+                'rgftd_v3_cap=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_current', 0.0)),
+                'rgftd_v3_cap_scale=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_scale', 1.0)),
+                'rgftd_v3_ret0=%.6f' % _scalar_float(rgftd_profile.get('v3_ret0_ratio', 0.0)),
+                'rgftd_v3_cap_hit=%.6f' % _scalar_float(rgftd_profile.get('v3_cap_hit_ratio', 0.0)),
+                'rgftd_v3_bgfg_win=%.6f' % _scalar_float(rgftd_profile.get('v3_bgfg_window', 0.0)),
+                'rgftd_v3_lowmaxp_d=%.6f' % _scalar_float(rgftd_profile.get('v3_lowmaxp_delta', 0.0)),
+                'rgftd_v3_mass_d=%.6f' % _scalar_float(rgftd_profile.get('v3_wann_mass_delta', 0.0)),
+                'rgftd_stable_valid=%.1f' % _scalar_float(rgftd_profile.get('stable_valid', 0.0)),
+                'rgftd_stable_score=%.6f' % _scalar_float(rgftd_profile.get('stable_score', 0.0)),
+                'rgftd_stable_best=%.6f' % _scalar_float(rgftd_profile.get('stable_best_score', 0.0)),
+                'rgftd_stable_updated=%.1f' % _scalar_float(rgftd_profile.get('stable_updated', 0.0)),
+            ])
+        for class_id in _rgftd_class_ids_from_profile(rgftd_profile):
+            parts.extend([
+                'rgftd_t_c%d=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_reliability'.format(class_id), 0.0)),
+                ),
+                'rgftd_t_c%d_sup=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_agreement'.format(class_id), 0.0)),
+                ),
+                'rgftd_t_c%d_core=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_core_agreement'.format(class_id), 0.0)),
+                ),
+                'rgftd_a_c%d=%.6f' % (
+                    class_id,
+                    _scalar_float(rgftd_profile.get('teacher_class{}_release_ratio'.format(class_id), 0.0)),
+                ),
+            ])
+    return ', '.join(parts)
 
 
 class MyClient(BaseClient):
@@ -50,10 +334,540 @@ class MyClient(BaseClient):
         if self.amp:
             self.scaler = GradScaler()
         self.best_performance = 0.0
+        self.rgftd_v3_last_audit_iter = -1
+        self.rgftd_v3_selected_teacher_id = None
+        self.rgftd_v3_status = _default_rgftd_v3_status()
+        self.rgftd_v3_active_key = None
+        self.rgftd_v3_lease_start_iter = -1
+        self.rgftd_v3_benefit_scores = {}
+        self.rgftd_v3_stability_scores = {}
+        self.rgftd_v3_last_window_scores = {}
+        self.rgftd_v3_last_wann_mass = {}
+        self.rgftd_v3_last_wann_lowmaxp = {}
+        self.rgftd_stable_best_score = 0.0
+        self.rgftd_stable_valid = 0.0
+        self.rgftd_stable_updated = 0.0
+        self.rgftd_stable_last_score = 0.0
+        self.rgftd_stable_last_wann_mass = None
+        self.rgftd_stable_last_wann_lowmaxp = None
+        self.rgftd_stable_snapshot_arrays = None
+        self.rgftd_stable_pending_upload = False
+
+    def _rgftd_v3_enabled(self):
+        return (
+            int(getattr(self.args, 'rgftd_enabled', 0)) == 1
+            and int(getattr(self.args, 'rgftd_v3_enabled', 0)) == 1
+        )
+
+    def _rgftd_v3_stable_enabled(self):
+        return self._rgftd_v3_enabled() and int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
+
+    def _move_batch_to_cuda(self, sampled_batch):
+        if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
+            volume_batch = sampled_batch['image'].unsqueeze(1).cuda()
+            label_batch = sampled_batch['label'].cuda()
+        elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+            volume_batch = sampled_batch['image'].cuda()
+            label_batch = sampled_batch['label'].cuda()
+        else:
+            raise ValueError('Unsupported img_class: {}'.format(self.args.img_class))
+        return volume_batch, label_batch
+
+    def _build_teacher_model_from_state_dict(self, teacher_state_dict):
+        teacher_model = copy.deepcopy(self.model.model).cuda()
+        teacher_model.load_state_dict(teacher_state_dict, strict=False)
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        return teacher_model
+
+    def _rgftd_v3_pair_key(self, teacher_source, teacher_id):
+        return '{}:{}'.format(int(teacher_source), int(teacher_id))
+
+    def _rgftd_v3_get_score(self, storage, key, default=1.0):
+        return float(storage.get(key, default))
+
+    def _rgftd_v3_cap_scale_for_score(self, benefit_score):
+        if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) != 1:
+            return 1.0
+        good_thresh = float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        min_scale = float(getattr(self.args, 'rgftd_v3_min_cap_scale', 0.25))
+        if benefit_score >= good_thresh:
+            return 1.0
+        if benefit_score >= decay_thresh:
+            return float(getattr(self.args, 'rgftd_v3_decay_cap_scale', 0.50))
+        return min_scale
+
+    def _rgftd_v3_routing_benefit(self, key):
+        benefit = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        floor = float(getattr(self.args, 'rgftd_v3_routing_benefit_floor', 0.25))
+        return max(benefit, floor)
+
+    def _rgftd_v3_base_cap(self, fallback_teacher=False):
+        if fallback_teacher:
+            return float(getattr(
+                self.args,
+                'rgftd_v3_fallback_lambda_eff_cap',
+                min(float(getattr(self.args, 'rgftd_lambda_eff_cap', 0.02)), 0.01),
+            ))
+        return float(getattr(self.args, 'rgftd_lambda_eff_cap', 0.02))
+
+    def _rgftd_args_for_teacher_source(self, fallback_teacher=False, cap_scale=1.0):
+        cap_scale = max(float(cap_scale), 0.0)
+        if not fallback_teacher:
+            if abs(cap_scale - 1.0) < 1e-8:
+                return self.args
+            routed_args = copy.copy(self.args)
+            routed_args.rgftd_lambda_eff_cap = self._rgftd_v3_base_cap(False) * cap_scale
+            return routed_args
+        fallback_args = copy.copy(self.args)
+        fallback_cap = self._rgftd_v3_base_cap(True) * cap_scale
+        fallback_args.rgftd_lambda_eff_cap = fallback_cap
+        return fallback_args
+
+    def _rgftd_stable_profile_score(self, profile, wann_maps):
+        prob_floor = float(getattr(self.args, 'rgftd_stable_seed_prob_floor', 0.35))
+        margin_floor = float(getattr(self.args, 'rgftd_stable_seed_margin_floor', 0.05))
+        max_conflict = float(max(getattr(self.args, 'rgftd_stable_max_core_conflict', 0.20), 1e-6))
+        seed_fg_pixels = _scalar_float(profile.get('seed_fg_support_pixels', 0.0))
+        seed_prob = _scalar_float(profile.get('teacher_seed_support_fg_prob_mean', 0.0))
+        seed_margin = _scalar_float(profile.get('teacher_seed_support_fg_margin_mean', 0.0))
+        core_valid = _scalar_float(profile.get('teacher_core_valid', 0.0))
+        core_conflict = _scalar_float(profile.get('teacher_core_conflict', 0.0))
+        if seed_fg_pixels <= 0.0:
+            return 0.0, {
+                'prob_gate': 0.0,
+                'margin_gate': 0.0,
+                'core_gate': 0.0,
+                'wann_gate': 0.0,
+            }
+
+        prob_gate = _normalize_gate_scalar(seed_prob, prob_floor)
+        margin_gate = _normalize_gate_scalar(seed_margin, margin_floor)
+        core_gate = 1.0
+        if core_valid > 0.0:
+            core_gate = max(0.0, min(1.0 - core_conflict / max_conflict, 1.0))
+
+        wann_mass = _scalar_float(wann_maps.profile.get('effective_supervision_mass', 0.0))
+        wann_lowmaxp = _scalar_float(wann_maps.profile.get('max_prob_low_r', 0.0))
+        mass_drop_thresh = float(max(getattr(self.args, 'rgftd_stable_wann_mass_drop_thresh', 0.05), 1e-6))
+        lowmaxp_delta_thresh = float(max(getattr(self.args, 'rgftd_stable_lowmaxp_delta_thresh', 0.02), 1e-6))
+        mass_gate = 1.0
+        lowmaxp_gate = 1.0
+        if self.rgftd_stable_last_wann_mass is not None:
+            mass_drop = max(0.0, self.rgftd_stable_last_wann_mass - wann_mass)
+            mass_gate = max(0.0, min(1.0 - mass_drop / mass_drop_thresh, 1.0))
+        if self.rgftd_stable_last_wann_lowmaxp is not None:
+            lowmaxp_delta = max(0.0, wann_lowmaxp - self.rgftd_stable_last_wann_lowmaxp)
+            lowmaxp_gate = max(0.0, min(1.0 - lowmaxp_delta / lowmaxp_delta_thresh, 1.0))
+        self.rgftd_stable_last_wann_mass = wann_mass
+        self.rgftd_stable_last_wann_lowmaxp = wann_lowmaxp
+        wann_gate = min(mass_gate, lowmaxp_gate)
+        score = prob_gate * margin_gate * core_gate * wann_gate
+        return score, {
+            'prob_gate': prob_gate,
+            'margin_gate': margin_gate,
+            'core_gate': core_gate,
+            'wann_gate': wann_gate,
+        }
+
+    def _rgftd_update_stable_teacher(self, outputs, label_batch, wann_maps):
+        if not self._rgftd_v3_stable_enabled():
+            return
+        audit_start = int(getattr(self.args, 'rgftd_v3_audit_start_iters', getattr(self.args, 'rgftd_warmup_iters', 800)))
+        if self.current_iter < audit_start:
+            return
+        stable_args = copy.copy(self.args)
+        stable_args.rgftd_refine_enabled = 0
+        _, _, stable_profile = rgftd_loss(
+            outputs.detach(),
+            outputs.detach(),
+            label_batch,
+            wann_maps,
+            stable_args,
+            max(self.current_iter, int(getattr(self.args, 'rgftd_warmup_iters', 800)) + 1),
+            image=None,
+        )
+        score, _ = self._rgftd_stable_profile_score(stable_profile, wann_maps)
+        self.rgftd_stable_last_score = float(score)
+        min_score = float(getattr(self.args, 'rgftd_stable_min_score', 0.05))
+        update_margin = float(getattr(self.args, 'rgftd_stable_update_margin', 0.01))
+        min_prob = float(getattr(self.args, 'rgftd_stable_seed_prob_floor', 0.35))
+        min_margin = float(getattr(self.args, 'rgftd_stable_seed_margin_floor', 0.05))
+        max_conflict = float(getattr(self.args, 'rgftd_stable_max_core_conflict', 0.20))
+        seed_prob = _scalar_float(stable_profile.get('teacher_seed_support_fg_prob_mean', 0.0))
+        seed_margin = _scalar_float(stable_profile.get('teacher_seed_support_fg_margin_mean', 0.0))
+        core_valid = _scalar_float(stable_profile.get('teacher_core_valid', 0.0))
+        core_conflict = _scalar_float(stable_profile.get('teacher_core_conflict', 0.0))
+        core_safe = core_valid <= 0.0 or core_conflict <= max_conflict
+        should_update = (
+            score >= min_score
+            and score > self.rgftd_stable_best_score + update_margin
+            and seed_prob >= min_prob
+            and seed_margin >= min_margin
+            and core_safe
+        )
+        if should_update:
+            self.rgftd_stable_best_score = float(score)
+            self.rgftd_stable_valid = 1.0
+            self.rgftd_stable_updated = 1.0
+            self.rgftd_stable_pending_upload = True
+            self.rgftd_stable_snapshot_arrays = [
+                tensor.detach().cpu().numpy().copy()
+                for tensor in self.model.model.state_dict().values()
+            ]
+
+    def _rgftd_v3_fill_runtime_status(self, status, teacher_source, teacher_id, cap_current):
+        status = dict(status)
+        key = self._rgftd_v3_pair_key(teacher_source, teacher_id)
+        if self.rgftd_v3_active_key != key:
+            self.rgftd_v3_active_key = key
+            self.rgftd_v3_lease_start_iter = self.current_iter
+        benefit_score = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        stability_score = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, key, 1.0)
+        window_score = self._rgftd_v3_get_score(self.rgftd_v3_last_window_scores, key, 1.0)
+        revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        teacher_revoke = 1.0 if benefit_score < revoke_thresh else 0.0
+        teacher_decay = 1.0 if revoke_thresh <= benefit_score < decay_thresh else 0.0
+        if int(teacher_source) == 2:
+            teacher_revoke = 0.0
+            teacher_decay = 1.0 if benefit_score < decay_thresh else 0.0
+        status.update({
+            'v3_lease_active': 0.0,
+            'v3_lease_age': 0.0,
+            'v3_benefit_score': benefit_score,
+            'v3_window_score': window_score,
+            'v3_stability_score': stability_score,
+            'v3_teacher_renew': 1.0 if benefit_score >= float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70)) else 0.0,
+            'v3_teacher_revoke': teacher_revoke,
+            'v3_teacher_decay': teacher_decay,
+            'v3_cap_current': float(cap_current),
+            'v3_cap_scale': self._rgftd_v3_cap_scale_for_score(benefit_score),
+        })
+        return status
+
+    def _rgftd_v3_update_online_benefit(self, status, rgftd_profile, wann_maps):
+        if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) != 1:
+            return status
+        source = int(float(status.get('v3_teacher_source', 0.0)))
+        teacher_id = int(float(status.get('v3_selected_teacher', -1.0)))
+        if source not in [1, 2]:
+            return status
+
+        key = self._rgftd_v3_pair_key(source, teacher_id)
+        ret = _scalar_float(rgftd_profile.get('return_reason', 3.0))
+        ret0 = 1.0 if ret <= 0.0 else 0.0
+        fg_px = _scalar_float(rgftd_profile.get('active_foreground_pixels', 0.0))
+        bgfg = _scalar_float(rgftd_profile.get('background_foreground_ratio', 0.0))
+        lambda_eff = _scalar_float(rgftd_profile.get('lambda_effective', 0.0))
+        cap_current = max(float(status.get('v3_cap_current', 0.0)), 0.0)
+        cap_hit = 1.0 if cap_current > 0.0 and lambda_eff >= 0.95 * cap_current else 0.0
+
+        wann_mass = 0.0
+        wann_lowmaxp = 0.0
+        if wann_maps is not None:
+            wann_profile = wann_maps.profile
+            wann_mass = _scalar_float(wann_profile.get('effective_supervision_mass', 0.0))
+            wann_lowmaxp = _scalar_float(wann_profile.get('max_prob_low_r', 0.0))
+        last_mass = self.rgftd_v3_last_wann_mass.get(key, None)
+        last_lowmaxp = self.rgftd_v3_last_wann_lowmaxp.get(key, None)
+        if last_mass is None:
+            mass_delta = 0.0
+        else:
+            mass_delta = wann_mass - last_mass
+        if last_lowmaxp is None:
+            lowmaxp_delta = 0.0
+        else:
+            lowmaxp_delta = wann_lowmaxp - last_lowmaxp
+        self.rgftd_v3_last_wann_mass[key] = wann_mass
+        self.rgftd_v3_last_wann_lowmaxp[key] = wann_lowmaxp
+
+        min_fg = float(getattr(self.args, 'rgftd_min_foreground_pixels', 8))
+        if ret0 > 0.0 and fg_px >= min_fg:
+            release_score = 1.0
+        elif ret0 > 0.0:
+            release_score = 0.65
+        elif ret == 4.0:
+            release_score = 0.55
+        elif ret in [1.0, 2.0]:
+            release_score = 0.45
+        else:
+            release_score = 0.30
+
+        stability = 1.0
+        bgfg_bad = bgfg > float(getattr(self.args, 'rgftd_v3_bgfg_warn_thresh', 0.75))
+        lowmaxp_bad = lowmaxp_delta > float(getattr(self.args, 'rgftd_v3_lowmaxp_delta_thresh', 0.02))
+        mass_bad = mass_delta < -float(getattr(self.args, 'rgftd_v3_wann_mass_drop_thresh', 0.05))
+        if bgfg_bad:
+            stability -= 0.20
+        if cap_hit > 0.0 and (bgfg_bad or lowmaxp_bad or mass_bad):
+            stability -= float(getattr(self.args, 'rgftd_v3_cap_hit_penalty', 0.20))
+        if lowmaxp_bad:
+            stability -= 0.20
+        if mass_bad:
+            stability -= 0.20
+        stability = max(0.0, min(stability, 1.0))
+        window_score = max(0.0, min(release_score * stability, 1.0))
+
+        momentum = float(getattr(self.args, 'rgftd_v3_benefit_momentum', 0.80))
+        momentum = max(0.0, min(momentum, 0.999))
+        prev_benefit = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, key, 1.0)
+        prev_stability = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, key, 1.0)
+        benefit = momentum * prev_benefit + (1.0 - momentum) * window_score
+        stability_ema = momentum * prev_stability + (1.0 - momentum) * stability
+        self.rgftd_v3_benefit_scores[key] = benefit
+        self.rgftd_v3_stability_scores[key] = stability_ema
+        self.rgftd_v3_last_window_scores[key] = window_score
+
+        revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+        decay_thresh = float(getattr(self.args, 'rgftd_v3_benefit_decay_thresh', 0.50))
+        good_thresh = float(getattr(self.args, 'rgftd_v3_benefit_good_thresh', 0.70))
+        teacher_revoke = 1.0 if benefit < revoke_thresh else 0.0
+        teacher_decay = 1.0 if revoke_thresh <= benefit < decay_thresh else 0.0
+        if source == 2:
+            teacher_revoke = 0.0
+            teacher_decay = 1.0 if benefit < decay_thresh else 0.0
+        status.update({
+            'v3_benefit_score': benefit,
+            'v3_window_score': window_score,
+            'v3_stability_score': stability_ema,
+            'v3_teacher_renew': 1.0 if benefit >= good_thresh else 0.0,
+            'v3_teacher_revoke': teacher_revoke,
+            'v3_teacher_decay': teacher_decay,
+            'v3_cap_scale': self._rgftd_v3_cap_scale_for_score(benefit),
+            'v3_ret0_ratio': ret0,
+            'v3_cap_hit_ratio': cap_hit,
+            'v3_bgfg_window': bgfg,
+            'v3_lowmaxp_delta': lowmaxp_delta,
+            'v3_wann_mass_delta': mass_delta,
+        })
+        return status
+
+    def _should_run_rgftd_v3_audit(self):
+        if not self._rgftd_v3_enabled():
+            return False
+        audit_start = int(getattr(self.args, 'rgftd_v3_audit_start_iters', getattr(self.args, 'rgftd_warmup_iters', 800)))
+        if self.current_iter < audit_start:
+            return False
+        audit_interval = int(getattr(self.args, 'rgftd_v3_audit_interval_iters', 1000))
+        if self.rgftd_v3_last_audit_iter < 0:
+            return True
+        if audit_interval <= 0:
+            return False
+        return (self.current_iter - self.rgftd_v3_last_audit_iter) >= audit_interval
+
+    def _run_rgftd_v3_routing_audit(self, wann_ref_model):
+        status = _default_rgftd_v3_status()
+        teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
+        teacher_valids = getattr(self.model, 'rgftd_teacher_valids', {})
+        teacher_scores = getattr(self.model, 'rgftd_teacher_scores', {})
+        if not teacher_state_dicts:
+            self.rgftd_v3_selected_teacher_id = None
+            self.rgftd_v3_last_audit_iter = self.current_iter
+            self.rgftd_v3_status = status
+            return status
+
+        candidate_ids = [
+            teacher_id for teacher_id in sorted(teacher_state_dicts.keys())
+            if int(teacher_id) != int(self.cid)
+            and (
+                not self._rgftd_v3_stable_enabled()
+                or float(teacher_valids.get(teacher_id, 0.0)) > 0.5
+            )
+        ]
+        if not candidate_ids:
+            self.rgftd_v3_selected_teacher_id = None
+            self.rgftd_v3_last_audit_iter = self.current_iter
+            self.rgftd_v3_status = status
+            return status
+
+        audit_batches = max(int(getattr(self.args, 'rgftd_v3_audit_batches', 4)), 1)
+        teacher_probe_model = copy.deepcopy(self.model.model).cuda()
+        teacher_probe_model.eval()
+        for param in teacher_probe_model.parameters():
+            param.requires_grad = False
+
+        profile_keys = [
+            'teacher_seed_support_fg_prob_mean',
+            'teacher_seed_support_fg_margin_mean',
+            'teacher_seed_support_fg_recall',
+            'teacher_core_conflict',
+            'teacher_core_valid',
+            'teacher_reliability',
+            'release_factor',
+        ]
+        fg_weighted_profile_keys = [
+            'teacher_seed_support_fg_prob_mean',
+            'teacher_seed_support_fg_margin_mean',
+            'teacher_seed_support_fg_recall',
+        ]
+        core_weighted_profile_keys = [
+            'teacher_core_conflict',
+            'teacher_core_valid',
+        ]
+        teacher_sums = {
+            teacher_id: {key: 0.0 for key in profile_keys}
+            for teacher_id in candidate_ids
+        }
+        teacher_weights = {
+            teacher_id: {key: 0.0 for key in profile_keys}
+            for teacher_id in candidate_ids
+        }
+
+        previous_mode = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for batch_idx, sampled_batch in enumerate(self.trainloader):
+                if batch_idx >= audit_batches:
+                    break
+                volume_batch, label_batch = self._move_batch_to_cuda(sampled_batch)
+                student_out = self.model(volume_batch)
+                student_logits = _primary_logits(student_out)
+                student_aux_logits = _aux_logits(student_out)
+                ref_out = wann_ref_model(volume_batch)
+                ref_logits = _primary_logits(ref_out)
+                wann_maps = build_wann_maps(
+                    image=volume_batch,
+                    label=label_batch,
+                    logits=student_logits,
+                    aux_logits=student_aux_logits,
+                    sup_type=self.args.sup_type,
+                    img_class=self.args.img_class,
+                    num_classes=self.args.num_classes,
+                    iter_num=self.current_iter,
+                    args=self.args,
+                    ref_logits=ref_logits,
+                )
+                for teacher_id in candidate_ids:
+                    teacher_probe_model.load_state_dict(teacher_state_dicts[teacher_id], strict=False)
+                    teacher_logits = _primary_logits(teacher_probe_model(volume_batch))
+                    _, _, audit_profile = rgftd_loss(
+                        student_logits,
+                        teacher_logits,
+                        label_batch,
+                        wann_maps,
+                        self.args,
+                        self.current_iter,
+                        image=volume_batch,
+                    )
+                    for key in profile_keys:
+                        metric_value = _scalar_float(audit_profile.get(key, 0.0))
+                        if key in fg_weighted_profile_keys:
+                            metric_weight = _scalar_float(audit_profile.get('seed_fg_support_pixels', 0.0))
+                        elif key in core_weighted_profile_keys:
+                            metric_weight = _scalar_float(audit_profile.get('teacher_core_valid', 0.0))
+                        else:
+                            metric_weight = 1.0
+                        if metric_weight <= 0.0:
+                            continue
+                        teacher_sums[teacher_id][key] += metric_value * metric_weight
+                        teacher_weights[teacher_id][key] += metric_weight
+        if previous_mode:
+            self.model.train()
+
+        prob_floor = float(getattr(self.args, 'rgftd_teacher_release_prob_floor', getattr(self.args, 'rgftd_teacher_fg_prob_thresh', 0.35)))
+        margin_floor = float(getattr(self.args, 'rgftd_teacher_release_margin_floor', 0.05))
+        max_core_conflict = float(max(getattr(self.args, 'rgftd_teacher_max_core_conflict', 0.20), 1e-6))
+        score_thresh = float(getattr(self.args, 'rgftd_v3_audit_score_thresh', 0.05))
+        reliability_min = float(getattr(self.args, 'rgftd_v3_audit_teacher_reliability_min', 0.30))
+
+        passed = []
+        best_teacher_status = dict(status)
+        for teacher_id in candidate_ids:
+            mean_profile = {
+                key: (
+                    teacher_sums[teacher_id][key] / teacher_weights[teacher_id][key]
+                    if teacher_weights[teacher_id][key] > 0.0 else 0.0
+                )
+                for key in profile_keys
+            }
+            foreground_gate = (
+                _normalize_gate_scalar(mean_profile['teacher_seed_support_fg_prob_mean'], prob_floor)
+                * _normalize_gate_scalar(mean_profile['teacher_seed_support_fg_margin_mean'], margin_floor)
+            )
+            if mean_profile['teacher_core_valid'] > 0.0:
+                safety_gate = max(0.0, min(1.0 - mean_profile['teacher_core_conflict'] / max_core_conflict, 1.0))
+            else:
+                safety_gate = 1.0
+            audit_score = foreground_gate * safety_gate
+            pair_key = self._rgftd_v3_pair_key(1, teacher_id)
+            benefit_score = self._rgftd_v3_routing_benefit(pair_key)
+            stability_score = self._rgftd_v3_get_score(self.rgftd_v3_stability_scores, pair_key, 1.0)
+            routing_score = audit_score * benefit_score * stability_score
+            recover_thresh = float(getattr(self.args, 'rgftd_v3_recover_audit_score_thresh', 0.60))
+            if (
+                audit_score >= recover_thresh
+                and self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, pair_key, 1.0) < benefit_score
+            ):
+                self.rgftd_v3_benefit_scores[pair_key] = benefit_score
+            teacher_status = {
+                'v3_pool_size': 0.0,
+                'v3_pool_stable': 0.0,
+                'v3_no_teacher': 0.0,
+                'v3_fallback_teacher': 0.0,
+                'v3_teacher_source': 1.0,
+                'v3_selected_teacher': float(teacher_id),
+                'v3_selected_score': float(routing_score),
+                'v3_selected_stable_score': float(teacher_scores.get(teacher_id, 0.0)),
+                'v3_best_failed_teacher': -1.0,
+                'v3_best_failed_score': 0.0,
+                'v3_routing_score': float(routing_score),
+                'v3_audit_seed_fg_prob_mean': float(mean_profile['teacher_seed_support_fg_prob_mean']),
+                'v3_audit_seed_fg_margin_mean': float(mean_profile['teacher_seed_support_fg_margin_mean']),
+                'v3_audit_seed_fg_recall': float(mean_profile['teacher_seed_support_fg_recall']),
+                'v3_audit_core_conflict': float(mean_profile['teacher_core_conflict']),
+                'v3_audit_core_valid': float(mean_profile['teacher_core_valid']),
+                'v3_audit_teacher_reliability': float(mean_profile['teacher_reliability']),
+                'v3_audit_release_factor': float(mean_profile['release_factor']),
+                'v3_benefit_score': float(benefit_score),
+                'v3_stability_score': float(stability_score),
+            }
+            if teacher_id == candidate_ids[0] or routing_score > best_teacher_status['v3_selected_score']:
+                best_teacher_status = teacher_status
+            if (
+                routing_score >= score_thresh
+                and mean_profile['teacher_reliability'] >= reliability_min
+                and (
+                    mean_profile['teacher_core_valid'] <= 0.0
+                    or mean_profile['teacher_core_conflict'] <= max_core_conflict
+                )
+            ):
+                passed.append((routing_score, teacher_id, teacher_status))
+
+        passed.sort(key=lambda item: item[0], reverse=True)
+        top_k = int(getattr(self.args, 'rgftd_v3_teacher_pool_topk', 1))
+        if top_k != 1:
+            raise ValueError('RGFTD-v3 first full version currently only supports top_k=1')
+
+        if passed:
+            _, selected_teacher_id, selected_status = passed[0]
+            selected_status['v3_pool_size'] = float(len(passed))
+            selected_status['v3_pool_stable'] = float(len(passed)) if self._rgftd_v3_stable_enabled() else 0.0
+            selected_status['v3_no_teacher'] = 0.0
+            self.rgftd_v3_selected_teacher_id = selected_teacher_id
+            status = selected_status
+        else:
+            status = best_teacher_status
+            status['v3_pool_size'] = 0.0
+            status['v3_no_teacher'] = 1.0
+            status['v3_selected_teacher'] = -1.0
+            status['v3_selected_score'] = 0.0
+            status['v3_best_failed_teacher'] = best_teacher_status['v3_selected_teacher']
+            status['v3_best_failed_score'] = best_teacher_status['v3_selected_score']
+            self.rgftd_v3_selected_teacher_id = None
+
+        self.rgftd_v3_last_audit_iter = self.current_iter
+        self.rgftd_v3_status = status
+        return status
 
 
     def _train(self, config):
         self.model.train()
+        if self._rgftd_v3_stable_enabled():
+            self.rgftd_stable_updated = 0.0
+            self.rgftd_stable_pending_upload = False
 
         # optimizer
         if self.args.strategy == 'FedRep':
@@ -94,6 +908,90 @@ class MyClient(BaseClient):
         previous_prompts = None
         previous_prompts_dis = None
         previous_prompts_uni = None
+        wann_ref_model = None
+        if int(getattr(self.args, 'wann_enabled', 0)) == 1:
+            wann_ref_model = copy.deepcopy(self.model).cuda()
+            wann_ref_model.eval()
+            for param in wann_ref_model.parameters():
+                param.requires_grad = False
+        rgftd_teacher_model = None
+        rgftd_teacher_args = self.args
+        rgftd_v3_status = _default_rgftd_v3_status()
+        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+            if self._rgftd_v3_enabled():
+                if self._should_run_rgftd_v3_audit():
+                    rgftd_v3_status = self._run_rgftd_v3_routing_audit(wann_ref_model)
+                else:
+                    rgftd_v3_status = dict(getattr(self, 'rgftd_v3_status', _default_rgftd_v3_status()))
+                teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
+                selected_teacher_id = getattr(self, 'rgftd_v3_selected_teacher_id', None)
+                if selected_teacher_id is not None and selected_teacher_id in teacher_state_dicts:
+                    pair_key = self._rgftd_v3_pair_key(1, selected_teacher_id)
+                    benefit_score = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, pair_key, 1.0)
+                    revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
+                    if int(getattr(self.args, 'rgftd_v3_benefit_enabled', 1)) == 1 and benefit_score < revoke_thresh:
+                        rgftd_v3_status['v3_no_teacher'] = 1.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 0.0
+                        rgftd_v3_status['v3_selected_teacher'] = -1.0
+                        rgftd_v3_status['v3_teacher_revoke'] = 1.0
+                        self.rgftd_v3_selected_teacher_id = None
+                    else:
+                        cap_scale = self._rgftd_v3_cap_scale_for_score(benefit_score)
+                        cap_current = self._rgftd_v3_base_cap(False) * cap_scale
+                        rgftd_teacher_args = self._rgftd_args_for_teacher_source(
+                            fallback_teacher=False,
+                            cap_scale=cap_scale,
+                        )
+                        rgftd_teacher_model = self._build_teacher_model_from_state_dict(
+                            teacher_state_dicts[selected_teacher_id]
+                        )
+                        rgftd_v3_status['v3_no_teacher'] = 0.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 1.0
+                        rgftd_v3_status = self._rgftd_v3_fill_runtime_status(
+                            rgftd_v3_status,
+                            1,
+                            selected_teacher_id,
+                            cap_current,
+                        )
+                else:
+                    fallback_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
+                    fallback_flag = int(getattr(self.args, 'rgftd_v3_server_ema_fallback', -1))
+                    if fallback_flag < 0:
+                        fallback_allowed = not self._rgftd_v3_stable_enabled()
+                    else:
+                        fallback_allowed = fallback_flag == 1
+                    if fallback_allowed and fallback_state_dict is not None:
+                        pair_key = self._rgftd_v3_pair_key(2, -2)
+                        benefit_score = self._rgftd_v3_routing_benefit(pair_key)
+                        cap_scale = self._rgftd_v3_cap_scale_for_score(benefit_score)
+                        cap_current = self._rgftd_v3_base_cap(True) * cap_scale
+                        rgftd_teacher_model = self._build_teacher_model_from_state_dict(fallback_state_dict)
+                        rgftd_teacher_args = self._rgftd_args_for_teacher_source(
+                            fallback_teacher=True,
+                            cap_scale=cap_scale,
+                        )
+                        rgftd_v3_status['v3_no_teacher'] = 0.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 1.0
+                        rgftd_v3_status['v3_teacher_source'] = 2.0
+                        rgftd_v3_status['v3_selected_teacher'] = -2.0
+                        rgftd_v3_status['v3_selected_score'] = 0.0
+                        rgftd_v3_status = self._rgftd_v3_fill_runtime_status(
+                            rgftd_v3_status,
+                            2,
+                            -2,
+                            cap_current,
+                        )
+                    else:
+                        rgftd_v3_status['v3_no_teacher'] = 1.0
+                        rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                        rgftd_v3_status['v3_teacher_source'] = 0.0
+                        rgftd_v3_status['v3_selected_teacher'] = -1.0
+            else:
+                teacher_state_dict = getattr(self.model, 'rgftd_teacher_state_dict', None)
+                if teacher_state_dict is not None:
+                    rgftd_teacher_model = self._build_teacher_model_from_state_dict(teacher_state_dict)
         
         for i_iter in range(config['iters']):
             # genearate sampled batches
@@ -107,7 +1005,7 @@ class MyClient(BaseClient):
             sampled_batch = self.sampled_batches[idx]
             # print(self.current_iter, i_iter, idx)
 
-            if self.args.img_class == 'faz':
+            if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
@@ -162,9 +1060,139 @@ class MyClient(BaseClient):
                     outputs, feature, de1, de2, de3, de4 = out
 
                 outputs_soft = torch.softmax(outputs, dim=1)
-                loss_ce_seg = ce_loss(outputs, label_batch[:].long())
-                loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
-                loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
+                if int(getattr(self.args, 'wann_enabled', 0)) == 1:
+                    with torch.no_grad():
+                        ref_out = wann_ref_model(volume_batch)
+                        if self.args.model == 'fcnet':
+                            _, ref_logits = ref_out
+                        elif self.args.model in ['deeplabv3plus', 'treefcn']:
+                            ref_logits = ref_out[0]
+                        elif self.args.model in [
+                            'unet_head', 'unet_multihead', 'unet_lc', 'unet_uni',
+                            'unet_univ2', 'unet_univ3', 'unet_univ4', 'unet_univ5'
+                        ]:
+                            ref_logits = ref_out[0]
+                        else:
+                            ref_logits = ref_out[0]
+                    wann_maps = build_wann_maps(
+                        image=volume_batch,
+                        label=label_batch,
+                        logits=outputs,
+                        aux_logits=outputs_auxiliary,
+                        sup_type=self.args.sup_type,
+                        img_class=self.args.img_class,
+                        num_classes=self.args.num_classes,
+                        iter_num=self.current_iter,
+                        args=self.args,
+                        ref_logits=ref_logits,
+                    )
+                    wann_target_label = getattr(wann_maps, 'target_label', label_batch)
+                    loss_ce_seg = wann_weighted_ce_loss(
+                        outputs, wann_target_label, wann_maps.core_weight, ignore_index=self.args.num_classes
+                    )
+                    loss_ce_auxiliary = wann_weighted_ce_loss(
+                        outputs_auxiliary, wann_target_label, wann_maps.core_weight, ignore_index=self.args.num_classes
+                    )
+                    loss_hard = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
+                    core_ratio = _scalar_float(wann_maps.profile.get('core_ratio', 0.0))
+                    target_core_ratio = float(getattr(self.args, 'wann_target_core_ratio', 0.0))
+                    core_deficit = max(0.0, target_core_ratio - core_ratio)
+                    soft_boost = 1.0 + float(getattr(self.args, 'wann_core_deficit_soft_boost', 0.0)) * core_deficit
+                    lambda_soft = float(getattr(self.args, 'wann_soft_lambda', 0.2)) * ramps.sigmoid_rampup(
+                        self.current_iter, int(getattr(self.args, 'wann_soft_rampup_iters', 800))
+                    ) * soft_boost
+                    lambda_cons = float(getattr(self.args, 'wann_cons_lambda', 0.05)) * ramps.sigmoid_rampup(
+                        self.current_iter, int(getattr(self.args, 'wann_cons_rampup_iters', 800))
+                    )
+                    loss_soft = wann_soft_band_loss(
+                        outputs, outputs_auxiliary, label_batch, wann_maps, ignore_index=self.args.num_classes
+                    )
+                    loss_cons = wann_consistency_loss(outputs, outputs_auxiliary, wann_maps.ignore_mask)
+                    loss_ce = loss_hard + lambda_soft * loss_soft + lambda_cons * loss_cons
+                    loss_rgftd = outputs.sum() * 0.0
+                    loss_rgftd_seg = outputs.sum() * 0.0
+                    loss_rgftd_aux = outputs.sum() * 0.0
+                    lambda_rgftd_raw = 0.0
+                    lambda_rgftd = 0.0
+                    rgftd_profile = zero_rgftd_profile(outputs.device)
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+                        lambda_rgftd_raw = get_rgftd_lambda(self.current_iter, self.args)
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
+                        light_audit_trigger = (
+                            core_ratio < float(getattr(self.args, 'rgftd_light_audit_core_ratio_thresh', 0.05))
+                            and _scalar_float(wann_maps.profile.get('max_prob_low_r', 0.0)) >
+                            float(getattr(self.args, 'rgftd_light_audit_low_maxp_thresh', 0.95))
+                        )
+                        lambda_light = 0.0
+                        if (
+                            float(lambda_rgftd_raw) <= 0.0
+                            and int(getattr(self.args, 'rgftd_light_audit_enabled', 0)) == 1
+                            and int(self.current_iter) >= int(getattr(self.args, 'rgftd_light_audit_start_iters', 0))
+                            and light_audit_trigger
+                        ):
+                            lambda_light = float(getattr(self.args, 'rgftd_light_audit_lambda', 0.01))
+                            rgftd_teacher_args = copy.copy(rgftd_teacher_args)
+                            setattr(rgftd_teacher_args, 'rgftd_force_lambda', lambda_light)
+                            setattr(rgftd_teacher_args, 'rgftd_light_audit_active', 1)
+                            setattr(rgftd_teacher_args, 'rgftd_use_soft_band', 1)
+                        if float(lambda_rgftd_raw) > 0.0 or float(lambda_light) > 0.0:
+                            with torch.no_grad():
+                                teacher_out = rgftd_teacher_model(volume_batch)
+                                teacher_logits = _primary_logits(teacher_out)
+                            loss_rgftd_seg, lambda_rgftd_seg, rgftd_profile_seg = rgftd_loss(
+                                outputs,
+                                teacher_logits,
+                                label_batch,
+                                wann_maps,
+                                rgftd_teacher_args,
+                                self.current_iter,
+                                image=volume_batch,
+                            )
+                            loss_rgftd_aux, lambda_rgftd_aux, rgftd_profile_aux = rgftd_loss(
+                                outputs_auxiliary,
+                                teacher_logits,
+                                label_batch,
+                                wann_maps,
+                                rgftd_teacher_args,
+                                self.current_iter,
+                                image=volume_batch,
+                            )
+                            loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux)
+                            lambda_rgftd = 0.5 * (float(lambda_rgftd_seg) + float(lambda_rgftd_aux))
+                            rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
+                            rgftd_profile['teacher_active_loss'] = (
+                                loss_rgftd.detach() * torch.tensor(float(lambda_rgftd), device=loss_rgftd.device)
+                            )
+                            loss_ce = loss_ce + float(lambda_rgftd) * loss_rgftd
+                            if self._rgftd_v3_enabled():
+                                rgftd_v3_status = self._rgftd_v3_update_online_benefit(
+                                    rgftd_v3_status,
+                                    rgftd_profile,
+                                    wann_maps,
+                                )
+                    self._rgftd_update_stable_teacher(outputs, label_batch, wann_maps)
+                    rgftd_v3_status['stable_valid'] = float(self.rgftd_stable_valid)
+                    rgftd_v3_status['stable_score'] = float(self.rgftd_stable_last_score)
+                    rgftd_v3_status['stable_best_score'] = float(self.rgftd_stable_best_score)
+                    rgftd_v3_status['stable_updated'] = float(self.rgftd_stable_updated)
+                    rgftd_profile = _attach_rgftd_v3_status(rgftd_profile, rgftd_v3_status, outputs.device)
+                else:
+                    wann_maps = None
+                    lambda_soft = 0.0
+                    lambda_cons = 0.0
+                    lambda_rgftd_raw = 0.0
+                    lambda_rgftd = 0.0
+                    loss_hard = torch.tensor(0.0).cuda()
+                    loss_soft = torch.tensor(0.0).cuda()
+                    loss_cons = torch.tensor(0.0).cuda()
+                    loss_rgftd = torch.tensor(0.0).cuda()
+                    loss_rgftd_seg = torch.tensor(0.0).cuda()
+                    loss_rgftd_aux = torch.tensor(0.0).cuda()
+                    rgftd_profile = zero_rgftd_profile(loss_rgftd.device)
+                    rgftd_profile = _attach_rgftd_v3_status(rgftd_profile, rgftd_v3_status, loss_rgftd.device)
+                    loss_ce_seg = ce_loss(outputs, label_batch[:].long())
+                    loss_ce_auxiliary = ce_loss(outputs_auxiliary, label_batch[:].long())
+                    loss_ce = 0.5 * (loss_ce_seg + loss_ce_auxiliary)
 # TreeEnergyLoss
                 # unlabeled_RoIs = (sampled_batch['label'] == self.args.num_classes)
                 # unlabeled_RoIs = unlabeled_RoIs.cuda()
@@ -294,7 +1322,6 @@ class MyClient(BaseClient):
                     loss_pls = (loss_pls_1 + loss_pls_2) / 2
                     loss = torch.add(loss, loss_pls, alpha=self.args.beta)
                     if i_iter > 0:
-                        print(previous_prompts_dis == distribution_prompts[self.args.cid])
                         distance_prompts = l1_loss(previous_prompts.detach(), prompts[self.args.cid].clone().detach())
                         distance_prompts_dis = l1_loss(previous_prompts_dis.detach(), distribution_prompts[self.args.cid].clone().detach())
                         distance_prompts_uni = l1_loss(previous_prompts_uni.detach(), uni_prompts.clone().detach())
@@ -315,6 +1342,14 @@ class MyClient(BaseClient):
 
             self.current_iter = self.current_iter + 1
             log(INFO, 'client %d : iteration %d : lr: %f, loss : %f, loss_ce: %f' % (self.cid, self.current_iter, self.current_lr, loss.item(), loss_ce.item()))
+            if int(getattr(self.args, 'wann_enabled', 0)) == 1 and self.current_iter % int(self.args.eval_iters) == 0:
+                log(INFO, _format_wann_rgftd_log(
+                    self.cid,
+                    self.current_iter,
+                    wann_maps,
+                    lambda_rgftd_raw,
+                    rgftd_profile,
+                ))
 
             lr_ = self.args.base_lr * (1.0 - self.current_iter / self.args.max_iterations) ** 0.9
             for param_group in optimizer.param_groups:
@@ -380,6 +1415,43 @@ class MyClient(BaseClient):
                 outputs_auxiliary, pseudo_labs = outputs_auxiliary.repeat(3, 1, 1), pseudo_labs.repeat(3, 1, 1)
             metrics_['client_{}_Prediction2'.format(self.cid)] = fl.common.ndarray_to_bytes(outputs_auxiliary.cpu().numpy())
             metrics_['client_{}_Pseudo'.format(self.cid)] = fl.common.ndarray_to_bytes(pseudo_labs.cpu().numpy())
+            if int(getattr(self.args, 'ala_max_epochs', 0)) > 0:
+                metrics_['client_{}_ala_epochs'.format(self.cid)] = float(getattr(self.model, 'ala_last_epochs', 0))
+                metrics_['client_{}_ala_final_std'.format(self.cid)] = float(getattr(self.model, 'ala_last_std', 0.0))
+                metrics_['client_{}_ala_hit_max_epochs'.format(self.cid)] = float(getattr(self.model, 'ala_hit_max_epochs', 0))
+
+        if int(getattr(self.args, 'wann_enabled', 0)) == 1 and wann_maps is not None:
+            metrics_['client_{}_wann_loss_hard'.format(self.cid)] = loss_hard.item()
+            metrics_['client_{}_wann_loss_soft'.format(self.cid)] = loss_soft.item()
+            metrics_['client_{}_wann_loss_cons'.format(self.cid)] = loss_cons.item()
+            metrics_['client_{}_wann_lambda_soft'.format(self.cid)] = float(lambda_soft)
+            metrics_['client_{}_wann_lambda_cons'.format(self.cid)] = float(lambda_cons)
+            for key, value in wann_maps.profile.items():
+                metrics_['client_{}_wann_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+
+        if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
+            metrics_['client_{}_rgftd_loss'.format(self.cid)] = float(loss_rgftd.detach().cpu().item())
+            metrics_['client_{}_rgftd_loss_seg'.format(self.cid)] = float(loss_rgftd_seg.detach().cpu().item())
+            metrics_['client_{}_rgftd_loss_aux'.format(self.cid)] = float(loss_rgftd_aux.detach().cpu().item())
+            metrics_['client_{}_rgftd_lambda'.format(self.cid)] = float(lambda_rgftd_raw)
+            for key, value in rgftd_profile.items():
+                if key in ['loss', 'lambda']:
+                    continue
+                metrics_['client_{}_rgftd_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+            for class_id in range(1, self.args.num_classes):
+                for suffix in ['agreement', 'core_agreement', 'reliability', 'release_ratio']:
+                    profile_key = 'teacher_class{}_{}'.format(class_id, suffix)
+                    metrics_key = 'client_{}_rgftd_{}'.format(self.cid, profile_key)
+                    if metrics_key not in metrics_:
+                        metrics_[metrics_key] = float(_scalar_float(rgftd_profile.get(profile_key, 0.0)))
+            if (
+                self._rgftd_v3_stable_enabled()
+                and self.rgftd_stable_pending_upload
+                and self.rgftd_stable_snapshot_arrays is not None
+            ):
+                metrics_['client_{}_rgftd_stable_snapshot'.format(self.cid)] = _pack_rgftd_stable_snapshot(
+                    self.rgftd_stable_snapshot_arrays
+                )
 
         return loss.item(), metrics_
 
@@ -392,7 +1464,7 @@ def pretrain_model(args, writer, worker_init_fn):
         RandomGenerator(args.patch_size, img_class=args.img_class)
     ]))
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     model = net_factory(args, net_type=args.model, in_chns=args.in_chns, class_num=args.num_classes)
@@ -410,7 +1482,7 @@ def pretrain_model(args, writer, worker_init_fn):
     model.train()
     for epoch_num in iterator:
         for i_batch, sampled_batch in enumerate(trainloader):
-            if args.img_class == 'faz':
+            if args.img_class == 'faz' or args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
             elif args.img_class == 'odoc' or args.img_class == 'polyp':
@@ -465,6 +1537,8 @@ def main():
                         default='[::]:8080', help='gRPC server address (default: [::]:8080)')
     parser.add_argument('--gpu', type=int,
                         required=True, help='GPU index')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of DataLoader workers')
     parser.add_argument('--role', type=str,
                         required=True, help='Role')
     # server
@@ -514,6 +1588,14 @@ def main():
                         help='Dual branch initiallization for FedUniV2/FedUniV2.1')
     parser.add_argument('--label_prompt', type=int, default=0,
                         help='Whether use label prompt for FedUniV2/FedUniV2.1')
+    parser.add_argument('--ala_max_epochs', type=int, default=0,
+                        help='Maximum ALA initialization epochs; <=0 keeps the original unbounded behavior')
+    parser.add_argument('--disable_tensorboard', type=int, default=0,
+                        help='Disable TensorBoard event writing when set to 1')
+    parser.add_argument('--save_code_snapshot', type=int, default=1,
+                        help='Copy code into snapshot_path/code when set to 1')
+    parser.add_argument('--save_checkpoint_copies', type=int, default=1,
+                        help='Save per-iteration checkpoint copies when set to 1; best_model files are still updated')
     # client
     parser.add_argument('--cid', type=int, default=0, help='Client CID (no default)')
 
@@ -549,6 +1631,262 @@ def main():
     parser.add_argument('--img_class', type=str,
                         default='faz', help='the img class(odoc or faz)')
     parser.add_argument('--seed', type=int,  default=2022, help='random seed')
+    parser.add_argument('--wann_enabled', type=int, default=0,
+                        help='Enable weak annotation reliability reconstruction')
+    parser.add_argument('--wann_core_thresh', type=float, default=0.65,
+                        help='Reliability threshold for hard-supervised core pixels')
+    parser.add_argument('--wann_soft_thresh', type=float, default=0.25,
+                        help='Reliability threshold for soft-band pixels')
+    parser.add_argument('--wann_core_min_weight', type=float, default=0.8,
+                        help='Minimum hard-supervision weight for core pixels')
+    parser.add_argument('--wann_r_max', type=float, default=1.2,
+                        help='Maximum reliability weight')
+    parser.add_argument('--wann_dilated_support_score', type=float, default=0.55,
+                        help='Annotation score assigned to non-core pixels near weak support')
+    parser.add_argument('--wann_appearance_temp', type=float, default=1.5,
+                        help='Temperature for image-appearance consistency')
+    parser.add_argument('--wann_texture_kernel_size', type=int, default=5,
+                        help='Local window size for WANN texture ambiguity penalty')
+    parser.add_argument('--wann_texture_temp', type=float, default=1.0,
+                        help='Temperature for WANN local texture ambiguity penalty')
+    parser.add_argument('--wann_texture_weight', type=float, default=0.25,
+                        help='Weight of WANN local texture stability in appearance reliability')
+    parser.add_argument('--wann_pred_start_iter', type=int, default=800,
+                        help='Iteration to start using prediction ambiguity in WANN')
+    parser.add_argument('--wann_entropy_weight', type=float, default=0.5,
+                        help='Entropy penalty weight in WANN reliability')
+    parser.add_argument('--wann_agreement_weight', type=float, default=0.5,
+                        help='Main-aux agreement weight in WANN reliability')
+    parser.add_argument('--wann_global_agreement_weight', type=float, default=0.5,
+                        help='Current-reference prediction agreement weight in WANN reliability')
+    parser.add_argument('--wann_keypoint_soft_radius', type=int, default=2,
+                        help='Soft-band radius for keypoint annotations')
+    parser.add_argument('--wann_scribble_soft_radius', type=int, default=4,
+                        help='Soft-band radius for scribble annotations')
+    parser.add_argument('--wann_box_soft_radius', type=int, default=2,
+                        help='Soft-band radius for box/block annotations')
+    parser.add_argument('--wann_mask_soft_radius', type=int, default=1,
+                        help='Soft-band radius for mask annotations')
+    parser.add_argument('--wann_seed_support_erode_radius', type=int, default=1,
+                        help='Default erosion radius used to build conservative seed support for box/block supervision')
+    parser.add_argument('--wann_seed_support_box_erode_radius', type=int, default=1,
+                        help='Erosion radius used to build conservative seed support for box supervision')
+    parser.add_argument('--wann_seed_support_block_erode_radius', type=int, default=1,
+                        help='Erosion radius used to build conservative seed support for block supervision')
+    parser.add_argument('--wann_soft_lambda', type=float, default=0.2,
+                        help='Maximum WANN soft-band loss weight')
+    parser.add_argument('--wann_cons_lambda', type=float, default=0.05,
+                        help='Maximum WANN ignore-region consistency weight')
+    parser.add_argument('--wann_soft_rampup_iters', type=int, default=800,
+                        help='Rampup iterations for WANN soft-band loss')
+    parser.add_argument('--wann_cons_rampup_iters', type=int, default=800,
+                        help='Rampup iterations for WANN consistency loss')
+    parser.add_argument('--wann_sparse_adaptive_core', type=int, default=0,
+                        help='Use source-free adaptive core quota for sparse scribble support')
+    parser.add_argument('--wann_sparse_min_core_ratio', type=float, default=0.0,
+                        help='Minimum per-image hard core ratio under sparse scribble support')
+    parser.add_argument('--wann_sparse_max_core_ratio', type=float, default=0.0,
+                        help='Maximum per-image hard core ratio under sparse scribble support')
+    parser.add_argument('--wann_sparse_core_min_reliability', type=float, default=0.25,
+                        help='Minimum reliability for sparse adaptive core candidates')
+    parser.add_argument('--wann_low_confident_thresh', type=float, default=0.95,
+                        help='Confidence threshold for high-confidence low-reliability WANN risk pixels')
+    parser.add_argument('--wann_target_core_ratio', type=float, default=0.0,
+                        help='Target core ratio used to scale soft supervision when WANN core is deficient')
+    parser.add_argument('--wann_core_deficit_soft_boost', type=float, default=0.0,
+                        help='Multiplier slope for soft-band supervision when WANN hard core is deficient')
+    parser.add_argument('--rgftd_enabled', type=int, default=0,
+                        help='Enable reliability-gated federated teacher distillation')
+    parser.add_argument('--rgftd_lambda', type=float, default=0.1,
+                        help='Maximum RGFTD distillation loss weight')
+    parser.add_argument('--rgftd_warmup_iters', type=int, default=800,
+                        help='Iterations before RGFTD loss is released')
+    parser.add_argument('--rgftd_rampup_iters', type=int, default=800,
+                        help='Rampup iterations after RGFTD warmup')
+    parser.add_argument('--rgftd_light_audit_enabled', type=int, default=0,
+                        help='Enable WANN-risk-triggered light RGFTD before the main release schedule')
+    parser.add_argument('--rgftd_light_audit_start_iters', type=int, default=0,
+                        help='Iteration to start WANN-risk-triggered light RGFTD audit')
+    parser.add_argument('--rgftd_light_audit_lambda', type=float, default=0.01,
+                        help='Distillation lambda for WANN-risk-triggered light RGFTD audit')
+    parser.add_argument('--rgftd_light_audit_core_ratio_thresh', type=float, default=0.05,
+                        help='Core ratio threshold that marks WANN hard supervision deficiency')
+    parser.add_argument('--rgftd_light_audit_low_maxp_thresh', type=float, default=0.95,
+                        help='Low-reliability confidence threshold that triggers early RGFTD audit')
+    parser.add_argument('--rgftd_teacher_ema_decay', type=float, default=0.99,
+                        help='Server EMA decay for RGFTD teacher')
+    parser.add_argument('--rgftd_teacher_conf_thresh', type=float, default=0.90,
+                        help='Teacher confidence threshold for RGFTD pixels')
+    parser.add_argument('--rgftd_teacher_foreground_radius', type=int, default=2,
+                        help='Foreground dilation radius for RGFTD teacher gating')
+    parser.add_argument('--rgftd_min_foreground_pixels', type=int, default=8,
+                        help='Minimum active foreground pixels required to keep RGFTD active')
+    parser.add_argument('--rgftd_min_foreground_ratio', type=float, default=0.05,
+                        help='Minimum active foreground ratio required to keep RGFTD active')
+    parser.add_argument('--rgftd_teacher_fg_prob_thresh', type=float, default=0.35,
+                        help='Teacher foreground probability threshold for RGFTD foreground anchoring')
+    parser.add_argument('--rgftd_teacher_fg_topk_ratio', type=float, default=0.002,
+                        help='Top-k ratio for fallback RGFTD foreground anchors inside WANN non-core regions')
+    parser.add_argument('--rgftd_teacher_fg_topk_min_pixels', type=int, default=8,
+                        help='Minimum fallback foreground-anchor pixels for RGFTD')
+    parser.add_argument('--rgftd_teacher_student_fg_margin', type=float, default=0.05,
+                        help='Teacher-student foreground probability margin for RGFTD foreground correction')
+    parser.add_argument('--rgftd_teacher_bg_conf_thresh', type=float, default=0.98,
+                        help='Teacher confidence threshold for accepted background pixels')
+    parser.add_argument('--rgftd_bg_max_fg_prob', type=float, default=0.15,
+                        help='Maximum teacher foreground probability allowed for accepted background pixels')
+    parser.add_argument('--rgftd_student_conf_thresh', type=float, default=0.80,
+                        help='Student maximum-confidence threshold for uncertainty gate')
+    parser.add_argument('--rgftd_student_entropy_thresh', type=float, default=0.35,
+                        help='Student normalized-entropy threshold for uncertainty gate')
+    parser.add_argument('--rgftd_low_r_thresh', type=float, default=0.25,
+                        help='WANN reliability threshold for RGFTD low-reliability region')
+    parser.add_argument('--rgftd_temperature', type=float, default=1.0,
+                        help='Temperature for RGFTD KL distillation')
+    parser.add_argument('--rgftd_use_soft_band', type=int, default=0,
+                        help='Whether RGFTD can also use WANN soft-band pixels')
+    parser.add_argument('--rgftd_background_weight', type=float, default=0.25,
+                        help='Relative weight for high-confidence teacher background pixels')
+    parser.add_argument('--rgftd_skip_background_only', type=int, default=1,
+                        help='Skip RGFTD when no active foreground pixels are present')
+    parser.add_argument('--rgftd_teacher_validation_enabled', type=int, default=0,
+                        help='Enable RGFTD-v2 teacher reliability validation and release veto')
+    parser.add_argument('--rgftd_teacher_reliability_min', type=float, default=0.55,
+                        help='Legacy reliability threshold kept for RGFTD-v2 audit compatibility')
+    parser.add_argument('--rgftd_teacher_core_agree_floor', type=float, default=0.80,
+                        help='Agreement floor for teacher validation on WANN core pixels')
+    parser.add_argument('--rgftd_teacher_support_agree_floor', type=float, default=0.70,
+                        help='Agreement floor for teacher validation on weak-support foreground pixels')
+    parser.add_argument('--rgftd_teacher_support_prob_floor', type=float, default=0.35,
+                        help='Foreground-probability floor used in RGFTD-v2 teacher reliability support gate')
+    parser.add_argument('--rgftd_teacher_conf_floor', type=float, default=0.85,
+                        help='Confidence floor used when building RGFTD-v2 teacher reliability')
+    parser.add_argument('--rgftd_teacher_class_reliability_min', type=float, default=0.50,
+                        help='Minimum class-wise reliability required to release a teacher class')
+    parser.add_argument('--rgftd_teacher_max_core_conflict', type=float, default=0.20,
+                        help='Maximum tolerated teacher conflict ratio on WANN core before veto')
+    parser.add_argument('--rgftd_teacher_score_core_weight', type=float, default=0.35,
+                        help='Weight of core agreement in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_support_weight', type=float, default=0.30,
+                        help='Weight of support foreground agreement in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_class_weight', type=float, default=0.25,
+                        help='Weight of class-wise validation in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_score_conf_weight', type=float, default=0.10,
+                        help='Weight of teacher confidence in teacher reliability score')
+    parser.add_argument('--rgftd_teacher_release_prob_floor', type=float, default=0.35,
+                        help='Foreground-probability floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_margin_floor', type=float, default=0.05,
+                        help='Foreground-vs-background margin floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_class_floor', type=float, default=0.50,
+                        help='Class-reliability floor for soft RGFTD-v2 release')
+    parser.add_argument('--rgftd_teacher_release_min', type=float, default=0.03,
+                        help='Maximum adaptive floor for RGFTD-v2 release after quality and schedule scaling')
+    parser.add_argument('--rgftd_active_fg_topk_ratio', type=float, default=0.002,
+                        help='Top-k ratio used to cap active RGFTD foreground pixels after gating')
+    parser.add_argument('--rgftd_active_fg_topk_min_pixels', type=int, default=8,
+                        help='Minimum active RGFTD foreground pixels kept after budget pruning')
+    parser.add_argument('--rgftd_active_fg_topk_max_pixels', type=int, default=4096,
+                        help='Maximum active RGFTD foreground pixels kept after budget pruning')
+    parser.add_argument('--rgftd_spatial_support_enabled', type=int, default=1,
+                        help='Softly weight RGFTD foreground release by target-side WANN candidate or seed-near support')
+    parser.add_argument('--rgftd_spatial_support_radius', type=int, default=2,
+                        help='Dilation radius around target foreground seed support for RGFTD spatial weighting')
+    parser.add_argument('--rgftd_spatial_candidate_weight', type=float, default=1.0,
+                        help='Soft spatial weight for teacher foreground pixels in target foreground candidate regions')
+    parser.add_argument('--rgftd_spatial_near_seed_weight', type=float, default=0.75,
+                        help='Soft spatial weight for teacher foreground pixels near target foreground seeds')
+    parser.add_argument('--rgftd_spatial_far_weight', type=float, default=0.15,
+                        help='Soft spatial weight for teacher foreground pixels far from target support but inside RGFTD region')
+    parser.add_argument('--rgftd_max_bg_fg_ratio', type=float, default=1.0,
+                        help='Maximum allowed active background-to-foreground pixel ratio for RGFTD')
+    parser.add_argument('--rgftd_allow_bg_without_fg', type=int, default=0,
+                        help='Whether RGFTD may keep background pixels when no foreground pixels survive')
+    parser.add_argument('--rgftd_lambda_eff_cap', type=float, default=0.02,
+                        help='Upper bound on effective RGFTD lambda after release and safety scaling')
+    parser.add_argument('--rgftd_refine_enabled', type=int, default=0,
+                        help='Enable target-side soft refinement before RGFTD KL distillation')
+    parser.add_argument('--rgftd_refine_iters', type=int, default=3,
+                        help='Local affinity propagation iterations for RGFTD refined soft target')
+    parser.add_argument('--rgftd_refine_affinity_sigma', type=float, default=0.75,
+                        help='Intensity-affinity bandwidth for RGFTD target-side refinement')
+    parser.add_argument('--rgftd_refine_affinity_mix', type=float, default=0.35,
+                        help='Per-iteration mixing strength for RGFTD target-side refinement')
+    parser.add_argument('--rgftd_refine_seed_strength', type=float, default=0.95,
+                        help='Strength used to clamp target weak seeds in RGFTD refined target')
+    parser.add_argument('--rgftd_refine_core_anchor_radius', type=int, default=1,
+                        help='Radius used to include nearby WANN core pixels as fixed anchors during RGFTD refinement')
+    parser.add_argument('--rgftd_refine_unsupported_fg_scale', type=float, default=0.25,
+                        help='Foreground probability scale for active teacher islands unsupported by target seed/candidate structure')
+    parser.add_argument('--rgftd_refine_fg_floor', type=float, default=0.02,
+                        help='Minimum foreground probability kept in active foreground refinement regions')
+    parser.add_argument('--rgftd_refine_bg_ceiling', type=float, default=0.98,
+                        help='Maximum background probability allowed inside RGFTD refinement ROI')
+    parser.add_argument('--rgftd_refine_min_fg_mass', type=float, default=1.0,
+                        help='Minimum refined foreground mass required to keep RGFTD active')
+    parser.add_argument('--rgftd_refine_min_roi_pixels', type=float, default=1.0,
+                        help='Minimum refinement ROI pixels required to keep RGFTD active')
+    parser.add_argument('--rgftd_v3_enabled', type=int, default=0,
+                        help='Enable RGFTD-v3 target-aware teacher routing')
+    parser.add_argument('--rgftd_v3_stable_teacher_enabled', type=int, default=0,
+                        help='Use audit-selected stable client snapshots as the RGFTD-v3 teacher bank')
+    parser.add_argument('--rgftd_v3_server_ema_fallback', type=int, default=-1,
+                        help='Allow RGFTD-v3 server EMA fallback; -1 keeps legacy fallback except stable-teacher mode')
+    parser.add_argument('--rgftd_v3_teacher_pool_topk', type=int, default=1,
+                        help='Top-k teachers kept by RGFTD-v3 routing; first full version uses top_k=1')
+    parser.add_argument('--rgftd_v3_audit_start_iters', type=int, default=800,
+                        help='Iteration after which RGFTD-v3 starts target-side routing audit')
+    parser.add_argument('--rgftd_v3_audit_interval_iters', type=int, default=1000,
+                        help='Low-frequency routing audit interval in iterations; <=0 means one-shot')
+    parser.add_argument('--rgftd_v3_audit_batches', type=int, default=4,
+                        help='Number of local batches used by each RGFTD-v3 routing audit')
+    parser.add_argument('--rgftd_v3_audit_score_thresh', type=float, default=0.05,
+                        help='Minimum routing score required for a teacher to enter the RGFTD-v3 pool')
+    parser.add_argument('--rgftd_v3_audit_teacher_reliability_min', type=float, default=0.30,
+                        help='Minimum teacher reliability required by RGFTD-v3 routing audit')
+    parser.add_argument('--rgftd_v3_fallback_lambda_eff_cap', type=float, default=0.01,
+                        help='Effective lambda cap used when RGFTD-v3 falls back to the server EMA teacher')
+    parser.add_argument('--rgftd_v3_benefit_enabled', type=int, default=1,
+                        help='Enable RGFTD-v3.2 online benefit-aware teacher scoring')
+    parser.add_argument('--rgftd_v3_lease_iters', type=int, default=0,
+                        help='Deprecated compatibility flag; region-conditional RGFTD does not grant teacher leases')
+    parser.add_argument('--rgftd_v3_benefit_momentum', type=float, default=0.80,
+                        help='EMA momentum for RGFTD-v3.2 online benefit score')
+    parser.add_argument('--rgftd_v3_benefit_good_thresh', type=float, default=0.70,
+                        help='Benefit score threshold for renewing a teacher at full cap')
+    parser.add_argument('--rgftd_v3_benefit_decay_thresh', type=float, default=0.50,
+                        help='Benefit score threshold below which the teacher cap is decayed')
+    parser.add_argument('--rgftd_v3_benefit_revoke_thresh', type=float, default=0.35,
+                        help='Benefit score threshold below which the selected teacher is revoked')
+    parser.add_argument('--rgftd_v3_routing_benefit_floor', type=float, default=0.25,
+                        help='Minimum benefit multiplier used by routing audit so teachers can recover after new audits')
+    parser.add_argument('--rgftd_v3_recover_audit_score_thresh', type=float, default=0.60,
+                        help='Audit score threshold that can restore a previously decayed teacher to the routing floor')
+    parser.add_argument('--rgftd_v3_decay_cap_scale', type=float, default=0.50,
+                        help='Lambda cap scale for a decayed RGFTD-v3.2 teacher')
+    parser.add_argument('--rgftd_v3_min_cap_scale', type=float, default=0.25,
+                        help='Minimum lambda cap scale before a teacher is fully revoked')
+    parser.add_argument('--rgftd_v3_bgfg_warn_thresh', type=float, default=0.75,
+                        help='Background/foreground ratio threshold used by RGFTD-v3.2 stability scoring')
+    parser.add_argument('--rgftd_v3_cap_hit_penalty', type=float, default=0.20,
+                        help='Stability penalty when effective lambda repeatedly hits the cap')
+    parser.add_argument('--rgftd_v3_lowmaxp_delta_thresh', type=float, default=0.02,
+                        help='Allowed positive delta of WANN low-R max probability before stability penalty')
+    parser.add_argument('--rgftd_v3_wann_mass_drop_thresh', type=float, default=0.05,
+                        help='Allowed WANN effective-mass drop before stability penalty')
+    parser.add_argument('--rgftd_stable_min_score', type=float, default=0.05,
+                        help='Minimum local weak-label proxy score required to mark a stable RGFTD teacher valid')
+    parser.add_argument('--rgftd_stable_update_margin', type=float, default=0.01,
+                        help='Minimum score improvement required to refresh the stable teacher snapshot')
+    parser.add_argument('--rgftd_stable_seed_prob_floor', type=float, default=0.35,
+                        help='Foreground seed probability floor used by local stable teacher selection')
+    parser.add_argument('--rgftd_stable_seed_margin_floor', type=float, default=0.05,
+                        help='Foreground-vs-background seed margin floor used by local stable teacher selection')
+    parser.add_argument('--rgftd_stable_max_core_conflict', type=float, default=0.20,
+                        help='Maximum core conflict allowed by local stable teacher selection')
+    parser.add_argument('--rgftd_stable_lowmaxp_delta_thresh', type=float, default=0.02,
+                        help='Allowed positive WANN low-R max-probability delta for stable teacher selection')
+    parser.add_argument('--rgftd_stable_wann_mass_drop_thresh', type=float, default=0.05,
+                        help='Allowed WANN effective-mass drop for stable teacher selection')
     args = parser.parse_args()
 
     if not args.deterministic:
@@ -575,7 +1913,9 @@ def main():
     assert args.max_iterations > 0 and (args.max_iterations % args.eval_iters == 0)
 
     if args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']:
-        assert args.tsne_iters > 0 and (args.tsne_iters % args.iters == 0)
+        assert args.tsne_iters >= 0
+        if args.tsne_iters > 0:
+            assert args.tsne_iters % args.iters == 0
 
     if args.strategy == 'FedRep':
         assert args.iters > args.rep_iters
@@ -608,20 +1948,153 @@ def main():
         assert args.dual_init in ['random', 'adjacent', 'nearest', 'aggregated']
 
     assert args.role in ['server', 'client']
-    assert args.img_class in ['odoc', 'faz', 'polyp']
-    if args.img_class == 'faz':
-        assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
-    else:
-        assert args.sup_type in ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
+    assert args.img_class in ['odoc', 'faz', 'polyp', 'prostate']
+    valid_sup_types = ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
+    assert args.sup_type in valid_sup_types or str(args.sup_type).startswith('sparse_scribble_')
+    assert args.wann_enabled in [0, 1]
+    assert args.ala_max_epochs >= 0
+    assert 0.0 <= args.wann_soft_thresh <= args.wann_core_thresh <= args.wann_r_max
+    assert 0.0 <= args.wann_core_min_weight <= args.wann_r_max
+    assert 0.0 <= args.wann_dilated_support_score <= 1.0
+    assert args.wann_appearance_temp > 0.0
+    assert args.wann_texture_kernel_size >= 1
+    assert args.wann_texture_temp > 0.0
+    assert 0.0 <= args.wann_texture_weight <= 1.0
+    assert args.wann_pred_start_iter >= 0
+    assert 0.0 <= args.wann_entropy_weight <= 1.0
+    assert 0.0 <= args.wann_agreement_weight <= 1.0
+    assert 0.0 <= args.wann_global_agreement_weight <= 1.0
+    assert args.wann_keypoint_soft_radius >= 0
+    assert args.wann_scribble_soft_radius >= 0
+    assert args.wann_box_soft_radius >= 0
+    assert args.wann_mask_soft_radius >= 0
+    assert args.wann_seed_support_erode_radius >= 0
+    assert args.wann_seed_support_box_erode_radius >= 0
+    assert args.wann_seed_support_block_erode_radius >= 0
+    assert args.wann_soft_lambda >= 0.0
+    assert args.wann_cons_lambda >= 0.0
+    assert args.wann_soft_rampup_iters >= 0
+    assert args.wann_cons_rampup_iters >= 0
+    assert args.wann_sparse_adaptive_core in [0, 1]
+    assert 0.0 <= args.wann_sparse_min_core_ratio <= 1.0
+    assert 0.0 <= args.wann_sparse_max_core_ratio <= 1.0
+    assert 0.0 <= args.wann_sparse_core_min_reliability <= args.wann_r_max
+    assert 0.0 <= args.wann_low_confident_thresh <= 1.0
+    assert 0.0 <= args.wann_target_core_ratio <= 1.0
+    assert args.wann_core_deficit_soft_boost >= 0.0
+    assert args.rgftd_enabled in [0, 1]
+    if args.rgftd_enabled == 1:
+        assert args.wann_enabled == 1
+        assert args.strategy in ['FedUniV2', 'FedUniV2.1']
+    assert args.rgftd_lambda >= 0.0
+    assert args.rgftd_warmup_iters >= 0
+    assert args.rgftd_rampup_iters >= 0
+    assert args.rgftd_light_audit_enabled in [0, 1]
+    assert args.rgftd_light_audit_start_iters >= 0
+    assert args.rgftd_light_audit_lambda >= 0.0
+    assert 0.0 <= args.rgftd_light_audit_core_ratio_thresh <= 1.0
+    assert 0.0 <= args.rgftd_light_audit_low_maxp_thresh <= 1.0
+    assert 0.0 <= args.rgftd_teacher_ema_decay < 1.0
+    assert 0.0 <= args.rgftd_teacher_conf_thresh <= 1.0
+    assert args.rgftd_teacher_foreground_radius >= 0
+    assert args.rgftd_min_foreground_pixels >= 0
+    assert 0.0 <= args.rgftd_min_foreground_ratio <= 1.0
+    assert 0.0 <= args.rgftd_teacher_fg_prob_thresh <= 1.0
+    assert 0.0 <= args.rgftd_teacher_fg_topk_ratio <= 1.0
+    assert args.rgftd_teacher_fg_topk_min_pixels >= 0
+    assert args.rgftd_teacher_student_fg_margin >= 0.0
+    assert 0.0 <= args.rgftd_teacher_bg_conf_thresh <= 1.0
+    assert 0.0 <= args.rgftd_bg_max_fg_prob <= 1.0
+    assert 0.0 <= args.rgftd_student_conf_thresh <= 1.0
+    assert 0.0 <= args.rgftd_student_entropy_thresh <= 1.0
+    assert 0.0 <= args.rgftd_low_r_thresh <= args.wann_r_max
+    assert args.rgftd_temperature > 0.0
+    assert args.rgftd_use_soft_band in [0, 1]
+    assert 0.0 <= args.rgftd_background_weight <= 1.0
+    assert args.rgftd_skip_background_only in [0, 1]
+    assert args.rgftd_teacher_validation_enabled in [0, 1]
+    assert 0.0 <= args.rgftd_teacher_reliability_min <= 1.0
+    assert 0.0 <= args.rgftd_teacher_core_agree_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_support_agree_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_support_prob_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_conf_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_class_reliability_min <= 1.0
+    assert 0.0 <= args.rgftd_teacher_max_core_conflict <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_prob_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_margin_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_class_floor <= 1.0
+    assert 0.0 <= args.rgftd_teacher_release_min <= 1.0
+    assert 0.0 <= args.rgftd_active_fg_topk_ratio <= 1.0
+    assert args.rgftd_active_fg_topk_min_pixels >= 0
+    assert args.rgftd_active_fg_topk_max_pixels >= 0
+    assert args.rgftd_active_fg_topk_max_pixels == 0 or args.rgftd_active_fg_topk_max_pixels >= args.rgftd_active_fg_topk_min_pixels
+    assert args.rgftd_spatial_support_enabled in [0, 1]
+    assert args.rgftd_spatial_support_radius >= 0
+    assert 0.0 <= args.rgftd_spatial_candidate_weight <= 1.0
+    assert 0.0 <= args.rgftd_spatial_near_seed_weight <= 1.0
+    assert 0.0 <= args.rgftd_spatial_far_weight <= 1.0
+    assert args.rgftd_max_bg_fg_ratio >= 0.0
+    assert args.rgftd_allow_bg_without_fg in [0, 1]
+    assert args.rgftd_lambda_eff_cap >= 0.0
+    assert args.rgftd_refine_enabled in [0, 1]
+    assert args.rgftd_refine_iters >= 0
+    assert args.rgftd_refine_affinity_sigma > 0.0
+    assert 0.0 <= args.rgftd_refine_affinity_mix <= 1.0
+    assert 0.0 <= args.rgftd_refine_seed_strength <= 1.0
+    assert args.rgftd_refine_core_anchor_radius >= 0
+    assert 0.0 <= args.rgftd_refine_unsupported_fg_scale <= 1.0
+    assert 0.0 <= args.rgftd_refine_fg_floor <= 1.0
+    assert 0.0 <= args.rgftd_refine_bg_ceiling <= 1.0
+    assert args.rgftd_refine_min_fg_mass >= 0.0
+    assert args.rgftd_refine_min_roi_pixels >= 0.0
+    assert args.rgftd_v3_enabled in [0, 1]
+    assert args.rgftd_v3_stable_teacher_enabled in [0, 1]
+    assert args.rgftd_v3_server_ema_fallback in [-1, 0, 1]
+    assert args.rgftd_v3_teacher_pool_topk >= 1
+    assert args.rgftd_v3_audit_start_iters >= 0
+    assert args.rgftd_v3_audit_interval_iters >= 0 or args.rgftd_v3_audit_interval_iters == -1
+    assert args.rgftd_v3_audit_batches >= 1
+    assert 0.0 <= args.rgftd_v3_audit_score_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_audit_teacher_reliability_min <= 1.0
+    assert args.rgftd_v3_fallback_lambda_eff_cap >= 0.0
+    assert args.rgftd_v3_benefit_enabled in [0, 1]
+    assert args.rgftd_v3_lease_iters >= 0
+    assert 0.0 <= args.rgftd_v3_benefit_momentum < 1.0
+    assert 0.0 <= args.rgftd_v3_benefit_revoke_thresh <= args.rgftd_v3_benefit_decay_thresh <= args.rgftd_v3_benefit_good_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_routing_benefit_floor <= 1.0
+    assert 0.0 <= args.rgftd_v3_recover_audit_score_thresh <= 1.0
+    assert 0.0 <= args.rgftd_v3_decay_cap_scale <= 1.0
+    assert 0.0 <= args.rgftd_v3_min_cap_scale <= 1.0
+    assert args.rgftd_v3_min_cap_scale <= args.rgftd_v3_decay_cap_scale
+    assert args.rgftd_v3_bgfg_warn_thresh >= 0.0
+    assert 0.0 <= args.rgftd_v3_cap_hit_penalty <= 1.0
+    assert args.rgftd_v3_lowmaxp_delta_thresh >= 0.0
+    assert args.rgftd_v3_wann_mass_drop_thresh >= 0.0
+    assert args.rgftd_stable_min_score >= 0.0
+    assert args.rgftd_stable_update_margin >= 0.0
+    assert 0.0 <= args.rgftd_stable_seed_prob_floor <= 1.0
+    assert -1.0 <= args.rgftd_stable_seed_margin_floor <= 1.0
+    assert args.rgftd_stable_max_core_conflict >= 0.0
+    assert args.rgftd_stable_lowmaxp_delta_thresh >= 0.0
+    assert args.rgftd_stable_wann_mass_drop_thresh >= 0.0
+    assert args.rgftd_teacher_score_core_weight >= 0.0
+    assert args.rgftd_teacher_score_support_weight >= 0.0
+    assert args.rgftd_teacher_score_class_weight >= 0.0
+    assert args.rgftd_teacher_score_conf_weight >= 0.0
+    if args.rgftd_v3_enabled == 1:
+        assert args.rgftd_enabled == 1
+        assert args.rgftd_v3_teacher_pool_topk == 1
+        assert args.rgftd_teacher_validation_enabled == 1
 
     # Configure logger
     if args.role == 'server':
-        if os.path.exists(snapshot_path + '/code'):
-            shutil.rmtree(snapshot_path + '/code')
-        shutil.copytree('.', snapshot_path + '/code',
-                        shutil.ignore_patterns(['.git', '__pycache__']))
+        if int(getattr(args, 'save_code_snapshot', 1)) == 1:
+            if os.path.exists(snapshot_path + '/code'):
+                shutil.rmtree(snapshot_path + '/code')
+            shutil.copytree('.', snapshot_path + '/code',
+                            shutil.ignore_patterns(['.git', '__pycache__']))
         fl.common.logger.configure('server', filename=os.path.join(snapshot_path, 'server.log'))
-        writer = SummaryWriter(snapshot_path + '/log')
+        writer = build_summary_writer(args, snapshot_path + '/log')
     else:
         fl.common.logger.configure('client_{}'.format(args.cid), filename=os.path.join(snapshot_path, 'client_{}.log'.format(args.cid)))
 
@@ -639,7 +2112,7 @@ def main():
 
     drop_last = True if args.strategy in ['FedUni', 'FedUniV2', 'FedUniV2.1'] else False
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
-                             num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
+                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
     valloader = DataLoader(db_val, batch_size=1, shuffle=False,
                            num_workers=0)
 
@@ -702,7 +2175,7 @@ def main():
         if args.strategy in ['FedAP', 'FedAPLC']:
             if args.pretrain:
                 start_time = time.time()
-                writer = SummaryWriter(snapshot_path + '/pretrain_log')
+                writer = build_summary_writer(args, snapshot_path + '/pretrain_log')
                 pretrain_path, pretrain_state_dict = pretrain_model(args, writer, worker_init_fn)
                 print(time.time() - start_time)
                 return
@@ -719,6 +2192,176 @@ def main():
         # Start server
         state_dict_keys = model.model.state_dict().keys()
         train_scalar_metrics = ['lr', 'total_loss', 'loss_ce']
+        if args.wann_enabled == 1:
+            train_scalar_metrics += [
+                'wann_loss_hard',
+                'wann_loss_soft',
+                'wann_loss_cons',
+                'wann_lambda_soft',
+                'wann_lambda_cons',
+                'wann_effective_supervision_mass',
+                'wann_core_ratio',
+                'wann_soft_ratio',
+                'wann_low_weight_ratio',
+                'wann_mean_reliability',
+                'wann_entropy_low_r',
+                'wann_max_prob_low_r',
+                'wann_foreground_ratio_low_r',
+                'wann_update_norm',
+                'wann_update_cos_loo',
+                'wann_update_conflict',
+            ]
+        if args.rgftd_enabled == 1:
+            train_scalar_metrics += [
+                'rgftd_loss',
+                'rgftd_loss_seg',
+                'rgftd_loss_aux',
+                'rgftd_lambda',
+                'rgftd_lambda_pre_safety',
+                'rgftd_lambda_after_safety',
+                'rgftd_lambda_effective',
+                'rgftd_core_safety_factor',
+                'rgftd_candidate_ratio',
+                'rgftd_active_ratio',
+                'rgftd_region_ratio',
+                'rgftd_risk_region_ratio',
+                'rgftd_preserve_region_ratio',
+                'rgftd_teacher_accept_ratio',
+                'rgftd_teacher_reject_ratio',
+                'rgftd_reject_by_support',
+                'rgftd_reject_by_core_conflict',
+                'rgftd_reject_by_fg_ratio',
+                'rgftd_teacher_active_loss',
+                'rgftd_student_uncertain_ratio',
+                'rgftd_teacher_conf_mean',
+                'rgftd_teacher_reliability',
+                'rgftd_teacher_core_agreement',
+                'rgftd_teacher_core_conflict',
+                'rgftd_teacher_core_conf_mean',
+                'rgftd_teacher_support_agreement',
+                'rgftd_teacher_support_conflict',
+                'rgftd_teacher_support_conf_mean',
+                'rgftd_teacher_support_fg_recall',
+                'rgftd_teacher_support_bg_agreement',
+                'rgftd_teacher_seed_support_agreement',
+                'rgftd_teacher_seed_support_conflict',
+                'rgftd_teacher_seed_support_conf_mean',
+                'rgftd_teacher_seed_support_fg_recall',
+                'rgftd_teacher_seed_support_fg_prob_mean',
+                'rgftd_teacher_seed_support_fg_conf_mean',
+                'rgftd_teacher_seed_support_fg_margin_mean',
+                'rgftd_teacher_seed_support_bg_agreement',
+                'rgftd_core_conflict_veto_ratio',
+                'rgftd_student_conf_mean',
+                'rgftd_student_entropy_mean',
+                'rgftd_kl_mean',
+                'rgftd_weight_mean',
+                'rgftd_release_factor',
+                'rgftd_release_raw',
+                'rgftd_release_quality',
+                'rgftd_release_min_effective',
+                'rgftd_release_prob_gate',
+                'rgftd_release_conf_gate',
+                'rgftd_release_class_gate',
+                'rgftd_teacher_foreground_ratio',
+                'rgftd_spatial_support_ratio',
+                'rgftd_foreground_candidate_ratio',
+                'rgftd_spatial_weight_mean',
+                'rgftd_spatial_weight_candidate_mean',
+                'rgftd_spatial_weight_near_seed_mean',
+                'rgftd_spatial_weight_far_mean',
+                'rgftd_spatial_loss_scale',
+                'rgftd_active_foreground_pixels_pre_spatial',
+                'rgftd_active_foreground_spatial_keep_ratio',
+                'rgftd_active_foreground_ratio',
+                'rgftd_active_background_ratio',
+                'rgftd_foreground_veto_ratio',
+                'rgftd_active_foreground_pixels_pre_budget',
+                'rgftd_active_background_pixels_pre_budget',
+                'rgftd_foreground_budget_ratio',
+                'rgftd_background_budget_ratio',
+                'rgftd_background_foreground_ratio',
+                'rgftd_background_balance_factor',
+                'rgftd_active_foreground_pixels_pre_return',
+                'rgftd_active_background_pixels_pre_return',
+                'rgftd_active_foreground_pixels',
+                'rgftd_active_background_pixels',
+                'rgftd_active_fg_seed_precision',
+                'rgftd_active_fg_seed_recall',
+                'rgftd_active_fg_support_precision',
+                'rgftd_active_fg_support_recall',
+                'rgftd_active_fg_candidate_ratio',
+                'rgftd_active_fg_fg_candidate_ratio',
+                'rgftd_active_fg_near_seed_ratio',
+                'rgftd_refine_enabled',
+                'rgftd_refine_silent',
+                'rgftd_refine_roi_ratio',
+                'rgftd_refine_affinity_mean',
+                'rgftd_refine_teacher_q_kl',
+                'rgftd_refine_q_entropy_mean',
+                'rgftd_refine_q_fg_mass',
+                'rgftd_refine_q_fg_ratio',
+                'rgftd_refine_q_fg_delta',
+                'rgftd_refine_q_seed_precision',
+                'rgftd_refine_q_seed_recall',
+                'rgftd_refine_q_candidate_ratio',
+                'rgftd_refine_q_near_seed_ratio',
+                'rgftd_refine_unsupported_fg_ratio',
+                'rgftd_refine_unsupported_fg_scale',
+                'rgftd_refine_q_core_conflict',
+                'rgftd_background_suppression_mean',
+                'rgftd_return_reason',
+                'rgftd_v3_pool_size',
+                'rgftd_v3_pool_stable',
+                'rgftd_v3_no_teacher',
+                'rgftd_v3_fallback_teacher',
+                'rgftd_v3_teacher_source',
+                'rgftd_v3_selected_teacher',
+                'rgftd_v3_selected_score',
+                'rgftd_v3_selected_stable_score',
+                'rgftd_v3_best_failed_teacher',
+                'rgftd_v3_best_failed_score',
+                'rgftd_v3_routing_score',
+                'rgftd_v3_audit_seed_fg_prob_mean',
+                'rgftd_v3_audit_seed_fg_margin_mean',
+                'rgftd_v3_audit_seed_fg_recall',
+                'rgftd_v3_audit_core_conflict',
+                'rgftd_v3_audit_core_valid',
+                'rgftd_v3_audit_teacher_reliability',
+                'rgftd_v3_audit_release_factor',
+                'rgftd_v3_lease_active',
+                'rgftd_v3_lease_age',
+                'rgftd_v3_benefit_score',
+                'rgftd_v3_window_score',
+                'rgftd_v3_stability_score',
+                'rgftd_v3_teacher_renew',
+                'rgftd_v3_teacher_revoke',
+                'rgftd_v3_teacher_decay',
+                'rgftd_v3_cap_current',
+                'rgftd_v3_cap_scale',
+                'rgftd_v3_ret0_ratio',
+                'rgftd_v3_cap_hit_ratio',
+                'rgftd_v3_bgfg_window',
+                'rgftd_v3_lowmaxp_delta',
+                'rgftd_v3_wann_mass_delta',
+                'rgftd_stable_valid',
+                'rgftd_stable_score',
+                'rgftd_stable_best_score',
+                'rgftd_stable_updated',
+            ]
+            for class_id in range(1, args.num_classes):
+                train_scalar_metrics += [
+                    'rgftd_teacher_class{}_agreement'.format(class_id),
+                    'rgftd_teacher_class{}_core_agreement'.format(class_id),
+                    'rgftd_teacher_class{}_reliability'.format(class_id),
+                    'rgftd_teacher_class{}_release_ratio'.format(class_id),
+                ]
+        if args.ala_max_epochs > 0:
+            train_scalar_metrics += [
+                'ala_epochs',
+                'ala_final_std',
+                'ala_hit_max_epochs',
+            ]
         train_image_metrics = ['Image', 'Prediction', 'GroundTruth']
         if args.strategy in ['FedUniV2', 'FedUniV2.1']:
             train_image_metrics += ['Prediction2', 'Pseudo']

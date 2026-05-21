@@ -137,6 +137,7 @@ class BaseClient(fl.client.Client):
             log(INFO, 'save model to {}'.format(save_mode_path))
 
         if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+            and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
             and (self.current_iter % self.args.tsne_iters == 0):
             tsne_feature_ = tsne_feature(self.args, self.model, self.valloader, self.amp)
             val_metrics['tsne_feature'] = fl.common.ndarray_to_bytes(tsne_feature_.cpu().numpy())
@@ -173,7 +174,18 @@ def tsne_feature(args, model, dataloader, amp=False):
     return all_feature_lc
 
 
-def tsne(n_components, data, label, list):
+def format_site_name(client_id):
+    if client_id < 26:
+        return f"Site {chr(ord('A') + client_id)}"
+    return f"Site {client_id + 1}"
+
+
+def build_site_markers(site_names):
+    marker_cycle = ["o", "v", "H", "s", "^", "P", "X", "D", "<", ">", "*", "p", "8"]
+    return {site_name: marker_cycle[idx % len(marker_cycle)] for idx, site_name in enumerate(site_names)}
+
+
+def tsne(n_components, data, label, site_labels):
     params = {
         'font.family':'',
         'font.serif':'',
@@ -190,15 +202,17 @@ def tsne(n_components, data, label, list):
 
         df = pd.DataFrame(z)
         df['label'] = label
-        df['list'] = list
-        # palet = sns.color_palette("hls",2)
-        # flatui = ['#f3a598', '#faaf42','#480080','#0fa14a','#7a7c7f']
-        flatui = ['#f3a598', '#66c7df','#faaf42','#9659ef','#11b855']
-        palet = sns.color_palette(flatui)
-        markers = {'Site A': "o", 'Site B': 'v', 'Site C': 'H', 'Site D': 's', 'Site E': '^'}
+        df['list'] = site_labels
+        site_names = list(dict.fromkeys(site_labels))
+        flatui = ['#f3a598', '#66c7df', '#faaf42', '#9659ef', '#11b855', '#7a7c7f', '#d65f5f', '#2f7f5f']
+        if len(site_names) <= len(flatui):
+            palet = sns.color_palette(flatui[:len(site_names)])
+        else:
+            palet = sns.color_palette("husl", len(site_names))
+        markers = build_site_markers(site_names)
         alpha = 0.8
 
-        sns.scatterplot(x=z[:,0], y=z[:,1], hue=list, style=list, markers=markers, linewidth = 0.1, 
+        sns.scatterplot(x=z[:,0], y=z[:,1], hue=site_labels, style=site_labels, markers=markers, linewidth = 0.1, 
                         palette=palet, alpha=alpha, data=df)
 
         plt.xlim(-150, 150)
@@ -469,8 +483,8 @@ class MyServer(Server):
                                         evaluate_metrics_fed['client_{}_val_mean_dice'.format(client_id)], iter_num)
 
                 if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
+                    and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
                     and (iter_num % self.args.tsne_iters == 0):
-                    site_list = ['Site A', 'Site B', 'Site C', 'Site D', 'Site E']
                     tsne_feature_list = []
                     labels = []
                     sites = []
@@ -478,7 +492,7 @@ class MyServer(Server):
                         tsne_feature = fl.common.bytes_to_ndarray(evaluate_metrics_fed['client_{}_tsne_feature'.format(client_id)])
                         tsne_feature_list.append(tsne_feature)
                         labels += [client_id + 1] * tsne_feature.shape[0]
-                        sites += [site_list[client_id]] * tsne_feature.shape[0]
+                        sites += [format_site_name(client_id)] * tsne_feature.shape[0]
 
                     all_tsne_feature = np.concatenate(tsne_feature_list, axis=0)
                     # print(labels, sites)
