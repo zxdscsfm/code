@@ -66,7 +66,12 @@ from weak_annotation_reliability import (
     soft_band_loss as wann_soft_band_loss,
     weighted_ce_loss as wann_weighted_ce_loss,
 )
-from rgftd_reliability_distillation import get_rgftd_lambda, rgftd_loss, zero_rgftd_profile
+from rgftd_reliability_distillation import (
+    get_rgftd_lambda,
+    rgftd_loss,
+    select_rdsi_teacher_logits,
+    zero_rgftd_profile,
+)
 
 
 def _primary_logits(model_out):
@@ -85,8 +90,11 @@ def _aux_logits(model_out):
 
 def _average_rgftd_profiles(profile_a, profile_b):
     return {
-        key: 0.5 * (profile_a[key] + profile_b[key])
-        for key in profile_a.keys()
+        key: 0.5 * (
+            profile_a.get(key, torch.tensor(0.0, device=next(iter(profile_a.values())).device))
+            + profile_b.get(key, torch.tensor(0.0, device=next(iter(profile_b.values())).device))
+        )
+        for key in set(profile_a.keys()) | set(profile_b.keys())
     }
 
 
@@ -207,6 +215,59 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rgftd_reject_by_support=%.6f' % _scalar_float(rgftd_profile.get('reject_by_support', 0.0)),
             'rgftd_reject_by_core_conflict=%.6f' % _scalar_float(rgftd_profile.get('reject_by_core_conflict', 0.0)),
             'rgftd_reject_by_fg_ratio=%.6f' % _scalar_float(rgftd_profile.get('reject_by_fg_ratio', 0.0)),
+            'rgftd_release_score_mean=%.6f' % _scalar_float(rgftd_profile.get('release_score_mean', 0.0)),
+            'rgftd_release_score_top=%.6f' % _scalar_float(rgftd_profile.get('release_score_top', 0.0)),
+            'rdsi_enabled=%.1f' % _scalar_float(rgftd_profile.get('rdsi_enabled', 0.0)),
+            'rdsi_compete=%.1f' % _scalar_float(rgftd_profile.get('rdsi_teacher_compete_count', 0.0)),
+            'rdsi_active=%.6f' % _scalar_float(rgftd_profile.get('rdsi_multi_teacher_active', 0.0)),
+            'rdsi_gap12=%.6f' % _scalar_float(rgftd_profile.get('rdsi_best_vs_second_gap', 0.0)),
+            'rdsi_score=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_score_mean', 0.0)),
+            'rdsi_score_top=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_score_top', 0.0)),
+            'rdsi_score_benefit=%.6f' % _scalar_float(rgftd_profile.get('rdsi_score_benefit_mean', 0.0)),
+            'rdsi_tid_mean=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_mean', 0.0)),
+            'rdsi_switch=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_switch_ratio', 0.0)),
+            'rdsi_trel=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher_reliable_score', 0.0)),
+            'rdsi_sel_trel=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_reliable', 0.0)),
+            'rdsi_sel_benefit=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_benefit', 0.0)),
+            'rdsi_sel_gap=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_gap', 0.0)),
+            'rdsi_sel_risk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_student_risk', 0.0)),
+            'rdsi_gap=%.6f' % _scalar_float(rgftd_profile.get('rdsi_knowledge_gap_score', 0.0)),
+            'rdsi_risk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_risk_region_ratio', 0.0)),
+            'rdsi_hcore=%.6f' % _scalar_float(rgftd_profile.get('rdsi_hard_core_ratio', 0.0)),
+            'rdsi_softcore=%.6f' % _scalar_float(rgftd_profile.get('rdsi_soft_core_ratio', 0.0)),
+            'rdsi_fgdef=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_deficient_ratio', 0.0)),
+            'rdsi_fgex=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_excessive_ratio', 0.0)),
+            'rdsi_cand=%.6f' % _scalar_float(rgftd_profile.get('rdsi_candidate_ratio', 0.0)),
+            'rdsi_accept=%.6f' % _scalar_float(rgftd_profile.get('rdsi_accept_ratio', 0.0)),
+            'rdsi_reject=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_ratio', 0.0)),
+            'rdsi_rej_core=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_by_core', 0.0)),
+            'rdsi_rej_seed=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_by_seed', 0.0)),
+            'rdsi_rej_prior=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_by_prior', 0.0)),
+            'rdsi_rej_ent=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_by_entropy', 0.0)),
+            'rdsi_rej_fgex=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_by_fg_excess', 0.0)),
+            'rdsi_benefit=%.6f' % _scalar_float(rgftd_profile.get('rdsi_benefit_mean', 0.0)),
+            'rdsi_benefit_top=%.6f' % _scalar_float(rgftd_profile.get('rdsi_benefit_top', 0.0)),
+            'rdsi_alpha=%.6f' % _scalar_float(rgftd_profile.get('rdsi_alpha_mean', 0.0)),
+            'rdsi_alpha_top=%.6f' % _scalar_float(rgftd_profile.get('rdsi_alpha_top', 0.0)),
+            'rdsi_raw_fg_delta=%.6f' % _scalar_float(rgftd_profile.get('rdsi_raw_teacher_fg_delta', 0.0)),
+            'rdsi_raw_conf=%.6f' % _scalar_float(rgftd_profile.get('rdsi_raw_teacher_conf_mean', 0.0)),
+            'rdsi_raw_fg=%.6f' % _scalar_float(rgftd_profile.get('rdsi_raw_teacher_fg_ratio', 0.0)),
+            'rdsi_q_fg_delta=%.6f' % _scalar_float(rgftd_profile.get('rdsi_q_fg_delta', 0.0)),
+            'rdsi_target_conf=%.6f' % _scalar_float(rgftd_profile.get('rdsi_target_conf_mean', 0.0)),
+            'rdsi_target_ent=%.6f' % _scalar_float(rgftd_profile.get('rdsi_target_entropy_mean', 0.0)),
+            'rdsi_loss_raw=%.6f' % _scalar_float(rgftd_profile.get('rdsi_loss_raw', 0.0)),
+            'rdsi_loss_w=%.6f' % _scalar_float(rgftd_profile.get('rdsi_loss_weighted', 0.0)),
+            'rdsi_t0=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher0_ratio', 0.0)),
+            'rdsi_t1=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher1_ratio', 0.0)),
+            'rdsi_t2=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher2_ratio', 0.0)),
+            'rdsi_t3=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher3_ratio', 0.0)),
+            'rdsi_t4=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher4_ratio', 0.0)),
+            'rdsi_t5=%.6f' % _scalar_float(rgftd_profile.get('rdsi_teacher5_ratio', 0.0)),
+            'rgftd_teacher_reliable_score=%.6f' % _scalar_float(rgftd_profile.get('teacher_reliable_score', 0.0)),
+            'rgftd_student_risk_score=%.6f' % _scalar_float(rgftd_profile.get('student_risk_score', 0.0)),
+            'rgftd_knowledge_gap_score=%.6f' % _scalar_float(rgftd_profile.get('knowledge_gap_score', 0.0)),
+            'rgftd_selected_gap_mean=%.6f' % _scalar_float(rgftd_profile.get('selected_gap_mean', 0.0)),
+            'rgftd_rejected_gap_mean=%.6f' % _scalar_float(rgftd_profile.get('rejected_gap_mean', 0.0)),
             'rgftd_t_rel=%.6f' % _scalar_float(rgftd_profile.get('teacher_reliability', 0.0)),
             'rgftd_t_core=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_agreement', 0.0)),
             'rgftd_t_core_cf=%.6f' % _scalar_float(rgftd_profile.get('teacher_core_conflict', 0.0)),
@@ -362,6 +423,9 @@ class MyClient(BaseClient):
     def _rgftd_v3_stable_enabled(self):
         return self._rgftd_v3_enabled() and int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
 
+    def _rdsi_enabled(self):
+        return self._rgftd_v3_enabled() and int(getattr(self.args, 'rdsi_enabled', 1)) == 1
+
     def _move_batch_to_cuda(self, sampled_batch):
         if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
             volume_batch = sampled_batch['image'].unsqueeze(1).cuda()
@@ -380,6 +444,18 @@ class MyClient(BaseClient):
         for param in teacher_model.parameters():
             param.requires_grad = False
         return teacher_model
+
+    def _rgftd_v3_candidate_teacher_ids(self):
+        teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
+        teacher_valids = getattr(self.model, 'rgftd_teacher_valids', {})
+        candidate_ids = []
+        for teacher_id in sorted(teacher_state_dicts.keys()):
+            if int(teacher_id) == int(self.cid):
+                continue
+            if self._rgftd_v3_stable_enabled() and float(teacher_valids.get(teacher_id, 0.0)) <= 0.5:
+                continue
+            candidate_ids.append(teacher_id)
+        return candidate_ids
 
     def _rgftd_v3_pair_key(self, teacher_source, teacher_id):
         return '{}:{}'.format(int(teacher_source), int(teacher_id))
@@ -654,6 +730,14 @@ class MyClient(BaseClient):
         audit_interval = int(getattr(self.args, 'rgftd_v3_audit_interval_iters', 1000))
         if self.rgftd_v3_last_audit_iter < 0:
             return True
+        last_status = getattr(self, 'rgftd_v3_status', _default_rgftd_v3_status())
+        empty_pool_retry = int(getattr(self.args, 'rgftd_v3_empty_pool_retry_iters', 10))
+        if (
+            empty_pool_retry > 0
+            and float(last_status.get('v3_no_teacher', 1.0)) > 0.5
+            and float(last_status.get('v3_pool_size', 0.0)) <= 0.0
+        ):
+            return (self.current_iter - self.rgftd_v3_last_audit_iter) >= empty_pool_retry
         if audit_interval <= 0:
             return False
         return (self.current_iter - self.rgftd_v3_last_audit_iter) >= audit_interval
@@ -915,6 +999,8 @@ class MyClient(BaseClient):
             for param in wann_ref_model.parameters():
                 param.requires_grad = False
         rgftd_teacher_model = None
+        rgftd_teacher_state_items = []
+        rgftd_pool_probe_model = None
         rgftd_teacher_args = self.args
         rgftd_v3_status = _default_rgftd_v3_status()
         if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
@@ -925,7 +1011,21 @@ class MyClient(BaseClient):
                     rgftd_v3_status = dict(getattr(self, 'rgftd_v3_status', _default_rgftd_v3_status()))
                 teacher_state_dicts = getattr(self.model, 'rgftd_teacher_state_dicts', {})
                 selected_teacher_id = getattr(self, 'rgftd_v3_selected_teacher_id', None)
-                if selected_teacher_id is not None and selected_teacher_id in teacher_state_dicts:
+                rdsi_candidate_ids = self._rgftd_v3_candidate_teacher_ids() if self._rdsi_enabled() else []
+                if self._rdsi_enabled() and rdsi_candidate_ids:
+                    for teacher_id in rdsi_candidate_ids:
+                        rgftd_teacher_state_items.append((teacher_id, teacher_state_dicts[teacher_id]))
+                    rgftd_v3_status['v3_no_teacher'] = 0.0
+                    rgftd_v3_status['v3_fallback_teacher'] = 0.0
+                    rgftd_v3_status['v3_teacher_source'] = 3.0
+                    rgftd_v3_status['v3_pool_size'] = float(len(rdsi_candidate_ids))
+                    rgftd_v3_status['v3_pool_stable'] = float(len(rdsi_candidate_ids)) if self._rgftd_v3_stable_enabled() else 0.0
+                    rgftd_v3_status['v3_selected_teacher'] = -3.0
+                    rgftd_v3_status['v3_selected_score'] = 0.0
+                    rgftd_pool_probe_model = self._build_teacher_model_from_state_dict(
+                        teacher_state_dicts[rdsi_candidate_ids[0]]
+                    )
+                elif selected_teacher_id is not None and selected_teacher_id in teacher_state_dicts:
                     pair_key = self._rgftd_v3_pair_key(1, selected_teacher_id)
                     benefit_score = self._rgftd_v3_get_score(self.rgftd_v3_benefit_scores, pair_key, 1.0)
                     revoke_thresh = float(getattr(self.args, 'rgftd_v3_benefit_revoke_thresh', 0.35))
@@ -1117,7 +1217,8 @@ class MyClient(BaseClient):
                     rgftd_profile = zero_rgftd_profile(outputs.device)
                     if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
                         lambda_rgftd_raw = get_rgftd_lambda(self.current_iter, self.args)
-                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and rgftd_teacher_model is not None:
+                    has_rgftd_teacher = rgftd_teacher_model is not None or len(rgftd_teacher_state_items) > 0
+                    if int(getattr(self.args, 'rgftd_enabled', 0)) == 1 and has_rgftd_teacher:
                         light_audit_trigger = (
                             core_ratio < float(getattr(self.args, 'rgftd_light_audit_core_ratio_thresh', 0.05))
                             and _scalar_float(wann_maps.profile.get('max_prob_low_r', 0.0)) >
@@ -1136,9 +1237,35 @@ class MyClient(BaseClient):
                             setattr(rgftd_teacher_args, 'rgftd_light_audit_active', 1)
                             setattr(rgftd_teacher_args, 'rgftd_use_soft_band', 1)
                         if float(lambda_rgftd_raw) > 0.0 or float(lambda_light) > 0.0:
+                            rdsi_profile = None
                             with torch.no_grad():
-                                teacher_out = rgftd_teacher_model(volume_batch)
-                                teacher_logits = _primary_logits(teacher_out)
+                                if len(rgftd_teacher_state_items) > 0:
+                                    if rgftd_pool_probe_model is None:
+                                        rgftd_pool_probe_model = self._build_teacher_model_from_state_dict(
+                                            rgftd_teacher_state_items[0][1]
+                                        )
+                                    teacher_logits_list = []
+                                    teacher_ids = []
+                                    for teacher_id, teacher_state_dict in rgftd_teacher_state_items:
+                                        rgftd_pool_probe_model.load_state_dict(teacher_state_dict, strict=False)
+                                        teacher_out = rgftd_pool_probe_model(volume_batch)
+                                        teacher_logits_list.append(_primary_logits(teacher_out).detach())
+                                        teacher_ids.append(teacher_id)
+                                    rgftd_teacher_args = copy.copy(rgftd_teacher_args)
+                                    teacher_logits, rdsi_profile = select_rdsi_teacher_logits(
+                                        outputs,
+                                        teacher_logits_list,
+                                        teacher_ids,
+                                        label_batch,
+                                        wann_maps,
+                                        rgftd_teacher_args,
+                                        self.current_iter,
+                                    )
+                                    if teacher_logits is None:
+                                        teacher_logits = teacher_logits_list[0]
+                                else:
+                                    teacher_out = rgftd_teacher_model(volume_batch)
+                                    teacher_logits = _primary_logits(teacher_out)
                             loss_rgftd_seg, lambda_rgftd_seg, rgftd_profile_seg = rgftd_loss(
                                 outputs,
                                 teacher_logits,
@@ -1160,9 +1287,15 @@ class MyClient(BaseClient):
                             loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux)
                             lambda_rgftd = 0.5 * (float(lambda_rgftd_seg) + float(lambda_rgftd_aux))
                             rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
+                            if rdsi_profile is not None:
+                                for rdsi_key, rdsi_value in rdsi_profile.items():
+                                    if str(rdsi_key).startswith('rdsi_'):
+                                        rgftd_profile[rdsi_key] = rdsi_value
                             rgftd_profile['teacher_active_loss'] = (
                                 loss_rgftd.detach() * torch.tensor(float(lambda_rgftd), device=loss_rgftd.device)
                             )
+                            rgftd_profile['rdsi_loss_raw'] = loss_rgftd.detach()
+                            rgftd_profile['rdsi_loss_weighted'] = rgftd_profile['teacher_active_loss'].detach()
                             loss_ce = loss_ce + float(lambda_rgftd) * loss_rgftd
                             if self._rgftd_v3_enabled():
                                 rgftd_v3_status = self._rgftd_v3_update_online_benefit(
@@ -1827,6 +1960,32 @@ def main():
                         help='Minimum refinement ROI pixels required to keep RGFTD active')
     parser.add_argument('--rgftd_v3_enabled', type=int, default=0,
                         help='Enable RGFTD-v3 target-aware teacher routing')
+    parser.add_argument('--rdsi_enabled', type=int, default=1,
+                        help='Enable RDSI region-wise domain-specialist teacher selection inside RGFTD-v3')
+    parser.add_argument('--rdsi_residual_alpha', type=float, default=0.35,
+                        help='Maximum residual intervention strength for benefit-validated RDSI teacher targets')
+    parser.add_argument('--rdsi_hard_core_conf_thresh', type=float, default=0.90,
+                        help='Student confidence required for WANN core pixels to be treated as hard preserve core')
+    parser.add_argument('--rdsi_hard_core_entropy_thresh', type=float, default=0.25,
+                        help='Maximum student entropy for WANN core pixels to be treated as hard preserve core')
+    parser.add_argument('--rdsi_hard_core_reliability_thresh', type=float, default=0.65,
+                        help='Minimum WANN reliability for WANN core pixels to be treated as hard preserve core')
+    parser.add_argument('--rdsi_benefit_topk_ratio', type=float, default=0.002,
+                        help='Per-image top-ratio of benefit-validated RDSI regions allowed to receive teacher intervention')
+    parser.add_argument('--rdsi_benefit_topk_min_pixels', type=int, default=8,
+                        help='Minimum pixels selected by benefit-validated RDSI per image when candidates exist')
+    parser.add_argument('--rdsi_benefit_topk_max_pixels', type=int, default=4096,
+                        help='Maximum pixels selected by benefit-validated RDSI per image; <=0 means no cap')
+    parser.add_argument('--rdsi_benefit_score_floor', type=float, default=1e-6,
+                        help='Minimum benefit-validated RDSI score required before top-k selection')
+    parser.add_argument('--rdsi_entropy_increase_margin', type=float, default=0.05,
+                        help='Allowed teacher foreground entropy increase before RDSI benefit is suppressed')
+    parser.add_argument('--rdsi_entropy_increase_scale', type=float, default=0.35,
+                        help='Scale used to suppress high-entropy teacher foreground intervention')
+    parser.add_argument('--rdsi_fg_excess_margin', type=float, default=0.05,
+                        help='Allowed regional foreground increase before RDSI foreground-excess suppression')
+    parser.add_argument('--rdsi_fg_excess_scale', type=float, default=0.20,
+                        help='Scale used to suppress foreground-excess RDSI teacher intervention')
     parser.add_argument('--rgftd_v3_stable_teacher_enabled', type=int, default=0,
                         help='Use audit-selected stable client snapshots as the RGFTD-v3 teacher bank')
     parser.add_argument('--rgftd_v3_server_ema_fallback', type=int, default=-1,
@@ -1837,6 +1996,8 @@ def main():
                         help='Iteration after which RGFTD-v3 starts target-side routing audit')
     parser.add_argument('--rgftd_v3_audit_interval_iters', type=int, default=1000,
                         help='Low-frequency routing audit interval in iterations; <=0 means one-shot')
+    parser.add_argument('--rgftd_v3_empty_pool_retry_iters', type=int, default=10,
+                        help='Retry interval after an empty teacher-pool audit before a full routing interval elapses')
     parser.add_argument('--rgftd_v3_audit_batches', type=int, default=4,
                         help='Number of local batches used by each RGFTD-v3 routing audit')
     parser.add_argument('--rgftd_v3_audit_score_thresh', type=float, default=0.05,
@@ -2048,11 +2209,26 @@ def main():
     assert args.rgftd_refine_min_fg_mass >= 0.0
     assert args.rgftd_refine_min_roi_pixels >= 0.0
     assert args.rgftd_v3_enabled in [0, 1]
+    assert args.rdsi_enabled in [0, 1]
+    assert 0.0 <= args.rdsi_residual_alpha <= 1.0
+    assert 0.0 <= args.rdsi_hard_core_conf_thresh <= 1.0
+    assert 0.0 <= args.rdsi_hard_core_entropy_thresh <= 1.0
+    assert 0.0 <= args.rdsi_hard_core_reliability_thresh <= 1.0
+    assert 0.0 <= args.rdsi_benefit_topk_ratio <= 1.0
+    assert args.rdsi_benefit_topk_min_pixels >= 0
+    assert args.rdsi_benefit_topk_max_pixels >= 0
+    assert args.rdsi_benefit_topk_max_pixels == 0 or args.rdsi_benefit_topk_max_pixels >= args.rdsi_benefit_topk_min_pixels
+    assert args.rdsi_benefit_score_floor >= 0.0
+    assert args.rdsi_entropy_increase_margin >= 0.0
+    assert args.rdsi_entropy_increase_scale > 0.0
+    assert args.rdsi_fg_excess_margin >= 0.0
+    assert args.rdsi_fg_excess_scale > 0.0
     assert args.rgftd_v3_stable_teacher_enabled in [0, 1]
     assert args.rgftd_v3_server_ema_fallback in [-1, 0, 1]
     assert args.rgftd_v3_teacher_pool_topk >= 1
     assert args.rgftd_v3_audit_start_iters >= 0
     assert args.rgftd_v3_audit_interval_iters >= 0 or args.rgftd_v3_audit_interval_iters == -1
+    assert args.rgftd_v3_empty_pool_retry_iters >= 0
     assert args.rgftd_v3_audit_batches >= 1
     assert 0.0 <= args.rgftd_v3_audit_score_thresh <= 1.0
     assert 0.0 <= args.rgftd_v3_audit_teacher_reliability_min <= 1.0
@@ -2231,6 +2407,54 @@ def main():
                 'rgftd_reject_by_support',
                 'rgftd_reject_by_core_conflict',
                 'rgftd_reject_by_fg_ratio',
+                'rgftd_release_score_mean',
+                'rgftd_release_score_top',
+                'rgftd_rdsi_enabled',
+                'rgftd_rdsi_teacher_compete_count',
+                'rgftd_rdsi_candidate_teacher_count',
+                'rgftd_rdsi_multi_teacher_active',
+                'rgftd_rdsi_best_vs_second_gap',
+                'rgftd_rdsi_selected_score_mean',
+                'rgftd_rdsi_selected_score_top',
+                'rgftd_rdsi_score_benefit_mean',
+                'rgftd_rdsi_selected_teacher_mean',
+                'rgftd_rdsi_selected_teacher_switch_ratio',
+                'rgftd_rdsi_teacher_reliable_score',
+                'rgftd_rdsi_selected_teacher_reliable',
+                'rgftd_rdsi_selected_teacher_benefit',
+                'rgftd_rdsi_selected_teacher_gap',
+                'rgftd_rdsi_selected_student_risk',
+                'rgftd_rdsi_knowledge_gap_score',
+                'rgftd_rdsi_risk_region_ratio',
+                'rgftd_rdsi_hard_core_ratio',
+                'rgftd_rdsi_soft_core_ratio',
+                'rgftd_rdsi_fg_deficient_ratio',
+                'rgftd_rdsi_fg_excessive_ratio',
+                'rgftd_rdsi_candidate_ratio',
+                'rgftd_rdsi_accept_ratio',
+                'rgftd_rdsi_reject_ratio',
+                'rgftd_rdsi_reject_by_core',
+                'rgftd_rdsi_reject_by_seed',
+                'rgftd_rdsi_reject_by_prior',
+                'rgftd_rdsi_reject_by_entropy',
+                'rgftd_rdsi_reject_by_fg_excess',
+                'rgftd_rdsi_benefit_mean',
+                'rgftd_rdsi_benefit_top',
+                'rgftd_rdsi_alpha_mean',
+                'rgftd_rdsi_alpha_top',
+                'rgftd_rdsi_raw_teacher_fg_delta',
+                'rgftd_rdsi_raw_teacher_conf_mean',
+                'rgftd_rdsi_raw_teacher_fg_ratio',
+                'rgftd_rdsi_q_fg_delta',
+                'rgftd_rdsi_target_conf_mean',
+                'rgftd_rdsi_target_entropy_mean',
+                'rgftd_rdsi_loss_raw',
+                'rgftd_rdsi_loss_weighted',
+                'rgftd_teacher_reliable_score',
+                'rgftd_student_risk_score',
+                'rgftd_knowledge_gap_score',
+                'rgftd_selected_gap_mean',
+                'rgftd_rejected_gap_mean',
                 'rgftd_teacher_active_loss',
                 'rgftd_student_uncertain_ratio',
                 'rgftd_teacher_conf_mean',
@@ -2355,6 +2579,10 @@ def main():
                     'rgftd_teacher_class{}_core_agreement'.format(class_id),
                     'rgftd_teacher_class{}_reliability'.format(class_id),
                     'rgftd_teacher_class{}_release_ratio'.format(class_id),
+                ]
+            for teacher_id in range(min(int(getattr(args, 'min_num_clients', 0)), 10)):
+                train_scalar_metrics += [
+                    'rgftd_rdsi_teacher{}_ratio'.format(teacher_id),
                 ]
         if args.ala_max_epochs > 0:
             train_scalar_metrics += [
