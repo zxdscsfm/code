@@ -3,7 +3,6 @@ from email.mime import image
 import os
 import re
 import shutil
-from tkinter import image_types
 import pandas as pd
 import h5py
 import nibabel as nib
@@ -52,6 +51,8 @@ parser.add_argument('--label_prompt', type=int, default=1,
                     help='Whether use label prompt for FedUniV2/FedUniV2.1')
 parser.add_argument('--img_size', type=int,  default=384,
                         help='image size')
+parser.add_argument('--use_cuda', type=int, default=1,
+                    help='Whether to use CUDA for evaluation')
 def get_client_ids(client,base_dir):
     client1_test_set = 'Domain1/test/'+pd.Series(os.listdir(base_dir+"/Domain1/test"))
     client1_training_set = 'Domain1/train/'+pd.Series(os.listdir(base_dir+"/Domain1/train"))
@@ -247,6 +248,7 @@ def calculate_metric_percase(pred, gt):
     else:
         return 0.0, 0.0, 192, 0.0, 0.0, 0.0, 0.0, 0.0
 def test_single_image(case, net, test_save_path, FLAGS):
+    device = torch.device('cuda' if int(getattr(FLAGS, 'use_cuda', 1)) == 1 and torch.cuda.is_available() else 'cpu')
    
     h5f = h5py.File(FLAGS.root_path +
                             "/{}".format(case), 'r')
@@ -262,7 +264,7 @@ def test_single_image(case, net, test_save_path, FLAGS):
             # slice = zoom(
             #     slice, (patch_size[0] / x, patch_size[1] / y), order=0)
         input = torch.from_numpy(slice).unsqueeze(
-                0).float().cuda()
+                0).float().to(device)
         net.eval()
         with torch.no_grad():
             out = torch.argmax(torch.softmax(
@@ -283,7 +285,7 @@ def test_single_image(case, net, test_save_path, FLAGS):
             # slice = zoom(
             #     slice, (patch_size[0] / x, patch_size[1] / y), order=0)
         input = torch.from_numpy(slice).unsqueeze(
-            0).unsqueeze(0).float().cuda()
+            0).unsqueeze(0).float().to(device)
         net.eval()
         with torch.no_grad():
             out = torch.argmax(torch.softmax(
@@ -326,6 +328,7 @@ def Inference(FLAGS):
     import torch.backends.cudnn as cudnn
     cudnn.benchmark = False
     cudnn.deterministic = True
+    FLAGS.device = 'cuda' if int(getattr(FLAGS, 'use_cuda', 1)) == 1 and torch.cuda.is_available() else 'cpu'
     net = net_factory(FLAGS,net_type=FLAGS.model, in_chns=FLAGS.in_chns,
                       class_num=FLAGS.num_classes)
     ## Personalizatioon Federated Learning test model path (FedLPPA, FedLC)
@@ -339,7 +342,7 @@ def Inference(FLAGS):
         snapshot_path, 'unet_best_model.pth')
   
   
-    net.load_state_dict(torch.load(save_mode_path))
+    net.load_state_dict(torch.load(save_mode_path, map_location=FLAGS.device))
     print("init weight from {}".format(save_mode_path))
     net.eval()
     names = []
@@ -436,8 +439,9 @@ if __name__ == '__main__':
     os.environ.setdefault('CUDA_VISIBLE_DEVICES', '3')
     seed = 2022 
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)  
     random.seed(seed)  
     torch.manual_seed(seed)

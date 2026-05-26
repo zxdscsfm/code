@@ -19,10 +19,128 @@ RGFTD_PROFILE_KEYS = [
     "release_prob_gate",
     "release_conf_gate",
     "release_class_gate",
+    "release_score_mean",
+    "release_score_top",
+    "rdsi_enabled",
+    "rdsi_teacher_compete_count",
+    "rdsi_candidate_teacher_count",
+    "rdsi_multi_teacher_active",
+    "rdsi_best_vs_second_gap",
+    "rdsi_selected_score_mean",
+    "rdsi_selected_score_top",
+    "rdsi_score_benefit_mean",
+    "rdsi_selected_teacher_reliable",
+    "rdsi_selected_teacher_benefit",
+    "rdsi_selected_teacher_gap",
+    "rdsi_selected_student_risk",
+    "rdsi_selected_spatial_support",
+    "rdsi_selected_teacher_mean",
+    "rdsi_selected_teacher_switch_ratio",
+    "rdsi_teacher_reliable_score",
+    "rdsi_knowledge_gap_score",
+    "rdsi_risk_region_ratio",
+    "rdsi_hard_core_ratio",
+    "rdsi_soft_core_ratio",
+    "rdsi_fg_deficient_ratio",
+    "rdsi_fg_excessive_ratio",
+    "rdsi_candidate_ratio",
+    "rdsi_accept_ratio",
+    "rdsi_reject_ratio",
+    "rdsi_reject_by_core",
+    "rdsi_reject_by_seed",
+    "rdsi_reject_by_prior",
+    "rdsi_reject_by_entropy",
+    "rdsi_reject_by_fg_excess",
+    "rdsi_reject_by_bg_only",
+    "rdsi_reject_by_no_fg_lift",
+    "rdsi_foreground_active_ratio",
+    "rdsi_background_paired_ratio",
+    "rdsi_fg_repair_active_ratio",
+    "rdsi_bg_suppress_active_ratio",
+    "rdsi_boundary_active_ratio",
+    "rdsi_background_pair_ratio",
+    "rdsi_fg_repair_score",
+    "rdsi_bg_suppress_score",
+    "rdsi_boundary_score",
+    "rdsi_bg_only_ratio",
+    "rdsi_fg_lift_mean",
+    "rdsi_fg_lift_top",
+    "rdsi_bg_suppression_mean",
+    "rdsi_bg_suppression_top",
+    "rdsi_benefit_mean",
+    "rdsi_benefit_top",
+    "rdsi_boundary_support_mean",
+    "rdsi_boundary_support_top",
+    "rdsi_core_preserving_fg_mean",
+    "rdsi_core_preserving_fg_top",
+    "rdsi_core_damage_mean",
+    "rdsi_core_damage_top",
+    "rdsi_seed_conflict_mean",
+    "rdsi_unsafe_gap_mean",
+    "rdsi_unsafe_gap_top",
+    "rdsi_foreground_excess_proxy",
+    "rdsi_safe_signal",
+    "rdsi_unsafe_signal",
+    "rdsi_safe_budget_factor",
+    "rdsi_effective_topk_ratio",
+    "rdsi_effective_min_pixels",
+    "rdsi_core_reopen_ratio",
+    "rdsi_core_reopen_active_ratio",
+    "rdsi_veto_by_core_damage",
+    "rdsi_alpha_mean",
+    "rdsi_alpha_top",
+    "rdsi_raw_teacher_fg_delta",
+    "rdsi_raw_teacher_conf_mean",
+    "rdsi_raw_teacher_fg_ratio",
+    "rdsi_q_fg_delta",
+    "rdsi_fg_repair_q_delta",
+    "rdsi_bg_suppress_q_delta",
+    "rdsi_boundary_q_delta",
+    "rdsi_target_conf_mean",
+    "rdsi_target_entropy_mean",
+    "rdsi_loss_raw",
+    "rdsi_loss_weighted",
+    "rdsi_proto_loss",
+    "rdsi_proto_weight_mean",
+    "rdsi_proto_weight_top",
+    "rdsi_proto_cosine",
+    "rdsi_proto_region_ratio",
+    "rdsi_proto_teacher_entropy",
+    "rdsi_proto_teacher_weight_max",
+    "rdsi_proto_valid_batches",
+    "rdsi_fg_repair_loss",
+    "rdsi_bg_suppress_loss",
+    "rdsi_boundary_loss",
+    "rdsi_teacher0_ratio",
+    "rdsi_teacher1_ratio",
+    "rdsi_teacher2_ratio",
+    "rdsi_teacher3_ratio",
+    "rdsi_teacher4_ratio",
+    "rdsi_teacher5_ratio",
+    "rdsi_teacher6_ratio",
+    "rdsi_teacher7_ratio",
+    "rdsi_teacher8_ratio",
+    "rdsi_teacher9_ratio",
+    "rdsi_teacher_scribble_ratio",
+    "rdsi_teacher_keypoint_ratio",
+    "rdsi_teacher_block_ratio",
+    "rdsi_teacher_unknown_ratio",
+    "teacher_reliable_score",
+    "student_risk_score",
+    "knowledge_gap_score",
+    "selected_gap_mean",
+    "rejected_gap_mean",
     "candidate_ratio",
     "active_ratio",
     "region_ratio",
+    "risk_region_ratio",
+    "preserve_region_ratio",
     "teacher_accept_ratio",
+    "teacher_reject_ratio",
+    "reject_by_support",
+    "reject_by_core_conflict",
+    "reject_by_fg_ratio",
+    "teacher_active_loss",
     "student_uncertain_ratio",
     "teacher_conf_mean",
     "student_conf_mean",
@@ -145,7 +263,19 @@ def _topk_foreground_anchor(score, valid_mask, topk_ratio, min_pixels, max_pixel
         valid_count = int(flat_valid[batch_idx].sum().detach().cpu().item())
         if valid_count <= 0:
             continue
-        k = max(int(min_pixels), int(math.ceil(float(valid_count) * float(topk_ratio))))
+        if torch.is_tensor(topk_ratio):
+            batch_topk_ratio = float(topk_ratio[batch_idx].detach().cpu().item())
+        elif isinstance(topk_ratio, (list, tuple)):
+            batch_topk_ratio = float(topk_ratio[batch_idx])
+        else:
+            batch_topk_ratio = float(topk_ratio)
+        if torch.is_tensor(min_pixels):
+            batch_min_pixels = int(math.ceil(float(min_pixels[batch_idx].detach().cpu().item())))
+        elif isinstance(min_pixels, (list, tuple)):
+            batch_min_pixels = int(math.ceil(float(min_pixels[batch_idx])))
+        else:
+            batch_min_pixels = int(min_pixels)
+        k = max(batch_min_pixels, int(math.ceil(float(valid_count) * batch_topk_ratio)))
         if max_pixels is not None:
             if torch.is_tensor(max_pixels):
                 batch_max_pixels = int(max_pixels[batch_idx].detach().cpu().item())
@@ -181,6 +311,17 @@ def _topk_foreground_anchor(score, valid_mask, topk_ratio, min_pixels, max_pixel
     return anchors & valid_mask
 
 
+def _local_range_score(value, radius):
+    radius = int(max(radius, 0))
+    if radius <= 0:
+        return torch.zeros_like(value)
+    kernel = radius * 2 + 1
+    x = value.float().unsqueeze(1)
+    local_max = F.max_pool2d(x, kernel_size=kernel, stride=1, padding=radius)
+    local_min = -F.max_pool2d(-x, kernel_size=kernel, stride=1, padding=radius)
+    return (local_max[:, 0] - local_min[:, 0]).clamp(0.0, 1.0)
+
+
 def _seed_or_fallback(seed_mask, fallback_mask):
     valid_mask = fallback_mask.clone()
     for batch_idx in range(seed_mask.shape[0]):
@@ -201,6 +342,18 @@ def _masked_mean(value, mask):
     if float(denom.detach().cpu().item()) <= 0.0:
         return denom * 0.0
     return (value * mask.float()).sum() / denom
+
+
+def _safe_target_masks(label, wann_maps, num_classes):
+    raw_label = label.long()
+    target_label = getattr(wann_maps, "target_label", raw_label).long()
+    target_valid = (target_label >= 0) & (target_label < num_classes)
+    valid_mask = getattr(wann_maps, "valid_mask", raw_label != num_classes) & target_valid
+    raw_support_mask = getattr(wann_maps, "support_mask", valid_mask) & target_valid
+    raw_seed_support_mask = getattr(wann_maps, "seed_support_mask", raw_support_mask) & target_valid
+    support_mask = raw_support_mask
+    seed_support_mask = raw_seed_support_mask
+    return target_label, target_valid, valid_mask, support_mask, seed_support_mask
 
 
 def _normalize_gate(score, floor):
@@ -297,6 +450,1369 @@ def _one_hot_label(label, num_classes, like):
     return one_hot
 
 
+_RDSI_RUNTIME_ATTRS = [
+    "_rdsi_active_mask",
+    "_rdsi_foreground_active_mask",
+    "_rdsi_background_active_mask",
+    "_rdsi_fg_repair_active_mask",
+    "_rdsi_bg_suppress_active_mask",
+    "_rdsi_boundary_active_mask",
+    "_rdsi_action_map",
+    "_rdsi_residual_alpha_map",
+    "_rdsi_teacher_proto_weight_stack",
+    "_rdsi_selected_teacher_stack_index",
+    "_rdsi_proto_region_weight",
+    "_rdsi_benefit_score",
+    "_rdsi_selected_score",
+    "_rdsi_fg_repair_score",
+    "_rdsi_bg_suppress_score",
+    "_rdsi_boundary_score",
+    "_rdsi_foreground_lift_score",
+    "_rdsi_background_suppression_score",
+    "_rdsi_boundary_support",
+    "_rdsi_core_preserving_fg_support",
+    "_rdsi_core_damage_proxy",
+    "_rdsi_seed_conflict",
+    "_rdsi_unsafe_gap",
+    "_rdsi_foreground_excess_proxy",
+    "_rdsi_safe_budget_factor",
+    "_rdsi_core_reopen_mask",
+    "_rdsi_risk_region",
+    "_rdsi_hard_core_mask",
+    "_rdsi_soft_core_mask",
+]
+
+
+def _clear_rdsi_runtime_state(args):
+    for attr in _RDSI_RUNTIME_ATTRS:
+        if hasattr(args, attr):
+            delattr(args, attr)
+
+
+_SUP_TYPE_BUCKETS = ("scribble", "keypoint", "block", "unknown")
+
+
+def _canonical_rdsi_sup_type(sup_type):
+    sup_type = str(sup_type).strip().lower()
+    if sup_type == "keypoint":
+        return "keypoint"
+    if sup_type in ["scribble", "scribble_noisy"] or sup_type.startswith("sparse_scribble_"):
+        return "scribble"
+    if sup_type in ["box", "block"]:
+        return "block"
+    return "unknown"
+
+
+def _rdsi_teacher_sup_type_map(args):
+    raw = str(getattr(args, "rdsi_teacher_sup_types", "") or "")
+    parts = [part.strip() for part in raw.split(",")]
+    return {
+        idx: _canonical_rdsi_sup_type(part)
+        for idx, part in enumerate(parts)
+        if part
+    }
+
+
+def _runtime_map(args, attr, ref, as_bool=False):
+    value = getattr(args, attr, None)
+    if value is None or not torch.is_tensor(value) or tuple(value.shape) != tuple(ref.shape):
+        return None
+    value = value.to(device=ref.device)
+    if as_bool:
+        return value > 0.5 if value.dtype != torch.bool else value
+    return value.float()
+
+
+def _rdsi_intervention_region(wann_maps, student_conf, student_entropy, hard_core_mask, soft_core_mask, args):
+    """Return WANN-supported risk pixels eligible for external intervention."""
+    low_r_thresh = float(getattr(args, "rgftd_low_r_thresh", getattr(args, "wann_soft_thresh", 0.25)))
+    student_conf_thresh = float(getattr(args, "rgftd_student_conf_thresh", 0.80))
+    student_entropy_thresh = float(getattr(args, "rgftd_student_entropy_thresh", 0.35))
+    zero_bool = torch.zeros_like(hard_core_mask, dtype=torch.bool)
+    risk_mask = getattr(wann_maps, "risk_mask", zero_bool)
+    low_conflict_mask = getattr(wann_maps, "low_conflict_mask", zero_bool)
+    low_reliability_mask = wann_maps.reliability < low_r_thresh
+    student_uncertain = (student_conf <= student_conf_thresh) | (student_entropy >= student_entropy_thresh)
+    non_core_candidate = (wann_maps.ignore_mask | wann_maps.soft_band | soft_core_mask) & (~hard_core_mask)
+    focus_evidence = risk_mask | low_conflict_mask | (student_uncertain & low_reliability_mask)
+    return non_core_candidate & focus_evidence
+
+
+def select_rdsi_teacher_logits(student_logits, teacher_logits_list, teacher_ids, label, wann_maps, args, iter_num):
+    """Select a region-wise domain-specialist teacher from a cross-client pool."""
+    device = student_logits.device
+    _clear_rdsi_runtime_state(args)
+    profile = {}
+    profile["rdsi_enabled"] = torch.tensor(1.0, device=device)
+    teacher_sup_type_map = _rdsi_teacher_sup_type_map(args)
+
+    if teacher_logits_list is None or len(teacher_logits_list) == 0:
+        return None, profile
+    if teacher_ids is None or len(teacher_ids) != len(teacher_logits_list):
+        teacher_ids = list(range(len(teacher_logits_list)))
+
+    temperature = max(float(getattr(args, "rgftd_temperature", 1.0)), 1e-6)
+    student_prob = F.softmax(student_logits.detach(), dim=1)
+    student_conf = student_prob.max(dim=1)[0]
+    student_entropy = _normalized_entropy(student_prob)
+    log_student_prob = torch.log(student_prob.clamp_min(1e-6))
+
+    num_classes = int(getattr(args, "num_classes", student_logits.shape[1]))
+    target_label, _, valid_mask, support_mask, seed_support_mask = _safe_target_masks(
+        label, wann_maps, num_classes
+    )
+    core_mask_raw = wann_maps.core_mask & valid_mask
+    student_pred = student_prob.argmax(dim=1)
+    hard_core_conf_thresh = float(getattr(args, "rdsi_hard_core_conf_thresh", 0.90))
+    hard_core_entropy_thresh = float(getattr(args, "rdsi_hard_core_entropy_thresh", 0.25))
+    hard_core_reliability_thresh = float(getattr(args, "rdsi_hard_core_reliability_thresh", 0.65))
+    hard_core_mask = (
+        core_mask_raw
+        & (student_pred == target_label)
+        & (student_conf >= hard_core_conf_thresh)
+        & (student_entropy <= hard_core_entropy_thresh)
+        & (wann_maps.reliability >= hard_core_reliability_thresh)
+    )
+    soft_core_mask = core_mask_raw & (~hard_core_mask)
+    core_mask = hard_core_mask
+    core_valid = bool(float(core_mask.float().sum().detach().cpu().item()) > 0.0)
+
+    low_r_thresh = float(getattr(args, "rgftd_low_r_thresh", getattr(args, "wann_soft_thresh", 0.25)))
+    candidate_mask = getattr(wann_maps, "candidate_mask", None)
+    if candidate_mask is None:
+        candidate_mask = (~hard_core_mask) & (wann_maps.reliability >= low_r_thresh)
+    candidate_mask = (candidate_mask | soft_core_mask) & (~hard_core_mask)
+    non_conflict_mask = ~getattr(wann_maps, "low_conflict_mask", torch.zeros_like(valid_mask, dtype=torch.bool))
+    reliable_candidate_mask = candidate_mask & non_conflict_mask & (wann_maps.reliability >= low_r_thresh)
+
+    region = _rdsi_intervention_region(
+        wann_maps,
+        student_conf,
+        student_entropy,
+        hard_core_mask,
+        soft_core_mask,
+        args,
+    )
+
+    teacher_fg_radius = int(getattr(args, "rgftd_teacher_foreground_radius", 2))
+    teacher_fg_prob_thresh = float(getattr(args, "rgftd_teacher_fg_prob_thresh", 0.35))
+    teacher_fg_topk_ratio = float(getattr(args, "rgftd_teacher_fg_topk_ratio", 0.002))
+    min_fg_pixels = int(getattr(args, "rgftd_min_foreground_pixels", 8))
+    teacher_fg_topk_min_pixels = int(getattr(args, "rgftd_teacher_fg_topk_min_pixels", min_fg_pixels))
+    teacher_student_fg_margin = float(getattr(args, "rgftd_teacher_student_fg_margin", 0.05))
+    teacher_bg_conf_thresh = float(getattr(args, "rgftd_teacher_bg_conf_thresh", 0.98))
+    bg_max_fg_prob = float(getattr(args, "rgftd_bg_max_fg_prob", 0.15))
+    max_bg_fg_ratio = float(getattr(args, "rgftd_max_bg_fg_ratio", 1.0))
+    spatial_support_enabled = int(getattr(args, "rgftd_spatial_support_enabled", 1)) == 1
+    spatial_support_radius = int(getattr(args, "rgftd_spatial_support_radius", teacher_fg_radius))
+    spatial_candidate_weight = max(0.0, min(float(getattr(args, "rgftd_spatial_candidate_weight", 1.0)), 1.0))
+    spatial_near_seed_weight = max(0.0, min(float(getattr(args, "rgftd_spatial_near_seed_weight", 0.75)), 1.0))
+    spatial_far_weight = max(0.0, min(float(getattr(args, "rgftd_spatial_far_weight", 0.15)), 1.0))
+    validation_enabled = int(getattr(args, "rgftd_teacher_validation_enabled", 0)) == 1
+    entropy_margin = float(getattr(args, "rdsi_entropy_increase_margin", 0.05))
+    entropy_scale = max(float(getattr(args, "rdsi_entropy_increase_scale", 0.35)), 1e-6)
+    fg_excess_margin = float(getattr(args, "rdsi_fg_excess_margin", 0.05))
+    fg_excess_scale = max(float(getattr(args, "rdsi_fg_excess_scale", 0.20)), 1e-6)
+    residual_alpha_max = max(0.0, min(float(getattr(args, "rdsi_residual_alpha", 0.35)), 1.0))
+    score_floor = max(float(getattr(args, "rdsi_benefit_score_floor", 1e-6)), 0.0)
+    benefit_topk_ratio = max(0.0, min(float(getattr(args, "rdsi_benefit_topk_ratio", getattr(args, "rgftd_active_fg_topk_ratio", 0.002))), 1.0))
+    benefit_topk_min_pixels = int(getattr(args, "rdsi_benefit_topk_min_pixels", getattr(args, "rgftd_active_fg_topk_min_pixels", min_fg_pixels)))
+    benefit_topk_max_pixels = int(getattr(args, "rdsi_benefit_topk_max_pixels", getattr(args, "rgftd_active_fg_topk_max_pixels", 0)))
+    boundary_radius_arg = int(getattr(args, "rdsi_boundary_radius", -1))
+    boundary_radius = max(1, teacher_fg_radius) if boundary_radius_arg < 0 else boundary_radius_arg
+    boundary_uncertainty_width = max(float(getattr(args, "rdsi_boundary_uncertainty_width", 0.25)), 1e-6)
+    core_damage_veto = max(0.0, min(float(getattr(args, "rdsi_core_damage_veto", 0.30)), 1.0))
+    unsafe_gap_scale = max(float(getattr(args, "rdsi_unsafe_gap_scale", 0.40)), 1e-6)
+    boundary_weight = max(0.0, float(getattr(args, "rdsi_boundary_support_weight", 0.35)))
+    core_preserve_weight = max(0.0, float(getattr(args, "rdsi_core_preserving_fg_weight", 0.25)))
+    reliability_weight = max(0.0, float(getattr(args, "rdsi_teacher_reliability_weight", 0.20)))
+    risk_weight = max(0.0, float(getattr(args, "rdsi_student_risk_weight", 0.20)))
+    core_damage_weight = max(0.0, float(getattr(args, "rdsi_core_damage_weight", 0.45)))
+    unsafe_gap_weight = max(0.0, float(getattr(args, "rdsi_unsafe_gap_weight", 0.30)))
+    fg_excess_weight = max(0.0, float(getattr(args, "rdsi_foreground_excess_weight", 0.25)))
+    safe_budget_gain = max(0.0, float(getattr(args, "rdsi_safe_budget_gain", 1.50)))
+    unsafe_budget_decay = max(0.0, float(getattr(args, "rdsi_unsafe_budget_decay", 1.00)))
+    max_budget_factor = max(1.0, float(getattr(args, "rdsi_max_budget_factor", 4.0)))
+
+    fg_support = support_mask & (target_label > 0)
+    seed_fg_support = seed_support_mask & (target_label > 0)
+    seed_fg_spatial_context = _dilate_mask(seed_fg_support, spatial_support_radius)
+    fg_support_context = _dilate_mask(fg_support, spatial_support_radius)
+    foreground_candidate_mask = reliable_candidate_mask & fg_support_context
+    if student_prob.shape[1] > 1:
+        student_fg_prob = student_prob[:, 1:].max(dim=1)[0]
+    else:
+        student_fg_prob = torch.zeros_like(student_conf)
+    if student_prob.shape[1] > 1:
+        student_fg_mass = student_prob[:, 1:].sum(dim=1)
+    else:
+        student_fg_mass = torch.zeros_like(student_conf)
+    student_boundary_uncertain = (
+        1.0 - (student_fg_mass - 0.5).abs() / boundary_uncertainty_width
+    ).clamp(0.0, 1.0)
+    student_boundary_grad = _local_range_score(student_fg_mass, boundary_radius)
+    student_entropy_grad = _local_range_score(student_entropy, boundary_radius)
+    wann_boundary_mask = (
+        wann_maps.soft_band
+        | getattr(wann_maps, "low_conflict_mask", torch.zeros_like(region, dtype=torch.bool))
+        | _dilate_mask(seed_fg_support, boundary_radius)
+        | _dilate_mask(foreground_candidate_mask, boundary_radius)
+    )
+    boundary_base = torch.maximum(student_boundary_uncertain, student_boundary_grad)
+    boundary_base = torch.maximum(boundary_base, student_entropy)
+    boundary_base = torch.maximum(boundary_base, student_entropy_grad)
+    boundary_base = torch.maximum(boundary_base, wann_boundary_mask.float())
+    boundary_base = boundary_base.clamp(0.0, 1.0)
+    student_core_uncertain = (
+        (student_conf <= hard_core_conf_thresh)
+        | (student_entropy >= hard_core_entropy_thresh)
+        | (student_boundary_grad >= float(getattr(args, "rdsi_core_reopen_boundary_floor", 0.20)))
+        | getattr(wann_maps, "low_conflict_mask", torch.zeros_like(region, dtype=torch.bool))
+    )
+    core_reopen_mask = hard_core_mask & student_core_uncertain & valid_mask
+    candidate_region = region | core_reopen_mask
+    region = candidate_region
+    region_f = region.float()
+    region_sum = region_f.sum().clamp_min(1.0)
+    weak_anchor_mask = seed_support_mask & region
+    region_denom = region_f.flatten(1).sum(dim=1).clamp_min(1.0).view(-1, 1, 1)
+    if spatial_support_enabled:
+        spatial_weight = region.float() * spatial_far_weight
+        spatial_weight = torch.maximum(spatial_weight, seed_fg_spatial_context.float() * spatial_near_seed_weight)
+        spatial_weight = torch.maximum(spatial_weight, foreground_candidate_mask.float() * spatial_candidate_weight)
+        spatial_weight = spatial_weight * region.float()
+    else:
+        spatial_weight = region.float()
+    student_fg_region_ratio = (student_fg_prob * region_f).flatten(1).sum(dim=1).view(-1, 1, 1) / region_denom
+    support_fg_region_ratio = (
+        ((seed_fg_spatial_context | foreground_candidate_mask) & region).float().flatten(1).sum(dim=1).view(-1, 1, 1)
+        / region_denom
+    )
+    fg_prior_reference = torch.maximum(student_fg_region_ratio, support_fg_region_ratio)
+    fg_deficit = (support_fg_region_ratio - student_fg_region_ratio).clamp_min(0.0)
+    fg_excess_state = (student_fg_region_ratio - (support_fg_region_ratio + fg_excess_margin)).clamp_min(0.0)
+    fg_excess_state_safe = (1.0 - fg_excess_state / fg_excess_scale).clamp(0.0, 1.0)
+    fg_deficient_region = (fg_deficit > 1e-6).expand_as(region)
+    fg_excessive_region = (fg_excess_state > 1e-6).expand_as(region)
+    risk_like_mask = (
+        getattr(wann_maps, "risk_mask", torch.zeros_like(region, dtype=torch.bool))
+        | getattr(wann_maps, "low_conflict_mask", torch.zeros_like(region, dtype=torch.bool))
+        | wann_maps.soft_band
+        | seed_fg_spatial_context
+        | foreground_candidate_mask
+        | core_reopen_mask
+    )
+    if not bool(region.any().detach().cpu().item()):
+        zero_map = torch.zeros_like(student_conf)
+        zero_bool = torch.zeros_like(student_conf, dtype=torch.bool)
+        zero_proto_weight = torch.zeros(
+            (len(teacher_logits_list),) + tuple(student_conf.shape),
+            device=device,
+            dtype=student_conf.dtype,
+        )
+        setattr(args, "_rdsi_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_foreground_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_background_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_fg_repair_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_bg_suppress_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_boundary_active_mask", zero_bool.detach())
+        setattr(args, "_rdsi_action_map", zero_map.detach())
+        setattr(args, "_rdsi_residual_alpha_map", zero_map.detach())
+        setattr(args, "_rdsi_teacher_proto_weight_stack", zero_proto_weight.detach())
+        setattr(args, "_rdsi_selected_teacher_stack_index", torch.zeros_like(student_conf, dtype=torch.long).detach())
+        setattr(args, "_rdsi_proto_region_weight", zero_map.detach())
+        setattr(args, "_rdsi_benefit_score", zero_map.detach())
+        setattr(args, "_rdsi_selected_score", zero_map.detach())
+        setattr(args, "_rdsi_fg_repair_score", zero_map.detach())
+        setattr(args, "_rdsi_bg_suppress_score", zero_map.detach())
+        setattr(args, "_rdsi_boundary_score", zero_map.detach())
+        setattr(args, "_rdsi_foreground_lift_score", zero_map.detach())
+        setattr(args, "_rdsi_background_suppression_score", zero_map.detach())
+        setattr(args, "_rdsi_boundary_support", zero_map.detach())
+        setattr(args, "_rdsi_core_preserving_fg_support", zero_map.detach())
+        setattr(args, "_rdsi_core_damage_proxy", zero_map.detach())
+        setattr(args, "_rdsi_seed_conflict", zero_map.detach())
+        setattr(args, "_rdsi_unsafe_gap", zero_map.detach())
+        setattr(args, "_rdsi_foreground_excess_proxy", zero_map.detach())
+        setattr(args, "_rdsi_safe_budget_factor", torch.ones(student_conf.shape[0], device=device).detach())
+        setattr(args, "_rdsi_core_reopen_mask", zero_bool.detach())
+        setattr(args, "_rdsi_risk_region", zero_bool.detach())
+        setattr(args, "_rdsi_hard_core_mask", hard_core_mask.detach())
+        setattr(args, "_rdsi_soft_core_mask", soft_core_mask.detach())
+        profile["rdsi_risk_region_ratio"] = zero_map.mean().detach()
+        profile["rdsi_hard_core_ratio"] = hard_core_mask.float().mean().detach()
+        profile["rdsi_soft_core_ratio"] = soft_core_mask.float().mean().detach()
+        profile["rdsi_accept_ratio"] = zero_map.mean().detach()
+        profile["rdsi_reject_ratio"] = zero_map.mean().detach()
+        profile["rdsi_fg_repair_active_ratio"] = zero_map.mean().detach()
+        profile["rdsi_bg_suppress_active_ratio"] = zero_map.mean().detach()
+        profile["rdsi_boundary_active_ratio"] = zero_map.mean().detach()
+        profile["rdsi_background_pair_ratio"] = zero_map.mean().detach()
+        profile["rdsi_fg_repair_score"] = zero_map.mean().detach()
+        profile["rdsi_bg_suppress_score"] = zero_map.mean().detach()
+        profile["rdsi_boundary_score"] = zero_map.mean().detach()
+        profile["rdsi_safe_budget_factor"] = zero_map.mean().detach()
+        profile["rdsi_effective_topk_ratio"] = zero_map.mean().detach()
+        profile["rdsi_effective_min_pixels"] = zero_map.mean().detach()
+        return teacher_logits_list[0].detach(), profile
+
+    score_stack_items = []
+    benefit_stack_items = []
+    reliable_stack_items = []
+    gap_stack_items = []
+    fg_lift_stack_items = []
+    bg_suppression_stack_items = []
+    student_risk_stack_items = []
+    boundary_support_items = []
+    core_preserving_fg_items = []
+    core_damage_items = []
+    seed_conflict_items = []
+    unsafe_gap_items = []
+    fg_excess_proxy_items = []
+    candidate_stack_items = []
+    fg_candidate_stack_items = []
+    bg_candidate_stack_items = []
+    boundary_candidate_stack_items = []
+    fg_repair_score_items = []
+    bg_suppress_score_items = []
+    boundary_score_items = []
+    core_reject_items = []
+    seed_reject_items = []
+    prior_reject_items = []
+    entropy_reject_items = []
+    fg_excess_reject_items = []
+    bg_only_reject_items = []
+    no_fg_lift_reject_items = []
+    logits_stack_items = []
+    teacher_id_values = []
+    reliable_means = []
+    gap_means = []
+    fg_lift_means = []
+
+    for teacher_id, teacher_logits in zip(teacher_ids, teacher_logits_list):
+        teacher_logits = teacher_logits.detach()
+        teacher_prob = F.softmax(teacher_logits / temperature, dim=1)
+        teacher_conf = teacher_prob.max(dim=1)[0]
+        teacher_pred = teacher_prob.argmax(dim=1)
+        teacher_entropy = _normalized_entropy(teacher_prob)
+        log_teacher_prob = torch.log(teacher_prob.clamp_min(1e-6))
+        kl_teacher_student = (teacher_prob * (log_teacher_prob - log_student_prob)).sum(dim=1)
+        kl_student_teacher = (student_prob * (log_student_prob - log_teacher_prob)).sum(dim=1)
+        kl_normalizer = max(math.log(float(teacher_prob.shape[1])), 1e-6)
+        knowledge_gap_score = (0.5 * (kl_teacher_student + kl_student_teacher) / kl_normalizer).clamp(0.0, 1.0)
+        teacher_student_disagreement = (1.0 - (teacher_prob * student_prob).sum(dim=1)).clamp(0.0, 1.0)
+
+        teacher_fg = teacher_pred > 0
+        teacher_bg = ~teacher_fg
+        if teacher_prob.shape[1] > 1:
+            teacher_fg_prob = teacher_prob[:, 1:].max(dim=1)[0]
+        else:
+            teacher_fg_prob = torch.zeros_like(teacher_conf)
+        teacher_bg_prob = teacher_prob[:, 0]
+        teacher_fg_margin = teacher_fg_prob - teacher_bg_prob
+        teacher_fg_conf = teacher_fg & (teacher_conf >= float(getattr(args, "rgftd_teacher_conf_thresh", 0.90)))
+        teacher_bg_conf = teacher_bg & (teacher_conf >= teacher_bg_conf_thresh)
+        teacher_bg_safe = teacher_fg_prob <= bg_max_fg_prob
+        teacher_fg_prob_anchor = (teacher_fg_prob >= teacher_fg_prob_thresh) & region
+        teacher_fg_seed = (teacher_fg_conf | teacher_fg_prob_anchor) & region
+        teacher_fg_topk_valid = _seed_or_fallback(teacher_fg_seed, region)
+        teacher_fg_anchor = _topk_foreground_anchor(
+            teacher_fg_prob,
+            teacher_fg_topk_valid,
+            topk_ratio=teacher_fg_topk_ratio,
+            min_pixels=teacher_fg_topk_min_pixels,
+        )
+        teacher_fg_lift_delta = (teacher_fg_prob - student_fg_prob).clamp_min(0.0)
+        teacher_fg_lift_score = (
+            teacher_fg_lift_delta / (1.0 - student_fg_prob).clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        teacher_bg_suppression_delta = (student_fg_prob - teacher_fg_prob).clamp_min(0.0)
+        teacher_bg_suppression_score = (
+            teacher_bg_suppression_delta / student_fg_prob.clamp_min(1e-6)
+        ).clamp(0.0, 1.0)
+        teacher_fg_lift = (teacher_fg_lift_delta >= teacher_student_fg_margin) & region
+        teacher_bg_suppression = (
+            (teacher_bg_suppression_delta >= teacher_student_fg_margin)
+            & (teacher_bg_prob >= teacher_bg_conf_thresh)
+            & teacher_bg_safe
+            & region
+        )
+        student_uncertain_for_fg = (
+            (student_conf <= float(getattr(args, "rgftd_student_conf_thresh", 0.80)))
+            | (student_entropy >= float(getattr(args, "rgftd_student_entropy_thresh", 0.35)))
+        )
+        student_foreground_repair = (
+            (student_pred == 0)
+            | student_uncertain_for_fg
+            | (student_fg_prob < teacher_fg_prob_thresh)
+            | core_reopen_mask
+        ) & region
+        teacher_fg_ready = teacher_fg_anchor | teacher_fg_prob_anchor
+        teacher_foreground_effective = teacher_fg_ready & teacher_fg_lift & student_foreground_repair
+        teacher_background_effective = teacher_bg_conf & teacher_bg_suppression
+        teacher_background_only = teacher_background_effective & (~teacher_foreground_effective)
+        teacher_fg_context = _dilate_mask(teacher_fg_ready, teacher_fg_radius)
+        teacher_bg_context = _dilate_mask(teacher_background_effective, teacher_fg_radius)
+        teacher_candidate_region = (
+            (teacher_foreground_effective & teacher_fg_context)
+            | (teacher_background_effective & teacher_bg_context)
+        ) & region
+
+        if core_valid:
+            teacher_core_agreement = _masked_ratio((teacher_pred == target_label) & core_mask, core_mask).detach()
+            teacher_core_conflict = (1.0 - teacher_core_agreement).detach()
+            core_consistency = (1.0 - teacher_core_conflict).clamp(0.0, 1.0)
+        else:
+            teacher_core_conflict = teacher_conf.mean().detach() * 0.0
+            core_consistency = torch.tensor(1.0, device=device)
+
+        if validation_enabled:
+            teacher_seed_support_fg_prob_mean = _masked_mean(teacher_fg_prob, seed_fg_support).detach()
+            teacher_seed_support_fg_margin_mean = _masked_mean(teacher_fg_margin, seed_fg_support).detach()
+            support_gate = _normalize_gate(
+                teacher_seed_support_fg_prob_mean,
+                float(getattr(args, "rgftd_teacher_support_prob_floor", teacher_fg_prob_thresh)),
+            )
+            conf_gate = _normalize_gate(
+                teacher_seed_support_fg_margin_mean,
+                float(getattr(args, "rgftd_teacher_release_margin_floor", 0.05)),
+            )
+            if core_valid:
+                core_gate = _normalize_gate(
+                    1.0 - teacher_core_conflict,
+                    float(getattr(args, "rgftd_teacher_core_agree_floor", 0.80)),
+                )
+            else:
+                core_gate = torch.tensor(1.0, device=device)
+            score_core_weight = float(getattr(args, "rgftd_teacher_score_core_weight", 0.35))
+            score_support_weight = float(getattr(args, "rgftd_teacher_score_support_weight", 0.30))
+            score_conf_weight = float(getattr(args, "rgftd_teacher_score_conf_weight", 0.10))
+            weight_sum = score_core_weight + score_support_weight + score_conf_weight
+            teacher_reliability = (
+                score_core_weight * core_gate
+                + score_support_weight * support_gate
+                + score_conf_weight * conf_gate
+            ) / max(weight_sum, 1e-6)
+            core_conflict_limit = float(getattr(args, "rgftd_teacher_max_core_conflict", 0.20))
+            if core_valid and float(teacher_core_conflict.cpu().item()) > core_conflict_limit:
+                teacher_reliability = teacher_reliability * 0.0
+        else:
+            teacher_reliability = torch.tensor(1.0, device=device)
+
+        weak_anchor_agreement = torch.where(
+            weak_anchor_mask,
+            ((teacher_pred == target_label) & weak_anchor_mask).float(),
+            torch.ones_like(teacher_conf),
+        )
+        prior_safe = torch.where(
+            teacher_fg_ready | teacher_background_effective,
+            torch.ones_like(teacher_conf),
+            teacher_bg_safe.float(),
+        )
+        seed_safe = weak_anchor_agreement
+        core_safe = torch.ones_like(teacher_conf) * core_consistency.detach().clamp(0.0, 1.0)
+        entropy_increase = (teacher_entropy - student_entropy - entropy_margin).clamp_min(0.0)
+        entropy_safe = torch.where(
+            teacher_fg_ready,
+            (1.0 - entropy_increase / entropy_scale).clamp(0.0, 1.0),
+            torch.ones_like(teacher_conf),
+        )
+        teacher_fg_region_ratio = (
+            (teacher_fg_prob * region_f).flatten(1).sum(dim=1).view(-1, 1, 1) / region_denom
+        )
+        fg_excess = (teacher_fg_region_ratio - (fg_prior_reference + fg_excess_margin)).clamp_min(0.0)
+        fg_excess_safe_scalar = (1.0 - fg_excess / fg_excess_scale).clamp(0.0, 1.0)
+        fg_excess_safe = fg_excess_safe_scalar.expand_as(teacher_conf)
+        fg_state_safe = torch.where(
+            teacher_fg_lift,
+            fg_excess_state_safe.expand_as(teacher_conf),
+            torch.ones_like(teacher_conf),
+        )
+        prior_benefit_safe = fg_excess_safe * fg_state_safe
+        intervention_prior_safe = torch.where(
+            teacher_background_effective,
+            torch.ones_like(prior_benefit_safe),
+            prior_benefit_safe,
+        )
+        seed_conflict_map = (
+            weak_anchor_mask
+            & (teacher_pred != target_label)
+            & ((teacher_conf >= student_conf) | teacher_fg_ready)
+        ).float()
+        if student_prob.shape[1] > 1:
+            teacher_fg_mass = teacher_prob[:, 1:].sum(dim=1)
+            teacher_bg_mass = teacher_prob[:, 0]
+            student_bg_mass = student_prob[:, 0]
+        else:
+            teacher_fg_mass = torch.zeros_like(teacher_conf)
+            teacher_bg_mass = torch.zeros_like(teacher_conf)
+            student_bg_mass = torch.zeros_like(teacher_conf)
+        hard_core_f = hard_core_mask.float()
+        core_drop = (
+            hard_core_f
+            * (target_label > 0).float()
+            * (student_fg_mass - teacher_fg_mass).clamp_min(0.0)
+        )
+        core_bg_lift = (
+            hard_core_f
+            * (target_label > 0).float()
+            * (teacher_bg_mass - student_bg_mass).clamp_min(0.0)
+        )
+        core_class_flip = (
+            hard_core_mask
+            & (teacher_pred != target_label)
+            & (teacher_conf >= student_conf)
+        ).float()
+        core_damage_proxy = torch.maximum(core_drop, core_bg_lift)
+        core_damage_proxy = torch.maximum(core_damage_proxy, core_class_flip).clamp(0.0, 1.0)
+        local_core_damage = _local_range_score(core_damage_proxy, boundary_radius)
+        core_damage_proxy = torch.maximum(core_damage_proxy, local_core_damage * core_reopen_mask.float()).clamp(0.0, 1.0)
+        core_damage_veto_map = (core_damage_proxy >= core_damage_veto) | (seed_conflict_map > 0.5)
+        hard_core_penalty = (core_damage_proxy / max(core_damage_veto, 1e-6)).clamp(0.0, 1.0)
+        core_damage_safe = (1.0 - hard_core_penalty).clamp(0.0, 1.0)
+
+        boundary_disagreement = (teacher_student_disagreement * boundary_base).clamp(0.0, 1.0)
+        teacher_boundary_grad = _local_range_score(teacher_fg_mass, boundary_radius)
+        boundary_alignment = torch.maximum(
+            torch.minimum(student_boundary_grad, teacher_boundary_grad),
+            boundary_base * wann_boundary_mask.float(),
+        ).clamp(0.0, 1.0)
+        boundary_support = torch.maximum(boundary_disagreement, boundary_alignment)
+        boundary_support = (
+            boundary_support
+            * region.float()
+            * seed_safe
+            * core_damage_safe
+        ).clamp(0.0, 1.0)
+        teacher_local_reliability = (
+            teacher_conf
+            * (1.0 - teacher_entropy).clamp(0.0, 1.0)
+            * weak_anchor_agreement
+            * teacher_reliability.detach().clamp(0.0, 1.0)
+            * core_consistency.detach()
+            * prior_safe
+        ).clamp(0.0, 1.0)
+        student_uncertainty_score = torch.maximum(student_entropy, (1.0 - student_conf).clamp(0.0, 1.0))
+        student_risk_evidence = torch.maximum(student_uncertainty_score, teacher_student_disagreement)
+        student_local_risk = (
+            (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+            * student_risk_evidence
+        ).clamp(0.0, 1.0)
+        safe_support_context = (
+            seed_fg_spatial_context
+            | foreground_candidate_mask
+            | wann_maps.soft_band
+            | core_reopen_mask
+        )
+        core_preserving_fg_support = (
+            teacher_fg_lift_score
+            * teacher_fg_ready.float()
+            * student_foreground_repair.float()
+            * safe_support_context.float()
+            * seed_safe
+            * core_damage_safe
+        ).clamp(0.0, 1.0)
+        bg_suppression_support = (
+            teacher_bg_suppression_score
+            * teacher_background_effective.float()
+            * risk_like_mask.float()
+            * seed_safe
+            * core_damage_safe
+        ).clamp(0.0, 1.0)
+        unsafe_gap = (
+            knowledge_gap_score
+            * (~risk_like_mask).float()
+        )
+        unsafe_gap = torch.maximum(
+            unsafe_gap,
+            knowledge_gap_score * hard_core_mask.float() * core_damage_proxy,
+        )
+        unsafe_gap = (unsafe_gap / unsafe_gap_scale).clamp(0.0, 1.0)
+        foreground_excess_proxy = (1.0 - fg_excess_safe).clamp(0.0, 1.0) * teacher_fg_ready.float()
+        student_fg_excess_proxy = (fg_excess_state / fg_excess_scale).clamp(0.0, 1.0).expand_as(teacher_conf)
+        fg_missing_proxy = torch.maximum(
+            (fg_deficit / fg_excess_scale).clamp(0.0, 1.0).expand_as(teacher_conf),
+            student_foreground_repair.float() * safe_support_context.float(),
+        ).clamp(0.0, 1.0)
+        common_negative = (
+            core_damage_weight * core_damage_proxy
+            + unsafe_gap_weight * unsafe_gap
+        )
+        fg_negative = common_negative + fg_excess_weight * foreground_excess_proxy
+        bg_negative = common_negative
+        boundary_negative = common_negative + 0.5 * fg_excess_weight * foreground_excess_proxy
+        action_safety = (
+            seed_safe
+            * intervention_prior_safe
+            * entropy_safe
+            * core_damage_safe
+            * (~core_damage_veto_map).float()
+        ).clamp(0.0, 1.0)
+        reliability_evidence = (0.5 + 0.5 * teacher_local_reliability.detach()).clamp(0.0, 1.0)
+        risk_evidence = (0.5 + 0.5 * student_local_risk.detach()).clamp(0.0, 1.0)
+        fg_repair_candidate = teacher_foreground_effective & safe_support_context & region & (~core_damage_veto_map)
+        bg_suppress_candidate = (
+            teacher_background_effective
+            & risk_like_mask
+            & (student_fg_excess_proxy > 0.0)
+            & region
+            & (~core_damage_veto_map)
+        )
+        boundary_candidate = (
+            (boundary_support > 0.0)
+            & risk_like_mask
+            & region
+            & (~core_damage_veto_map)
+        )
+        fg_repair_benefit = (
+            core_preserve_weight * core_preserving_fg_support
+            + reliability_weight * teacher_local_reliability.detach()
+            + risk_weight * student_local_risk.detach()
+            + boundary_weight * boundary_support
+            - fg_negative
+        ).clamp(0.0, 1.0)
+        bg_suppress_benefit = (
+            core_preserve_weight * bg_suppression_support
+            + reliability_weight * teacher_local_reliability.detach()
+            + risk_weight * student_local_risk.detach()
+            - bg_negative
+        ).clamp(0.0, 1.0)
+        boundary_benefit = (
+            boundary_weight * boundary_support
+            + core_preserve_weight * core_preserving_fg_support
+            + reliability_weight * teacher_local_reliability.detach()
+            + risk_weight * student_local_risk.detach()
+            - boundary_negative
+        ).clamp(0.0, 1.0)
+        fg_repair_score = (
+            fg_repair_benefit
+            * teacher_fg_lift_score
+            * fg_missing_proxy
+            * reliability_evidence
+            * risk_evidence
+            * spatial_weight
+            * action_safety
+            * fg_repair_candidate.float()
+        ).clamp(0.0, 1.0)
+        bg_suppress_score = (
+            bg_suppress_benefit
+            * teacher_bg_suppression_score
+            * student_fg_excess_proxy
+            * reliability_evidence
+            * risk_evidence
+            * spatial_weight
+            * action_safety
+            * bg_suppress_candidate.float()
+        ).clamp(0.0, 1.0)
+        boundary_score = (
+            boundary_benefit
+            * boundary_support
+            * reliability_evidence
+            * risk_evidence
+            * spatial_weight
+            * action_safety
+            * boundary_candidate.float()
+        ).clamp(0.0, 1.0)
+        benefit_positive = (
+            boundary_weight * boundary_support
+            + core_preserve_weight * core_preserving_fg_support
+            + core_preserve_weight * bg_suppression_support
+            + reliability_weight * teacher_local_reliability.detach()
+            + risk_weight * student_local_risk.detach()
+        )
+        benefit_negative = common_negative + fg_excess_weight * foreground_excess_proxy
+        benefit_score = (benefit_positive - benefit_negative).clamp(0.0, 1.0)
+        benefit_score = (
+            benefit_score
+            * action_safety
+        ).clamp(0.0, 1.0)
+        teacher_candidate_region = fg_repair_candidate | boundary_candidate
+        release_score = torch.maximum(fg_repair_score, boundary_score).clamp(0.0, 1.0)
+
+        score_stack_items.append(release_score)
+        benefit_stack_items.append(benefit_score)
+        reliable_stack_items.append(teacher_local_reliability)
+        gap_stack_items.append(knowledge_gap_score)
+        fg_lift_stack_items.append(teacher_fg_lift_score)
+        bg_suppression_stack_items.append(teacher_bg_suppression_score)
+        student_risk_stack_items.append(student_local_risk)
+        boundary_support_items.append(boundary_support)
+        core_preserving_fg_items.append(core_preserving_fg_support)
+        core_damage_items.append(core_damage_proxy)
+        seed_conflict_items.append(seed_conflict_map)
+        unsafe_gap_items.append(unsafe_gap)
+        fg_excess_proxy_items.append(foreground_excess_proxy)
+        candidate_stack_items.append(teacher_candidate_region.float())
+        fg_candidate_stack_items.append(fg_repair_candidate.float())
+        bg_candidate_stack_items.append(bg_suppress_candidate.float())
+        boundary_candidate_stack_items.append(boundary_candidate.float())
+        fg_repair_score_items.append(fg_repair_score)
+        bg_suppress_score_items.append(bg_suppress_score)
+        boundary_score_items.append(boundary_score)
+        core_reject_items.append((teacher_candidate_region.float() * torch.maximum(1.0 - core_safe, core_damage_proxy)).clamp(0.0, 1.0))
+        seed_reject_items.append((teacher_candidate_region & weak_anchor_mask & (teacher_pred != target_label)).float())
+        prior_reject_items.append((teacher_candidate_region.float() * torch.maximum(1.0 - intervention_prior_safe, foreground_excess_proxy)).clamp(0.0, 1.0))
+        entropy_reject_items.append((teacher_candidate_region.float() * (1.0 - entropy_safe)).clamp(0.0, 1.0))
+        fg_excess_reject_items.append((teacher_candidate_region.float() * (1.0 - fg_excess_safe)).clamp(0.0, 1.0))
+        bg_only_reject_items.append(teacher_background_only.float())
+        no_fg_lift_reject_items.append((teacher_fg_ready & region & (~teacher_fg_lift)).float())
+        logits_stack_items.append(teacher_logits)
+        teacher_id_values.append(float(teacher_id))
+        reliable_means.append(_masked_mean(teacher_local_reliability, teacher_candidate_region).detach())
+        gap_means.append(_masked_mean(knowledge_gap_score, teacher_candidate_region).detach())
+        fg_lift_means.append(_masked_mean(teacher_fg_lift_score, teacher_candidate_region).detach())
+
+    score_stack = torch.stack(score_stack_items, dim=0)
+    benefit_stack = torch.stack(benefit_stack_items, dim=0)
+    reliable_stack = torch.stack(reliable_stack_items, dim=0)
+    gap_stack = torch.stack(gap_stack_items, dim=0)
+    fg_lift_stack = torch.stack(fg_lift_stack_items, dim=0)
+    bg_suppression_stack = torch.stack(bg_suppression_stack_items, dim=0)
+    student_risk_stack = torch.stack(student_risk_stack_items, dim=0)
+    boundary_support_stack = torch.stack(boundary_support_items, dim=0)
+    core_preserving_fg_stack = torch.stack(core_preserving_fg_items, dim=0)
+    core_damage_stack = torch.stack(core_damage_items, dim=0)
+    seed_conflict_stack = torch.stack(seed_conflict_items, dim=0)
+    unsafe_gap_stack = torch.stack(unsafe_gap_items, dim=0)
+    fg_excess_proxy_stack = torch.stack(fg_excess_proxy_items, dim=0)
+    candidate_stack = torch.stack(candidate_stack_items, dim=0)
+    fg_candidate_stack = torch.stack(fg_candidate_stack_items, dim=0)
+    bg_candidate_stack = torch.stack(bg_candidate_stack_items, dim=0)
+    boundary_candidate_stack = torch.stack(boundary_candidate_stack_items, dim=0)
+    fg_repair_score_stack = torch.stack(fg_repair_score_items, dim=0)
+    bg_suppress_score_stack = torch.stack(bg_suppress_score_items, dim=0)
+    boundary_score_stack = torch.stack(boundary_score_items, dim=0)
+    core_reject_stack = torch.stack(core_reject_items, dim=0)
+    seed_reject_stack = torch.stack(seed_reject_items, dim=0)
+    prior_reject_stack = torch.stack(prior_reject_items, dim=0)
+    entropy_reject_stack = torch.stack(entropy_reject_items, dim=0)
+    fg_excess_reject_stack = torch.stack(fg_excess_reject_items, dim=0)
+    bg_only_reject_stack = torch.stack(bg_only_reject_items, dim=0)
+    no_fg_lift_reject_stack = torch.stack(no_fg_lift_reject_items, dim=0)
+    logits_stack = torch.stack(logits_stack_items, dim=0)
+    best_score, best_index = score_stack.max(dim=0)
+    gather_index = best_index.unsqueeze(0).unsqueeze(2).expand(
+        1,
+        logits_stack.shape[1],
+        logits_stack.shape[2],
+        logits_stack.shape[3],
+        logits_stack.shape[4],
+    )
+    selected_logits = logits_stack.gather(0, gather_index).squeeze(0).detach()
+    gather_map_index = best_index.unsqueeze(0)
+    selected_benefit = benefit_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_reliable = reliable_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_gap = gap_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_fg_lift = fg_lift_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_bg_suppression = bg_suppression_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_student_risk = student_risk_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_boundary_support = boundary_support_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_core_preserving_fg = core_preserving_fg_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_core_damage = core_damage_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_seed_conflict = seed_conflict_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_unsafe_gap = unsafe_gap_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_fg_excess_proxy = fg_excess_proxy_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_fg_candidate = fg_candidate_stack.gather(0, gather_map_index).squeeze(0) > 0.5
+    selected_bg_candidate = bg_candidate_stack.gather(0, gather_map_index).squeeze(0) > 0.5
+    selected_boundary_candidate = boundary_candidate_stack.gather(0, gather_map_index).squeeze(0) > 0.5
+    selected_fg_repair_score = fg_repair_score_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_bg_suppress_score = bg_suppress_score_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_boundary_score = boundary_score_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_primary_is_fg = selected_fg_candidate & (
+        (selected_fg_repair_score >= selected_boundary_score) | (~selected_boundary_candidate)
+    )
+    selected_primary_is_boundary = selected_boundary_candidate & (
+        (selected_boundary_score > selected_fg_repair_score) | (~selected_fg_candidate)
+    )
+    selected_candidate = selected_primary_is_fg | selected_primary_is_boundary
+    selected_core_reject = core_reject_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_seed_reject = seed_reject_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_prior_reject = prior_reject_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_entropy_reject = entropy_reject_stack.gather(0, gather_map_index).squeeze(0).detach()
+    selected_fg_excess_reject = fg_excess_reject_stack.gather(0, gather_map_index).squeeze(0).detach()
+    raw_active_mask = (best_score > score_floor) & selected_candidate & region
+    raw_active_f = raw_active_mask.float()
+    raw_active_denom = raw_active_f.flatten(1).sum(dim=1).clamp_min(1.0)
+    safe_signal = (
+        (
+            selected_boundary_support
+            + selected_core_preserving_fg
+            + selected_benefit
+        )
+        * raw_active_f
+    ).flatten(1).sum(dim=1) / (3.0 * raw_active_denom)
+    unsafe_signal = (
+        (
+            selected_core_damage
+            + selected_seed_conflict
+            + selected_unsafe_gap
+            + selected_fg_excess_proxy
+        )
+        * raw_active_f
+    ).flatten(1).sum(dim=1) / (4.0 * raw_active_denom)
+    safe_budget_factor = (
+        1.0
+        + safe_budget_gain * safe_signal
+        - unsafe_budget_decay * unsafe_signal
+    ).clamp(0.0, max_budget_factor)
+    effective_topk_ratio = (benefit_topk_ratio * safe_budget_factor).clamp(0.0, 1.0)
+    effective_min_pixels = torch.ceil(
+        torch.tensor(float(max(benefit_topk_min_pixels, 0)), device=device) * safe_budget_factor
+    )
+    if benefit_topk_max_pixels > 0:
+        effective_max_pixels = torch.ceil(
+            torch.tensor(float(benefit_topk_max_pixels), device=device) * safe_budget_factor
+        )
+    else:
+        effective_max_pixels = None
+    selected_active_mask = _topk_foreground_anchor(
+        best_score,
+        raw_active_mask,
+        topk_ratio=effective_topk_ratio,
+        min_pixels=effective_min_pixels,
+        max_pixels=effective_max_pixels,
+    ) & raw_active_mask
+    fg_repair_active_mask = selected_active_mask & selected_primary_is_fg
+    bg_suppress_active_mask = torch.zeros_like(selected_active_mask, dtype=torch.bool)
+    boundary_active_mask = selected_active_mask & selected_primary_is_boundary
+    foreground_active_mask = fg_repair_active_mask
+    background_active_mask = bg_suppress_active_mask
+    selected_action_map = torch.zeros_like(best_score)
+    selected_action_map = torch.where(fg_repair_active_mask, torch.ones_like(selected_action_map), selected_action_map)
+    selected_action_map = torch.where(
+        bg_suppress_active_mask,
+        torch.ones_like(selected_action_map) * 2.0,
+        selected_action_map,
+    )
+    selected_action_map = torch.where(
+        boundary_active_mask,
+        torch.ones_like(selected_action_map) * 3.0,
+        selected_action_map,
+    )
+    teacher_id_tensor = torch.tensor(teacher_id_values, device=device, dtype=torch.float32)
+    selected_teacher_id = teacher_id_tensor[best_index]
+    fg_repair_alpha = (
+        residual_alpha_max
+        * best_score
+        * fg_repair_active_mask.float()
+    ).clamp(0.0, residual_alpha_max)
+    bg_suppress_alpha = (
+        residual_alpha_max
+        * best_score
+        * bg_suppress_active_mask.float()
+    ).clamp(0.0, residual_alpha_max)
+    boundary_alpha = (
+        residual_alpha_max
+        * best_score
+        * boundary_active_mask.float()
+    ).clamp(0.0, residual_alpha_max)
+    background_pair_score_items = []
+    for teacher_stack_index, teacher_id in enumerate(teacher_id_values):
+        teacher_fg_active = fg_repair_active_mask & (selected_teacher_id == float(teacher_id))
+        teacher_fg_alpha = fg_repair_alpha * teacher_fg_active.float()
+        teacher_alpha_context = F.max_pool2d(
+            teacher_fg_alpha.unsqueeze(1),
+            kernel_size=teacher_fg_radius * 2 + 1,
+            stride=1,
+            padding=teacher_fg_radius,
+        )[:, 0] if teacher_fg_radius > 0 else teacher_fg_alpha
+        teacher_fg_active_context = _dilate_mask(teacher_fg_active, teacher_fg_radius)
+        teacher_prob_for_bg = F.softmax(logits_stack[teacher_stack_index] / temperature, dim=1)
+        teacher_conf_for_bg = teacher_prob_for_bg.max(dim=1)[0]
+        teacher_pred_for_bg = teacher_prob_for_bg.argmax(dim=1)
+        if teacher_prob_for_bg.shape[1] > 1:
+            teacher_fg_prob_for_bg = teacher_prob_for_bg[:, 1:].max(dim=1)[0]
+        else:
+            teacher_fg_prob_for_bg = torch.zeros_like(teacher_conf_for_bg)
+        teacher_bg_prob_for_bg = teacher_prob_for_bg[:, 0]
+        teacher_bg_pair = (
+            teacher_fg_active_context
+            & region
+            & (~foreground_active_mask)
+            & (teacher_pred_for_bg == 0)
+            & (teacher_conf_for_bg >= teacher_bg_conf_thresh)
+            & (teacher_fg_prob_for_bg <= bg_max_fg_prob)
+        )
+        teacher_bg_core_damage = core_damage_stack[teacher_stack_index]
+        teacher_bg_seed_conflict = seed_conflict_stack[teacher_stack_index]
+        teacher_bg_unsafe_gap = unsafe_gap_stack[teacher_stack_index]
+        teacher_bg_pair = (
+            teacher_bg_pair
+            & (teacher_bg_core_damage < core_damage_veto)
+            & (teacher_bg_seed_conflict <= 0.5)
+        )
+        teacher_bg_safe_score = (
+            (1.0 - teacher_bg_core_damage.clamp(0.0, 1.0))
+            * (1.0 - teacher_bg_seed_conflict.clamp(0.0, 1.0))
+            * (1.0 - teacher_bg_unsafe_gap.clamp(0.0, 1.0))
+        ).clamp(0.0, 1.0)
+        background_pair_score_items.append(
+            teacher_bg_prob_for_bg * teacher_alpha_context * teacher_bg_pair.float() * teacher_bg_safe_score
+        )
+    background_pair_score_stack = torch.stack(background_pair_score_items, dim=0)
+    background_pair_score, background_pair_index = background_pair_score_stack.max(dim=0)
+    raw_background_pair_mask = (
+        (background_pair_score > 0.0)
+        & region
+        & (~foreground_active_mask)
+        & (~boundary_active_mask)
+        & (~background_active_mask)
+    )
+    flat_fg_active = foreground_active_mask.flatten(1)
+    flat_bg_pair = raw_background_pair_mask.flatten(1)
+    max_bg_pixels = []
+    for batch_idx in range(raw_background_pair_mask.shape[0]):
+        fg_count = int(flat_fg_active[batch_idx].sum().detach().cpu().item())
+        bg_count = int(flat_bg_pair[batch_idx].sum().detach().cpu().item())
+        if fg_count > 0 and bg_count > 0:
+            max_bg_pixels.append(int(math.ceil(float(fg_count) * max(max_bg_fg_ratio, 0.0))))
+        else:
+            max_bg_pixels.append(0)
+    if max(max_bg_pixels) <= 0:
+        background_pair_active_mask = torch.zeros_like(foreground_active_mask, dtype=torch.bool)
+    else:
+        background_pair_active_mask = _topk_foreground_anchor(
+            background_pair_score,
+            raw_background_pair_mask,
+            topk_ratio=1.0,
+            min_pixels=0,
+            max_pixels=max_bg_pixels,
+        ) & raw_background_pair_mask
+    background_active_mask = background_active_mask | background_pair_active_mask
+    bg_suppress_active_mask = background_active_mask
+    selected_action_map = torch.where(
+        background_pair_active_mask,
+        torch.ones_like(selected_action_map) * 2.0,
+        selected_action_map,
+    )
+    if bool(background_pair_active_mask.any().detach().cpu().item()):
+        bg_gather_index = background_pair_index.unsqueeze(0).unsqueeze(2).expand(
+            1,
+            logits_stack.shape[1],
+            logits_stack.shape[2],
+            logits_stack.shape[3],
+            logits_stack.shape[4],
+        )
+        background_logits = logits_stack.gather(0, bg_gather_index).squeeze(0).detach()
+        selected_logits = torch.where(background_pair_active_mask.unsqueeze(1), background_logits, selected_logits)
+        selected_teacher_id = torch.where(
+            background_pair_active_mask,
+            teacher_id_tensor[background_pair_index],
+            selected_teacher_id,
+        )
+        bg_gather_map_index = background_pair_index.unsqueeze(0)
+        selected_benefit = torch.where(
+            background_pair_active_mask,
+            benefit_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_benefit,
+        )
+        selected_reliable = torch.where(
+            background_pair_active_mask,
+            reliable_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_reliable,
+        )
+        selected_gap = torch.where(
+            background_pair_active_mask,
+            gap_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_gap,
+        )
+        selected_bg_suppression = torch.where(
+            background_pair_active_mask,
+            bg_suppression_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_bg_suppression,
+        )
+        selected_student_risk = torch.where(
+            background_pair_active_mask,
+            student_risk_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_student_risk,
+        )
+        selected_boundary_support = torch.where(
+            background_pair_active_mask,
+            boundary_support_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_boundary_support,
+        )
+        selected_core_preserving_fg = torch.where(
+            background_pair_active_mask,
+            core_preserving_fg_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_core_preserving_fg,
+        )
+        selected_core_damage = torch.where(
+            background_pair_active_mask,
+            core_damage_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_core_damage,
+        )
+        selected_seed_conflict = torch.where(
+            background_pair_active_mask,
+            seed_conflict_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_seed_conflict,
+        )
+        selected_unsafe_gap = torch.where(
+            background_pair_active_mask,
+            unsafe_gap_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_unsafe_gap,
+        )
+        selected_fg_excess_proxy = torch.where(
+            background_pair_active_mask,
+            fg_excess_proxy_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_fg_excess_proxy,
+        )
+        selected_bg_suppress_score = torch.where(
+            background_pair_active_mask,
+            bg_suppress_score_stack.gather(0, bg_gather_map_index).squeeze(0).detach(),
+            selected_bg_suppress_score,
+        )
+    bg_suppress_alpha = torch.where(
+        background_pair_active_mask,
+        (background_pair_score * background_pair_active_mask.float()).clamp(0.0, residual_alpha_max),
+        bg_suppress_alpha,
+    )
+    active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
+    residual_alpha = (fg_repair_alpha + bg_suppress_alpha + boundary_alpha).clamp(0.0, residual_alpha_max)
+    selected_score_map = torch.where(
+        background_pair_active_mask,
+        torch.maximum(best_score, background_pair_score),
+        best_score,
+    ).detach()
+    selected_stack_index = torch.where(background_pair_active_mask, background_pair_index, best_index).detach()
+    proto_score_mass = (selected_score_map * active_mask.float()).detach()
+    proto_weight_stack = torch.zeros_like(score_stack)
+    proto_weight_stack.scatter_(
+        0,
+        selected_stack_index.unsqueeze(0),
+        proto_score_mass.unsqueeze(0),
+    )
+    selected_teacher_prob = F.softmax(selected_logits / temperature, dim=1)
+
+    active_sum = active_mask.float().sum().clamp_min(1.0)
+    candidate_any = (candidate_stack.max(dim=0).values > 0.5) & region
+    bg_only_any = (bg_only_reject_stack.max(dim=0).values > 0.5) & region
+    no_fg_lift_any = (no_fg_lift_reject_stack.max(dim=0).values > 0.5) & region
+    if score_stack.shape[0] > 1:
+        top2 = torch.topk(score_stack, k=2, dim=0).values
+        best_vs_second = (top2[0] - top2[1]).clamp_min(0.0)
+    else:
+        best_vs_second = best_score
+    profile["rdsi_teacher_compete_count"] = torch.tensor(float(len(teacher_logits_list)), device=device)
+    profile["rdsi_candidate_teacher_count"] = torch.tensor(float(len(teacher_logits_list)), device=device)
+    profile["rdsi_risk_region_ratio"] = region.float().mean().detach()
+    profile["rdsi_hard_core_ratio"] = hard_core_mask.float().mean().detach()
+    profile["rdsi_soft_core_ratio"] = soft_core_mask.float().mean().detach()
+    profile["rdsi_fg_deficient_ratio"] = (fg_deficient_region & region).float().mean().detach()
+    profile["rdsi_fg_excessive_ratio"] = (fg_excessive_region & region).float().mean().detach()
+    profile["rdsi_candidate_ratio"] = (candidate_any.float().sum() / region_sum).detach()
+    profile["rdsi_accept_ratio"] = (active_mask.float().sum() / region_sum).detach()
+    profile["rdsi_reject_ratio"] = ((candidate_any & (~active_mask)).float().sum() / region_sum).detach()
+    profile["rdsi_reject_by_core"] = (selected_core_reject.sum() / region_sum).detach()
+    profile["rdsi_reject_by_seed"] = (selected_seed_reject.sum() / region_sum).detach()
+    profile["rdsi_reject_by_prior"] = (selected_prior_reject.sum() / region_sum).detach()
+    profile["rdsi_reject_by_entropy"] = (selected_entropy_reject.sum() / region_sum).detach()
+    profile["rdsi_reject_by_fg_excess"] = (selected_fg_excess_reject.sum() / region_sum).detach()
+    profile["rdsi_reject_by_bg_only"] = (bg_only_any.float().sum() / region_sum).detach()
+    profile["rdsi_reject_by_no_fg_lift"] = (no_fg_lift_any.float().sum() / region_sum).detach()
+    profile["rdsi_multi_teacher_active"] = active_mask.float().mean().detach()
+    profile["rdsi_foreground_active_ratio"] = foreground_active_mask.float().mean().detach()
+    profile["rdsi_background_paired_ratio"] = background_active_mask.float().mean().detach()
+    profile["rdsi_fg_repair_active_ratio"] = fg_repair_active_mask.float().mean().detach()
+    profile["rdsi_bg_suppress_active_ratio"] = bg_suppress_active_mask.float().mean().detach()
+    profile["rdsi_boundary_active_ratio"] = boundary_active_mask.float().mean().detach()
+    profile["rdsi_background_pair_ratio"] = background_pair_active_mask.float().mean().detach()
+    profile["rdsi_bg_only_ratio"] = torch.zeros_like(profile["rdsi_multi_teacher_active"]).detach()
+    profile["rdsi_best_vs_second_gap"] = _masked_mean(best_vs_second, active_mask).detach()
+    profile["rdsi_selected_score_mean"] = _masked_mean(selected_score_map, active_mask).detach()
+    profile["rdsi_selected_score_top"] = _masked_mean(
+        selected_score_map,
+        active_mask & (selected_score_map >= selected_score_map.mean()),
+    ).detach()
+    profile["rdsi_score_benefit_mean"] = _masked_mean(
+        selected_score_map,
+        active_mask,
+    ).detach()
+    profile["rdsi_selected_teacher_reliable"] = _masked_mean(selected_reliable, active_mask).detach()
+    profile["rdsi_selected_teacher_benefit"] = _masked_mean(selected_score_map, active_mask).detach()
+    profile["rdsi_selected_teacher_gap"] = _masked_mean(selected_gap, active_mask).detach()
+    profile["rdsi_selected_student_risk"] = _masked_mean(selected_student_risk, active_mask).detach()
+    profile["rdsi_selected_spatial_support"] = _masked_mean(spatial_weight, active_mask).detach()
+    profile["rdsi_fg_repair_score"] = _masked_mean(selected_fg_repair_score, fg_repair_active_mask).detach()
+    profile["rdsi_bg_suppress_score"] = _masked_mean(selected_bg_suppress_score, bg_suppress_active_mask).detach()
+    profile["rdsi_boundary_score"] = _masked_mean(selected_boundary_score, boundary_active_mask).detach()
+    profile["rdsi_fg_lift_mean"] = _masked_mean(selected_fg_lift, fg_repair_active_mask).detach()
+    profile["rdsi_fg_lift_top"] = _masked_mean(
+        selected_fg_lift,
+        fg_repair_active_mask & (selected_fg_lift >= selected_fg_lift.mean()),
+    ).detach()
+    profile["rdsi_bg_suppression_mean"] = _masked_mean(selected_bg_suppression, bg_suppress_active_mask).detach()
+    profile["rdsi_bg_suppression_top"] = _masked_mean(
+        selected_bg_suppression,
+        bg_suppress_active_mask & (selected_bg_suppression >= selected_bg_suppression.mean()),
+    ).detach()
+    profile["rdsi_benefit_mean"] = _masked_mean(selected_score_map, active_mask).detach()
+    profile["rdsi_benefit_top"] = _masked_mean(
+        selected_score_map,
+        active_mask & (selected_score_map >= selected_score_map.mean()),
+    ).detach()
+    profile["rdsi_boundary_support_mean"] = _masked_mean(selected_boundary_support, boundary_active_mask).detach()
+    profile["rdsi_boundary_support_top"] = _masked_mean(
+        selected_boundary_support,
+        boundary_active_mask & (selected_boundary_support >= selected_boundary_support.mean()),
+    ).detach()
+    profile["rdsi_core_preserving_fg_mean"] = _masked_mean(selected_core_preserving_fg, fg_repair_active_mask).detach()
+    profile["rdsi_core_preserving_fg_top"] = _masked_mean(
+        selected_core_preserving_fg,
+        fg_repair_active_mask & (selected_core_preserving_fg >= selected_core_preserving_fg.mean()),
+    ).detach()
+    profile["rdsi_core_damage_mean"] = _masked_mean(selected_core_damage, raw_active_mask).detach()
+    profile["rdsi_core_damage_top"] = _masked_mean(selected_core_damage, foreground_active_mask).detach()
+    profile["rdsi_seed_conflict_mean"] = _masked_mean(selected_seed_conflict, raw_active_mask).detach()
+    profile["rdsi_unsafe_gap_mean"] = _masked_mean(selected_unsafe_gap, raw_active_mask).detach()
+    profile["rdsi_unsafe_gap_top"] = _masked_mean(selected_unsafe_gap, active_mask).detach()
+    profile["rdsi_foreground_excess_proxy"] = _masked_mean(selected_fg_excess_proxy, raw_active_mask).detach()
+    profile["rdsi_safe_signal"] = safe_signal.mean().detach()
+    profile["rdsi_unsafe_signal"] = unsafe_signal.mean().detach()
+    profile["rdsi_safe_budget_factor"] = safe_budget_factor.mean().detach()
+    profile["rdsi_effective_topk_ratio"] = effective_topk_ratio.mean().detach()
+    profile["rdsi_effective_min_pixels"] = effective_min_pixels.float().mean().detach()
+    profile["rdsi_core_reopen_ratio"] = core_reopen_mask.float().mean().detach()
+    profile["rdsi_core_reopen_active_ratio"] = (foreground_active_mask & core_reopen_mask).float().mean().detach()
+    candidate_veto_map = (
+        ((core_damage_stack >= core_damage_veto) | (seed_conflict_stack > 0.5)).float()
+        * candidate_stack
+    ).max(dim=0).values > 0.5
+    profile["rdsi_veto_by_core_damage"] = _masked_ratio(
+        candidate_veto_map,
+        candidate_any,
+    ).detach()
+    profile["rdsi_alpha_mean"] = _masked_mean(residual_alpha, active_mask).detach()
+    profile["rdsi_alpha_top"] = _masked_mean(residual_alpha, active_mask & (residual_alpha >= residual_alpha.mean())).detach()
+    if student_prob.shape[1] > 1:
+        selected_teacher_fg_prob = selected_teacher_prob[:, 1:].sum(dim=1)
+        student_fg_mass = student_prob[:, 1:].sum(dim=1)
+        profile["rdsi_raw_teacher_fg_delta"] = _masked_mean(
+            selected_teacher_fg_prob - student_fg_mass,
+            active_mask,
+        ).detach()
+    else:
+        profile["rdsi_raw_teacher_fg_delta"] = residual_alpha.sum().detach() * 0.0
+    profile["rdsi_selected_teacher_mean"] = ((selected_teacher_id * active_mask.float()).sum() / active_sum).detach()
+    zero_ratio = active_sum.detach() * 0.0
+    sup_type_ratios = {bucket: zero_ratio for bucket in _SUP_TYPE_BUCKETS}
+    if bool(active_mask.any().detach().cpu().item()):
+        hist_values = []
+        for teacher_id in teacher_id_values:
+            teacher_ratio = (((selected_teacher_id == float(teacher_id)) & active_mask).float().sum() / active_sum).detach()
+            hist_values.append(teacher_ratio)
+            int_teacher_id = int(teacher_id)
+            if 0 <= int_teacher_id <= 9:
+                profile["rdsi_teacher{}_ratio".format(int_teacher_id)] = teacher_ratio
+            sup_type = teacher_sup_type_map.get(int_teacher_id, "unknown")
+            sup_type_ratios[sup_type] = sup_type_ratios.get(sup_type, zero_ratio) + teacher_ratio
+        if hist_values:
+            profile["rdsi_selected_teacher_switch_ratio"] = (1.0 - torch.stack(hist_values).max()).detach()
+    for sup_type, sup_ratio in sup_type_ratios.items():
+        profile["rdsi_teacher_{}_ratio".format(sup_type)] = sup_ratio.detach()
+    if reliable_means:
+        profile["rdsi_teacher_reliable_score"] = torch.stack(reliable_means).mean().detach()
+    if gap_means:
+        profile["rdsi_knowledge_gap_score"] = torch.stack(gap_means).mean().detach()
+    if fg_lift_means:
+        profile["rdsi_fg_lift_mean"] = _masked_mean(selected_fg_lift, fg_repair_active_mask).detach()
+    setattr(args, "_rdsi_active_mask", active_mask.detach())
+    setattr(args, "_rdsi_foreground_active_mask", foreground_active_mask.detach())
+    setattr(args, "_rdsi_background_active_mask", background_active_mask.detach())
+    setattr(args, "_rdsi_fg_repair_active_mask", fg_repair_active_mask.detach())
+    setattr(args, "_rdsi_bg_suppress_active_mask", bg_suppress_active_mask.detach())
+    setattr(args, "_rdsi_boundary_active_mask", boundary_active_mask.detach())
+    setattr(args, "_rdsi_action_map", selected_action_map.detach())
+    setattr(args, "_rdsi_residual_alpha_map", residual_alpha.detach())
+    setattr(args, "_rdsi_teacher_proto_weight_stack", proto_weight_stack.detach())
+    setattr(args, "_rdsi_selected_teacher_stack_index", selected_stack_index.detach())
+    setattr(args, "_rdsi_proto_region_weight", proto_score_mass.detach())
+    setattr(args, "_rdsi_benefit_score", selected_score_map.detach())
+    setattr(args, "_rdsi_selected_score", selected_score_map.detach())
+    setattr(args, "_rdsi_fg_repair_score", selected_fg_repair_score.detach())
+    setattr(args, "_rdsi_bg_suppress_score", selected_bg_suppress_score.detach())
+    setattr(args, "_rdsi_boundary_score", selected_boundary_score.detach())
+    setattr(args, "_rdsi_foreground_lift_score", selected_fg_lift.detach())
+    setattr(args, "_rdsi_background_suppression_score", selected_bg_suppression.detach())
+    setattr(args, "_rdsi_boundary_support", selected_boundary_support.detach())
+    setattr(args, "_rdsi_core_preserving_fg_support", selected_core_preserving_fg.detach())
+    setattr(args, "_rdsi_core_damage_proxy", selected_core_damage.detach())
+    setattr(args, "_rdsi_seed_conflict", selected_seed_conflict.detach())
+    setattr(args, "_rdsi_unsafe_gap", selected_unsafe_gap.detach())
+    setattr(args, "_rdsi_foreground_excess_proxy", selected_fg_excess_proxy.detach())
+    setattr(args, "_rdsi_safe_budget_factor", safe_budget_factor.detach())
+    setattr(args, "_rdsi_core_reopen_mask", core_reopen_mask.detach())
+    setattr(args, "_rdsi_risk_region", region.detach())
+    setattr(args, "_rdsi_hard_core_mask", hard_core_mask.detach())
+    setattr(args, "_rdsi_soft_core_mask", soft_core_mask.detach())
+    return selected_logits, profile
+
+
+def rdsi_feature_prototype_loss(student_feature, teacher_feature_list, args, iter_num):
+    """Transfer RDSI-selected regional knowledge through feature prototypes."""
+    device = student_feature.device
+    zero_loss = student_feature.sum() * 0.0
+    profile = zero_rgftd_profile(device)
+    profile["rdsi_enabled"] = torch.tensor(1.0, device=device)
+
+    if teacher_feature_list is None or len(teacher_feature_list) == 0:
+        raise ValueError("RDSI feature-prototype transfer requires a non-empty teacher feature list")
+
+    weight_stack = getattr(args, "_rdsi_teacher_proto_weight_stack", None)
+    if weight_stack is None or not torch.is_tensor(weight_stack):
+        raise ValueError("RDSI teacher selection must run before feature-prototype transfer")
+    if weight_stack.dim() != 4 or weight_stack.shape[0] != len(teacher_feature_list):
+        raise ValueError("RDSI prototype weight stack does not match teacher feature list")
+
+    if student_feature.dim() != 4:
+        raise ValueError("RDSI feature-prototype transfer expects a 4D student feature map")
+
+    batch_size, channels, height, width = student_feature.shape
+    teacher_features = []
+    for teacher_feature in teacher_feature_list:
+        if teacher_feature is None or not torch.is_tensor(teacher_feature) or teacher_feature.dim() != 4:
+            raise ValueError("RDSI feature-prototype transfer expects 4D teacher feature maps")
+        teacher_feature = teacher_feature.detach().to(device=device, dtype=student_feature.dtype)
+        if teacher_feature.shape[0] != batch_size or teacher_feature.shape[1] != channels:
+            raise ValueError("RDSI teacher feature batch/channel dimensions must match student features")
+        if teacher_feature.shape[-2:] != (height, width):
+            teacher_feature = F.interpolate(
+                teacher_feature,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        teacher_features.append(teacher_feature)
+
+    weight_stack = weight_stack.detach().to(device=device, dtype=student_feature.dtype).clamp_min(0.0)
+    if weight_stack.shape[1] != batch_size:
+        raise ValueError("RDSI prototype weight batch dimension must match student features")
+    if weight_stack.shape[-2:] != (height, width):
+        flat_weight = weight_stack.reshape(-1, 1, weight_stack.shape[-2], weight_stack.shape[-1])
+        flat_weight = F.interpolate(flat_weight, size=(height, width), mode="bilinear", align_corners=False)
+        weight_stack = flat_weight.reshape(weight_stack.shape[0], batch_size, height, width).clamp_min(0.0)
+
+    region_weight = weight_stack.sum(dim=0).clamp_min(0.0)
+    region_mass = region_weight.flatten(1).sum(dim=1)
+    valid_batch = region_mass > 1e-6
+
+    lambda_raw = float(get_rgftd_lambda(iter_num, args))
+    lambda_cap = float(getattr(args, "rgftd_lambda_eff_cap", lambda_raw))
+    if lambda_cap > 0.0:
+        lambda_effective = min(lambda_raw, lambda_cap)
+    else:
+        lambda_effective = lambda_raw
+    profile["lambda"] = torch.tensor(lambda_raw, device=device)
+    profile["lambda_pre_safety"] = torch.tensor(lambda_raw, device=device)
+    profile["lambda_after_safety"] = torch.tensor(lambda_effective, device=device)
+    profile["lambda_effective"] = torch.tensor(lambda_effective, device=device)
+
+    if not bool(valid_batch.any().detach().cpu().item()):
+        return zero_loss, 0.0, profile
+
+    teacher_stack = torch.stack(teacher_features, dim=0)
+    teacher_stack = F.normalize(teacher_stack, dim=2)
+    student_norm = F.normalize(student_feature, dim=1)
+
+    def _resized_runtime_mask(attr):
+        mask = getattr(args, attr, None)
+        if mask is None or not torch.is_tensor(mask):
+            raise ValueError("RDSI feature-prototype transfer requires {}".format(attr))
+        mask = mask.to(device=device)
+        if mask.shape[0] != batch_size:
+            raise ValueError("RDSI runtime mask batch dimension must match student features")
+        if mask.shape[-2:] != (height, width):
+            mask = F.interpolate(
+                mask.float().unsqueeze(1),
+                size=(height, width),
+                mode="nearest",
+            )[:, 0]
+        return mask > 0.5
+
+    def _prototype_term(action_weight_stack):
+        action_region_weight = action_weight_stack.sum(dim=0).clamp_min(0.0)
+        action_mass = action_region_weight.flatten(1).sum(dim=1)
+        action_valid = action_mass > 1e-6
+        if not bool(action_valid.any().detach().cpu().item()):
+            zero_cosine = torch.zeros(batch_size, device=device, dtype=student_feature.dtype)
+            return zero_loss, zero_cosine, action_valid, action_region_weight, action_mass
+        action_teacher_weight = action_weight_stack / action_region_weight.unsqueeze(0).clamp_min(1e-6)
+        action_teacher_mix = (teacher_stack * action_teacher_weight.unsqueeze(2)).sum(dim=0).detach()
+        action_teacher_mix = F.normalize(action_teacher_mix, dim=1)
+        action_region_weight_4d = action_region_weight.unsqueeze(1)
+        action_denom = action_mass.clamp_min(1e-6).view(batch_size, 1)
+        action_student_proto = (student_norm * action_region_weight_4d).flatten(2).sum(dim=2) / action_denom
+        action_teacher_proto = (action_teacher_mix * action_region_weight_4d).flatten(2).sum(dim=2) / action_denom
+        action_student_proto = F.normalize(action_student_proto, dim=1)
+        action_teacher_proto = F.normalize(action_teacher_proto.detach(), dim=1)
+        action_cosine = (action_student_proto * action_teacher_proto).sum(dim=1).clamp(-1.0, 1.0)
+        action_valid_float = action_valid.float()
+        action_loss = ((1.0 - action_cosine) * action_valid_float).sum() / action_valid_float.sum().clamp_min(1.0)
+        return action_loss, action_cosine, action_valid, action_region_weight, action_mass
+
+    fg_mask = _resized_runtime_mask("_rdsi_fg_repair_active_mask")
+    bg_mask = _resized_runtime_mask("_rdsi_background_active_mask")
+    boundary_mask = _resized_runtime_mask("_rdsi_boundary_active_mask")
+
+    fg_loss, fg_cosine, fg_valid, fg_region_weight, fg_mass = _prototype_term(
+        weight_stack * fg_mask.unsqueeze(0).float()
+    )
+    bg_loss, bg_cosine, bg_valid, bg_region_weight, bg_mass = _prototype_term(
+        weight_stack * bg_mask.unsqueeze(0).float()
+    )
+    boundary_loss, boundary_cosine, boundary_valid, boundary_region_weight, boundary_mass = _prototype_term(
+        weight_stack * boundary_mask.unsqueeze(0).float()
+    )
+
+    action_terms = [
+        (fg_loss, fg_mass.sum().detach()),
+        (bg_loss, bg_mass.sum().detach()),
+        (boundary_loss, boundary_mass.sum().detach()),
+    ]
+    action_weight_sum = sum(action_weight for _, action_weight in action_terms).clamp_min(1.0)
+    loss = sum(action_loss * action_weight for action_loss, action_weight in action_terms) / action_weight_sum
+    valid_float = valid_batch.float()
+    proto_cosine = 1.0 - loss.detach()
+
+    teacher_mix_weight = weight_stack / region_weight.unsqueeze(0).clamp_min(1e-6)
+    teacher_prob = teacher_mix_weight.clamp_min(1e-6)
+    teacher_prob = teacher_prob / teacher_prob.sum(dim=0, keepdim=True).clamp_min(1e-6)
+    if teacher_prob.shape[0] > 1:
+        teacher_entropy = -(teacher_prob * torch.log(teacher_prob)).sum(dim=0)
+        teacher_entropy = teacher_entropy / math.log(float(teacher_prob.shape[0]))
+    else:
+        teacher_entropy = torch.zeros_like(region_weight)
+    teacher_weight_max = teacher_prob.max(dim=0).values
+    positive_region = region_weight > 0.0
+
+    profile["loss"] = loss.detach()
+    profile["lambda"] = torch.tensor(lambda_raw, device=device)
+    profile["lambda_pre_safety"] = torch.tensor(lambda_raw, device=device)
+    profile["lambda_effective"] = torch.tensor(lambda_effective, device=device)
+    profile["lambda_after_safety"] = torch.tensor(lambda_effective, device=device)
+    profile["teacher_active_loss"] = (loss * lambda_effective).detach()
+    profile["rdsi_loss_raw"] = loss.detach()
+    profile["rdsi_loss_weighted"] = profile["teacher_active_loss"].detach()
+    profile["rdsi_proto_loss"] = loss.detach()
+    profile["rdsi_proto_weight_mean"] = region_weight.mean().detach()
+    profile["rdsi_proto_weight_top"] = _masked_mean(region_weight, positive_region).detach()
+    profile["rdsi_proto_cosine"] = proto_cosine.detach()
+    profile["rdsi_proto_region_ratio"] = positive_region.float().mean().detach()
+    profile["rdsi_proto_teacher_entropy"] = _masked_mean(teacher_entropy, positive_region).detach()
+    profile["rdsi_proto_teacher_weight_max"] = _masked_mean(teacher_weight_max, positive_region).detach()
+    profile["rdsi_proto_valid_batches"] = valid_float.mean().detach()
+    profile["rdsi_fg_repair_loss"] = fg_loss.detach()
+    profile["rdsi_bg_suppress_loss"] = bg_loss.detach()
+    profile["rdsi_boundary_loss"] = boundary_loss.detach()
+    profile["region_ratio"] = positive_region.float().mean().detach()
+    profile["active_ratio"] = positive_region.float().mean().detach()
+    risk_region = _runtime_map(args, "_rdsi_risk_region", region_weight, as_bool=True)
+    if risk_region is not None:
+        profile["risk_region_ratio"] = risk_region.float().mean().detach()
+    else:
+        profile["risk_region_ratio"] = positive_region.float().mean().detach()
+    return loss, lambda_effective, profile
+
+
 def _build_refined_teacher_target(
     teacher_prob,
     image,
@@ -342,11 +1858,12 @@ def _build_refined_teacher_target(
         return teacher_prob.detach(), False, profile
 
     support_roi = active_fg_mask | active_bg_mask | seed_fg_context | (candidate_mask & region)
+    preserve_core_mask = core_mask & (~active_fg_mask) & (~active_bg_mask)
     core_anchor_radius = int(getattr(args, "rgftd_refine_core_anchor_radius", 1))
-    core_anchor = core_mask & _dilate_mask(support_roi, core_anchor_radius)
+    core_anchor = preserve_core_mask & _dilate_mask(support_roi, core_anchor_radius)
     refine_roi = support_roi | core_anchor | seed_fg_support
     q = teacher_prob.detach().clone()
-    supported_fg_region = seed_fg_context | foreground_candidate_mask
+    supported_fg_region = seed_fg_context | foreground_candidate_mask | active_fg_mask
     unsupported_fg_region = active_fg_mask & (~supported_fg_region)
 
     seed_fg_anchor = seed_fg_support & refine_roi
@@ -364,9 +1881,9 @@ def _build_refined_teacher_target(
         q = q.clamp_min(1e-6)
         q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-    if core_mask.any():
+    if preserve_core_mask.any():
         core_q = _one_hot_label(label, num_classes, q)
-        q = torch.where(core_mask.unsqueeze(1), core_q, q)
+        q = torch.where(preserve_core_mask.unsqueeze(1), core_q, q)
 
     locked_mask = core_anchor | seed_fg_anchor | seed_bg_anchor
     locked_q = q.detach()
@@ -420,8 +1937,8 @@ def _build_refined_teacher_target(
     q_candidate_ratio = _masked_mean(q_fg_prob, candidate_mask & refine_roi)
     q_near_seed_ratio = _masked_mean(q_fg_prob, seed_fg_context & refine_roi)
     unsupported_fg_ratio = _masked_ratio(unsupported_fg_region, active_fg_mask)
-    if core_mask.any():
-        q_core_conflict = _masked_ratio((q_pred != label) & core_mask, core_mask)
+    if preserve_core_mask.any():
+        q_core_conflict = _masked_ratio((q_pred != label) & preserve_core_mask, preserve_core_mask)
     else:
         q_core_conflict = q[:, :1].sum() * 0.0
     teacher_to_q_kl = F.kl_div(
@@ -508,6 +2025,9 @@ def _classwise_teacher_validation(
 
 
 def get_rgftd_lambda(iter_num, args):
+    forced_lambda = getattr(args, "rgftd_force_lambda", None)
+    if forced_lambda is not None:
+        return max(float(forced_lambda), 0.0)
     warmup = int(getattr(args, "rgftd_warmup_iters", 800))
     rampup = int(getattr(args, "rgftd_rampup_iters", 800))
     max_lambda = float(getattr(args, "rgftd_lambda", 0.1))
@@ -538,19 +2058,48 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     teacher_conf = teacher_prob.max(dim=1)[0]
     teacher_pred = teacher_prob.argmax(dim=1)
     student_conf = student_prob.max(dim=1)[0]
+    student_pred = student_prob.argmax(dim=1)
+    teacher_entropy = _normalized_entropy(teacher_prob)
     student_entropy = _normalized_entropy(student_prob)
-    label = label.long()
-    valid_mask = getattr(wann_maps, "valid_mask", label != int(getattr(args, "num_classes", teacher_prob.shape[1])))
-    support_mask = getattr(wann_maps, "support_mask", valid_mask)
-    seed_support_mask = getattr(wann_maps, "seed_support_mask", support_mask)
-    core_mask = wann_maps.core_mask & valid_mask
-    fg_support = support_mask & (label > 0)
-    bg_support = support_mask & (label == 0)
-    seed_fg_support = seed_support_mask & (label > 0)
-    seed_bg_support = seed_support_mask & (label == 0)
+    log_teacher_prob = torch.log(teacher_prob.clamp_min(1e-6))
+    log_student_prob = torch.log(student_prob.clamp_min(1e-6))
+    kl_teacher_student = (teacher_prob * (log_teacher_prob - log_student_prob)).sum(dim=1)
+    kl_student_teacher = (student_prob * (log_student_prob - log_teacher_prob)).sum(dim=1)
+    kl_normalizer = max(math.log(float(teacher_prob.shape[1])), 1e-6)
+    knowledge_gap_score = (0.5 * (kl_teacher_student + kl_student_teacher) / kl_normalizer).clamp(0.0, 1.0)
+    teacher_student_disagreement = (1.0 - (teacher_prob * student_prob).sum(dim=1)).clamp(0.0, 1.0)
+    raw_label = label.long()
+    num_classes = int(getattr(args, "num_classes", teacher_prob.shape[1]))
+    target_label = getattr(wann_maps, "target_label", raw_label).long()
+    target_valid = (target_label >= 0) & (target_label < num_classes)
+    valid_mask = getattr(wann_maps, "valid_mask", raw_label != num_classes) & target_valid
+    raw_support_mask = getattr(wann_maps, "support_mask", valid_mask) & target_valid
+    raw_seed_support_mask = getattr(wann_maps, "seed_support_mask", raw_support_mask) & target_valid
+    support_mask = raw_support_mask
+    seed_support_mask = raw_seed_support_mask
+    label = target_label
+    core_mask_raw = wann_maps.core_mask & valid_mask
+    rdsi_hard_core_mask = _runtime_map(args, "_rdsi_hard_core_mask", teacher_conf, as_bool=True)
+    rdsi_soft_core_mask = _runtime_map(args, "_rdsi_soft_core_mask", teacher_conf, as_bool=True)
+    if rdsi_hard_core_mask is not None:
+        core_mask = rdsi_hard_core_mask & valid_mask
+    else:
+        hard_core_conf_thresh = float(getattr(args, "rdsi_hard_core_conf_thresh", 0.90))
+        hard_core_entropy_thresh = float(getattr(args, "rdsi_hard_core_entropy_thresh", 0.25))
+        hard_core_reliability_thresh = float(getattr(args, "rdsi_hard_core_reliability_thresh", 0.65))
+        core_mask = (
+            core_mask_raw
+            & (student_pred == target_label)
+            & (student_conf >= hard_core_conf_thresh)
+            & (student_entropy <= hard_core_entropy_thresh)
+            & (wann_maps.reliability >= hard_core_reliability_thresh)
+        )
+    if rdsi_soft_core_mask is not None:
+        soft_core_mask = rdsi_soft_core_mask & valid_mask
+    else:
+        soft_core_mask = core_mask_raw & (~core_mask)
 
     low_r_thresh = float(getattr(args, "rgftd_low_r_thresh", getattr(args, "wann_soft_thresh", 0.25)))
-    use_soft_band = int(getattr(args, "rgftd_use_soft_band", 1)) == 1
     teacher_fg_radius = int(getattr(args, "rgftd_teacher_foreground_radius", 2))
     min_fg_pixels = int(getattr(args, "rgftd_min_foreground_pixels", 8))
     min_fg_ratio = float(getattr(args, "rgftd_min_foreground_ratio", 0.05))
@@ -580,15 +2129,21 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
 
     candidate_mask = getattr(wann_maps, "candidate_mask", None)
     if candidate_mask is None:
-        candidate_mask = (~wann_maps.core_mask) & (wann_maps.reliability >= low_r_thresh)
-    candidate_mask = candidate_mask & (~wann_maps.core_mask)
+        candidate_mask = (~core_mask) & (wann_maps.reliability >= low_r_thresh)
+    candidate_mask = (candidate_mask | soft_core_mask) & (~core_mask)
+    non_conflict_mask = ~getattr(wann_maps, "low_conflict_mask", torch.zeros_like(valid_mask, dtype=torch.bool))
+    reliable_candidate_mask = candidate_mask & non_conflict_mask & (wann_maps.reliability >= low_r_thresh)
 
-    # Re-open non-core pixels, but only around teacher foreground evidence.
-    # This keeps the v1 semantics (uncertain / ignore can be distilled) without turning RGFTD into background-only KL.
-    non_core_region = wann_maps.ignore_mask | wann_maps.soft_band
-    if use_soft_band:
-        non_core_region = non_core_region | candidate_mask
-    region = non_core_region & (~wann_maps.core_mask)
+    region = _rdsi_intervention_region(
+        wann_maps,
+        student_conf,
+        student_entropy,
+        core_mask,
+        soft_core_mask,
+        args,
+    )
+    risk_region = region
+    preserve_region = core_mask & valid_mask
 
     teacher_fg = teacher_pred > 0
     teacher_bg = ~teacher_fg
@@ -600,6 +2155,10 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
         student_fg_prob = torch.zeros_like(student_conf)
     teacher_bg_prob = teacher_prob[:, 0]
     teacher_fg_margin = teacher_fg_prob - teacher_bg_prob
+    fg_support = support_mask & (label > 0)
+    bg_support = support_mask & (label == 0)
+    seed_fg_support = seed_support_mask & (label > 0)
+    seed_bg_support = seed_support_mask & (label == 0)
     teacher_fg_conf = teacher_fg & (teacher_conf >= float(getattr(args, "rgftd_teacher_conf_thresh", 0.90)))
     teacher_fg_prob_anchor = (teacher_fg_prob >= teacher_fg_prob_thresh) & region
     teacher_fg_seed = (teacher_fg_conf | teacher_fg_prob_anchor) & region
@@ -613,10 +2172,88 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     teacher_fg_ready = teacher_fg_anchor | teacher_fg_prob_anchor
     teacher_bg_conf = teacher_bg & (teacher_conf >= teacher_bg_conf_thresh)
     teacher_bg_safe = teacher_fg_prob <= bg_max_fg_prob
-    teacher_accept = teacher_fg_ready | (teacher_bg_conf & teacher_bg_safe)
+    student_uncertain_for_fg = (
+        (student_conf <= float(getattr(args, "rgftd_student_conf_thresh", 0.80)))
+        | (student_entropy >= float(getattr(args, "rgftd_student_entropy_thresh", 0.35)))
+    )
+    student_foreground_repair = (
+        (student_pred == 0)
+        | student_uncertain_for_fg
+        | (student_fg_prob < teacher_fg_prob_thresh)
+    ) & region
+    teacher_fg_lift_score = (
+        (teacher_fg_prob - student_fg_prob).clamp_min(0.0)
+        / (1.0 - student_fg_prob).clamp_min(1e-6)
+    ).clamp(0.0, 1.0)
+    teacher_fg_repair_ready = (
+        teacher_fg_ready
+        & ((teacher_fg_prob - student_fg_prob) >= teacher_student_fg_margin)
+        & student_foreground_repair
+    )
+    teacher_accept = teacher_fg_repair_ready | (teacher_bg_conf & teacher_bg_safe)
     teacher_fg_context = _dilate_mask(teacher_fg_ready, teacher_fg_radius)
-    teacher_bg_context = teacher_fg_context & teacher_bg_conf
-    region = region & (teacher_fg_context | teacher_bg_context)
+    teacher_bg_context = teacher_bg_conf & teacher_bg_safe
+    rdsi_active_mask = _runtime_map(args, "_rdsi_active_mask", teacher_conf, as_bool=True)
+    rdsi_foreground_active_mask = _runtime_map(args, "_rdsi_foreground_active_mask", teacher_conf, as_bool=True)
+    rdsi_background_active_mask = _runtime_map(args, "_rdsi_background_active_mask", teacher_conf, as_bool=True)
+    rdsi_fg_repair_active_mask = _runtime_map(args, "_rdsi_fg_repair_active_mask", teacher_conf, as_bool=True)
+    rdsi_bg_suppress_active_mask = _runtime_map(args, "_rdsi_bg_suppress_active_mask", teacher_conf, as_bool=True)
+    rdsi_boundary_active_mask = _runtime_map(args, "_rdsi_boundary_active_mask", teacher_conf, as_bool=True)
+    rdsi_action_map = _runtime_map(args, "_rdsi_action_map", teacher_conf)
+    rdsi_alpha_map = _runtime_map(args, "_rdsi_residual_alpha_map", teacher_conf)
+    rdsi_benefit_map = _runtime_map(args, "_rdsi_benefit_score", teacher_conf)
+    rdsi_score_map = _runtime_map(args, "_rdsi_selected_score", teacher_conf)
+    rdsi_fg_repair_score_map = _runtime_map(args, "_rdsi_fg_repair_score", teacher_conf)
+    rdsi_bg_suppress_score_map = _runtime_map(args, "_rdsi_bg_suppress_score", teacher_conf)
+    rdsi_boundary_score_map = _runtime_map(args, "_rdsi_boundary_score", teacher_conf)
+    rdsi_fg_lift_map = _runtime_map(args, "_rdsi_foreground_lift_score", teacher_conf)
+    rdsi_bg_suppression_map = _runtime_map(args, "_rdsi_background_suppression_score", teacher_conf)
+    rdsi_boundary_support_map = _runtime_map(args, "_rdsi_boundary_support", teacher_conf)
+    rdsi_core_preserving_fg_map = _runtime_map(args, "_rdsi_core_preserving_fg_support", teacher_conf)
+    rdsi_core_damage_map = _runtime_map(args, "_rdsi_core_damage_proxy", teacher_conf)
+    rdsi_seed_conflict_map = _runtime_map(args, "_rdsi_seed_conflict", teacher_conf)
+    rdsi_unsafe_gap_map = _runtime_map(args, "_rdsi_unsafe_gap", teacher_conf)
+    rdsi_fg_excess_proxy_map = _runtime_map(args, "_rdsi_foreground_excess_proxy", teacher_conf)
+    rdsi_core_reopen_mask = _runtime_map(args, "_rdsi_core_reopen_mask", teacher_conf, as_bool=True)
+    if rdsi_core_reopen_mask is not None:
+        region = region | rdsi_core_reopen_mask
+        risk_region = risk_region | rdsi_core_reopen_mask
+        student_foreground_repair = student_foreground_repair | rdsi_core_reopen_mask
+        teacher_fg_repair_ready = teacher_fg_repair_ready | (
+            rdsi_core_reopen_mask
+            & teacher_fg_ready
+            & ((teacher_fg_prob - student_fg_prob) >= teacher_student_fg_margin)
+        )
+        teacher_accept = teacher_fg_repair_ready | (teacher_bg_conf & teacher_bg_safe)
+    if rdsi_active_mask is not None:
+        if rdsi_fg_repair_active_mask is None:
+            rdsi_fg_repair_active_mask = (
+                rdsi_foreground_active_mask & region
+                if rdsi_foreground_active_mask is not None
+                else rdsi_active_mask & region
+            )
+        if rdsi_bg_suppress_active_mask is None:
+            rdsi_bg_suppress_active_mask = (
+                rdsi_background_active_mask & region
+                if rdsi_background_active_mask is not None
+                else torch.zeros_like(region, dtype=torch.bool)
+            )
+        if rdsi_boundary_active_mask is None:
+            rdsi_boundary_active_mask = torch.zeros_like(region, dtype=torch.bool)
+        rdsi_foreground_region = (
+            rdsi_foreground_active_mask & region
+            if rdsi_foreground_active_mask is not None
+            else (rdsi_fg_repair_active_mask | rdsi_boundary_active_mask) & region
+        )
+        rdsi_background_region = (
+            rdsi_background_active_mask & region
+            if rdsi_background_active_mask is not None
+            else rdsi_bg_suppress_active_mask & region
+        )
+        teacher_candidate_region = (rdsi_foreground_region | rdsi_background_region) & region
+    else:
+        region = region & (teacher_fg_context | teacher_bg_context)
+        teacher_candidate_region = teacher_accept & region
 
     core_pixels = core_mask.float().sum().detach()
     core_valid = bool(float(core_pixels.cpu().item()) > 0.0)
@@ -745,12 +2382,17 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
         (student_conf <= float(getattr(args, "rgftd_student_conf_thresh", 0.80)))
         | (student_entropy >= float(getattr(args, "rgftd_student_entropy_thresh", 0.35)))
     )
-    foreground_correction = teacher_fg_ready & ((teacher_fg_prob - student_fg_prob) >= teacher_student_fg_margin)
+    foreground_correction = teacher_fg_repair_ready
     seed_fg_spatial_context = _dilate_mask(seed_fg_support, spatial_support_radius)
     fg_support_context = _dilate_mask(fg_support, spatial_support_radius)
     foreground_candidate_mask = candidate_mask & fg_support_context
     spatial_support_gate = (foreground_candidate_mask | seed_fg_spatial_context) & region
-    active_fg_pre_spatial = region & teacher_fg_ready & (student_uncertain | foreground_correction)
+    support_reject_map = (
+        risk_region
+        & teacher_fg_ready
+        & (~seed_fg_spatial_context)
+        & (~foreground_candidate_mask)
+    )
     if spatial_support_enabled:
         spatial_weight = region.float() * spatial_far_weight
         spatial_weight = torch.maximum(
@@ -764,47 +2406,120 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
         spatial_weight = spatial_weight * region.float()
     else:
         spatial_weight = region.float()
-    active_fg = active_fg_pre_spatial
-    active_fg_pre_budget = active_fg
-    fg_budget_score = (
-        teacher_fg_prob
-        * student_entropy
-        * (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
-        * spatial_weight
+
+    weak_anchor_mask = seed_support_mask & region
+    weak_anchor_agreement = torch.where(
+        weak_anchor_mask,
+        ((teacher_pred == label) & weak_anchor_mask).float(),
+        torch.ones_like(teacher_conf),
     )
-    active_fg = _topk_foreground_anchor(
-        fg_budget_score,
-        active_fg,
-        topk_ratio=active_fg_topk_ratio,
-        min_pixels=active_fg_topk_min_pixels,
-        max_pixels=active_fg_topk_max_pixels,
-        preserve_mask=foreground_correction & active_fg,
-    )
-    active_bg = region & teacher_bg_conf & teacher_bg_safe & (~teacher_fg_ready) & student_uncertain
-    active_bg_pre_budget = active_bg
-    bg_budget_score = teacher_bg_prob * student_entropy * (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
-    flat_active_fg = active_fg.flatten(1)
-    flat_active_bg = active_bg.flatten(1)
-    max_bg_pixels = []
-    for batch_idx in range(active_bg.shape[0]):
-        fg_count = int(flat_active_fg[batch_idx].sum().detach().cpu().item())
-        bg_count = int(flat_active_bg[batch_idx].sum().detach().cpu().item())
-        if fg_count > 0:
-            max_bg_pixels.append(int(math.ceil(float(fg_count) * max(max_bg_fg_ratio, 0.0))))
-        elif allow_bg_without_fg:
-            max_bg_pixels.append(int(max(min_fg_pixels, bg_count)))
-        else:
-            max_bg_pixels.append(0)
-    if max(max_bg_pixels) <= 0:
-        active_bg = torch.zeros_like(active_bg, dtype=torch.bool)
+    if core_valid:
+        core_consistency = (1.0 - teacher_core_conflict).clamp(0.0, 1.0)
     else:
-        active_bg = _topk_foreground_anchor(
-            bg_budget_score,
-            active_bg,
-            topk_ratio=1.0,
-            min_pixels=0,
-            max_pixels=max_bg_pixels,
+        core_consistency = torch.tensor(1.0, device=device)
+    prior_safe = torch.where(
+        teacher_fg_ready,
+        torch.ones_like(teacher_conf),
+        teacher_bg_safe.float(),
+    )
+    teacher_local_reliability = (
+        teacher_conf
+        * (1.0 - teacher_entropy).clamp(0.0, 1.0)
+        * weak_anchor_agreement
+        * teacher_reliability.detach().clamp(0.0, 1.0)
+        * core_consistency.detach()
+        * prior_safe
+    ).clamp(0.0, 1.0)
+    student_uncertainty_score = torch.maximum(
+        student_entropy,
+        (1.0 - student_conf).clamp(0.0, 1.0),
+    )
+    student_risk_evidence = torch.maximum(student_uncertainty_score, teacher_student_disagreement)
+    student_local_risk = (
+        (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+        * student_risk_evidence
+    ).clamp(0.0, 1.0)
+    if rdsi_active_mask is not None:
+        if rdsi_score_map is not None:
+            release_score = (
+                rdsi_score_map.clamp(0.0, 1.0)
+                * teacher_candidate_region.float()
+            ).clamp(0.0, 1.0)
+        elif rdsi_benefit_map is not None:
+            release_score = (
+                teacher_local_reliability
+                * rdsi_benefit_map.clamp(0.0, 1.0)
+                * teacher_candidate_region.float()
+            ).clamp(0.0, 1.0)
+        else:
+            release_score = (
+                teacher_local_reliability
+                * teacher_candidate_region.float()
+            ).clamp(0.0, 1.0)
+        if rdsi_background_active_mask is not None and rdsi_alpha_map is not None:
+            alpha_floor = max(float(getattr(args, "rdsi_residual_alpha", 0.35)), 1e-6)
+            paired_bg_score = (rdsi_alpha_map / alpha_floor).clamp(0.0, 1.0)
+            paired_bg_mask = rdsi_background_active_mask & teacher_candidate_region
+            release_score = torch.where(
+                paired_bg_mask,
+                torch.maximum(release_score, paired_bg_score),
+                release_score,
+            )
+    else:
+        release_score = (
+            teacher_local_reliability
+            * student_local_risk
+            * teacher_fg_lift_score
+            * spatial_weight
+            * teacher_candidate_region.float()
+        ).clamp(0.0, 1.0)
+    teacher_release_candidate = teacher_candidate_region & (release_score > 0.0)
+
+    if rdsi_active_mask is not None:
+        active_fg_pre_spatial = teacher_release_candidate & (
+            rdsi_fg_repair_active_mask | rdsi_boundary_active_mask
         )
+        active_fg_pre_budget = active_fg_pre_spatial
+        active_bg_pre_budget = teacher_release_candidate & rdsi_bg_suppress_active_mask
+        active_fg = active_fg_pre_budget
+        active_bg = active_bg_pre_budget
+    else:
+        active_fg_pre_spatial = teacher_release_candidate & teacher_fg_ready
+        active_fg_pre_budget = active_fg_pre_spatial
+        active_bg_pre_budget = teacher_release_candidate & teacher_bg_conf & teacher_bg_safe & (~teacher_fg_ready)
+        active_fg = active_fg_pre_spatial
+        fg_budget_score = release_score * teacher_fg_ready.float()
+        active_fg = _topk_foreground_anchor(
+            fg_budget_score,
+            active_fg,
+            topk_ratio=active_fg_topk_ratio,
+            min_pixels=active_fg_topk_min_pixels,
+            max_pixels=active_fg_topk_max_pixels,
+        )
+        active_bg = active_bg_pre_budget
+        bg_budget_score = release_score * teacher_bg_prob
+        flat_active_fg = active_fg.flatten(1)
+        flat_active_bg = active_bg.flatten(1)
+        max_bg_pixels = []
+        for batch_idx in range(active_bg.shape[0]):
+            fg_count = int(flat_active_fg[batch_idx].sum().detach().cpu().item())
+            bg_count = int(flat_active_bg[batch_idx].sum().detach().cpu().item())
+            if fg_count > 0:
+                max_bg_pixels.append(int(math.ceil(float(fg_count) * max(max_bg_fg_ratio, 0.0))))
+            elif allow_bg_without_fg:
+                max_bg_pixels.append(int(max(min_fg_pixels, bg_count)))
+            else:
+                max_bg_pixels.append(0)
+        if max(max_bg_pixels) <= 0:
+            active_bg = torch.zeros_like(active_bg, dtype=torch.bool)
+        else:
+            active_bg = _topk_foreground_anchor(
+                bg_budget_score,
+                active_bg,
+                topk_ratio=1.0,
+                min_pixels=0,
+                max_pixels=max_bg_pixels,
+            )
     active = active_fg | active_bg
 
     region_f = region.float()
@@ -813,6 +2528,16 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     active_sum = active_f.sum()
     active_fg_mask = active_fg
     active_bg_mask = active_bg
+    if rdsi_active_mask is not None:
+        active_fg_repair_mask = active & rdsi_fg_repair_active_mask
+        active_bg_suppress_mask = active & rdsi_bg_suppress_active_mask
+        active_boundary_mask = active & rdsi_boundary_active_mask
+        active_fg_mask = active_fg_repair_mask | active_boundary_mask
+        active_bg_mask = active_bg_suppress_mask
+    else:
+        active_fg_repair_mask = active_fg_mask
+        active_bg_suppress_mask = active_bg_mask
+        active_boundary_mask = torch.zeros_like(active, dtype=torch.bool)
     active_fg_pre_budget_pixels = active_fg_pre_budget.float().sum()
     active_bg_pre_budget_pixels = active_bg_pre_budget.float().sum()
     active_fg_pixels = active_fg_mask.float().sum()
@@ -850,8 +2575,12 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     active_fg_pre_budget_seed_precision = _masked_ratio(active_fg_pre_budget & seed_fg_support, active_fg_pre_budget)
     active_fg_pre_budget_candidate_ratio = _masked_ratio(active_fg_pre_budget & candidate_mask, active_fg_pre_budget)
     spatial_loss_scale = _masked_mean(spatial_weight, active_fg_mask).detach()
+    if rdsi_active_mask is not None and bool(active_fg_mask.any().detach().cpu().item()):
+        lambda_spatial_scale = torch.ones_like(spatial_loss_scale)
+    else:
+        lambda_spatial_scale = spatial_loss_scale
     foreground_veto = bool(
-        skip_background_only and (
+        rdsi_active_mask is None and skip_background_only and (
             active_fg_pixels.detach().cpu().item() < float(min_fg_pixels)
             or active_fg_ratio.detach().cpu().item() < float(min_fg_ratio)
         )
@@ -860,7 +2589,11 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     profile["candidate_ratio"] = candidate_mask.float().mean().detach()
     profile["region_ratio"] = region_f.mean().detach()
     profile["active_ratio"] = active_f.mean().detach()
-    profile["teacher_accept_ratio"] = ((teacher_accept & region).float().sum() / region_sum).detach()
+    risk_region_f = risk_region.float()
+    risk_region_sum = risk_region_f.sum().clamp_min(1.0)
+    profile["risk_region_ratio"] = risk_region_f.mean().detach()
+    profile["preserve_region_ratio"] = preserve_region.float().mean().detach()
+    profile["reject_by_support"] = (support_reject_map.float().sum() / risk_region_sum).detach()
     profile["student_uncertain_ratio"] = ((student_uncertain & region).float().sum() / region_sum).detach()
     profile["teacher_conf_mean"] = (teacher_conf * region_f).sum().detach() / region_sum
     profile["student_conf_mean"] = (student_conf * region_f).sum().detach() / region_sum
@@ -893,6 +2626,12 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     profile["teacher_seed_support_bg_agreement"] = teacher_seed_support_bg_agreement
     profile["seed_fg_support_pixels"] = seed_fg_support_pixels
     profile["core_conflict_veto_ratio"] = torch.tensor(1.0 if teacher_validation_veto else 0.0, device=device)
+    if teacher_validation_veto:
+        profile["reject_by_core_conflict"] = (
+            teacher_candidate_region.float().sum() / risk_region_sum
+        ).detach()
+    else:
+        profile["reject_by_core_conflict"] = teacher_conf.mean().detach() * 0.0
     profile["spatial_support_ratio"] = spatial_support_gate.float().mean().detach()
     profile["foreground_candidate_ratio"] = foreground_candidate_mask.float().mean().detach()
     profile["spatial_weight_mean"] = _masked_mean(spatial_weight, active_fg_mask).detach()
@@ -914,6 +2653,62 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     profile["foreground_veto_ratio"] = torch.tensor(1.0 if foreground_veto else 0.0, device=device)
     profile["active_foreground_ratio"] = active_fg_ratio.detach()
     profile["active_background_ratio"] = active_bg_ratio.detach()
+    if rdsi_active_mask is not None:
+        profile["rdsi_foreground_active_ratio"] = active_fg_mask.float().mean().detach()
+        profile["rdsi_background_paired_ratio"] = active_bg_mask.float().mean().detach()
+        profile["rdsi_fg_repair_active_ratio"] = active_fg_repair_mask.float().mean().detach()
+        profile["rdsi_bg_suppress_active_ratio"] = active_bg_suppress_mask.float().mean().detach()
+        profile["rdsi_boundary_active_ratio"] = active_boundary_mask.float().mean().detach()
+        profile["rdsi_bg_only_ratio"] = (
+            (active_bg_mask & (~active_fg_mask)).float().sum() / active_sum.clamp_min(1.0)
+        ).detach() if float(active_fg_pixels.detach().cpu().item()) <= 0.0 else teacher_conf.mean().detach() * 0.0
+        if rdsi_fg_repair_score_map is not None:
+            profile["rdsi_fg_repair_score"] = _masked_mean(rdsi_fg_repair_score_map, active_fg_repair_mask).detach()
+        if rdsi_bg_suppress_score_map is not None:
+            profile["rdsi_bg_suppress_score"] = _masked_mean(rdsi_bg_suppress_score_map, active_bg_suppress_mask).detach()
+        if rdsi_boundary_score_map is not None:
+            profile["rdsi_boundary_score"] = _masked_mean(rdsi_boundary_score_map, active_boundary_mask).detach()
+        if rdsi_fg_lift_map is not None:
+            profile["rdsi_fg_lift_mean"] = _masked_mean(rdsi_fg_lift_map, active_fg_repair_mask).detach()
+            profile["rdsi_fg_lift_top"] = _masked_mean(
+                rdsi_fg_lift_map,
+                active_fg_repair_mask & (rdsi_fg_lift_map >= rdsi_fg_lift_map.mean()),
+            ).detach()
+        if rdsi_bg_suppression_map is not None:
+            profile["rdsi_bg_suppression_mean"] = _masked_mean(rdsi_bg_suppression_map, active_bg_suppress_mask).detach()
+            profile["rdsi_bg_suppression_top"] = _masked_mean(
+                rdsi_bg_suppression_map,
+                active_bg_suppress_mask & (rdsi_bg_suppression_map >= rdsi_bg_suppression_map.mean()),
+            ).detach()
+        if rdsi_boundary_support_map is not None:
+            profile["rdsi_boundary_support_mean"] = _masked_mean(rdsi_boundary_support_map, active_boundary_mask).detach()
+            profile["rdsi_boundary_support_top"] = _masked_mean(
+                rdsi_boundary_support_map,
+                active_boundary_mask & (rdsi_boundary_support_map >= rdsi_boundary_support_map.mean()),
+            ).detach()
+        if rdsi_core_preserving_fg_map is not None:
+            profile["rdsi_core_preserving_fg_mean"] = _masked_mean(rdsi_core_preserving_fg_map, active_fg_repair_mask).detach()
+            profile["rdsi_core_preserving_fg_top"] = _masked_mean(
+                rdsi_core_preserving_fg_map,
+                active_fg_repair_mask & (rdsi_core_preserving_fg_map >= rdsi_core_preserving_fg_map.mean()),
+            ).detach()
+        if rdsi_core_damage_map is not None:
+            profile["rdsi_core_damage_mean"] = _masked_mean(rdsi_core_damage_map, teacher_candidate_region).detach()
+            profile["rdsi_core_damage_top"] = _masked_mean(rdsi_core_damage_map, active_fg_mask).detach()
+            profile["rdsi_veto_by_core_damage"] = _masked_ratio(
+                rdsi_core_damage_map >= float(getattr(args, "rdsi_core_damage_veto", 0.30)),
+                teacher_candidate_region,
+            ).detach()
+        if rdsi_seed_conflict_map is not None:
+            profile["rdsi_seed_conflict_mean"] = _masked_mean(rdsi_seed_conflict_map, teacher_candidate_region).detach()
+        if rdsi_unsafe_gap_map is not None:
+            profile["rdsi_unsafe_gap_mean"] = _masked_mean(rdsi_unsafe_gap_map, teacher_candidate_region).detach()
+            profile["rdsi_unsafe_gap_top"] = _masked_mean(rdsi_unsafe_gap_map, active_fg_mask).detach()
+        if rdsi_fg_excess_proxy_map is not None:
+            profile["rdsi_foreground_excess_proxy"] = _masked_mean(rdsi_fg_excess_proxy_map, teacher_candidate_region).detach()
+        if rdsi_core_reopen_mask is not None:
+            profile["rdsi_core_reopen_ratio"] = rdsi_core_reopen_mask.float().mean().detach()
+            profile["rdsi_core_reopen_active_ratio"] = (active_fg_mask & rdsi_core_reopen_mask).float().mean().detach()
     profile["active_foreground_pixels_pre_budget"] = active_fg_pre_budget_pixels.detach()
     profile["active_background_pixels_pre_budget"] = active_bg_pre_budget_pixels.detach()
     profile["foreground_budget_ratio"] = foreground_budget_ratio.detach()
@@ -937,22 +2732,26 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
         class_release = ((active_fg & (teacher_pred == class_id)).float().sum() / region_sum).detach()
         profile["teacher_class{}_release_ratio".format(class_id)] = class_release
 
-    lambda_pre_safety = (
-        float(lambda_rgftd)
-        * float(teacher_reliability.detach().cpu().item())
-        * float(release_factor.detach().cpu().item())
-    )
-    if validation_enabled:
+    if rdsi_active_mask is not None:
+        lambda_pre_safety = float(lambda_rgftd)
+        core_safety_factor = 1.0
+    else:
+        lambda_pre_safety = (
+            float(lambda_rgftd)
+            * float(teacher_reliability.detach().cpu().item())
+            * float(release_factor.detach().cpu().item())
+        )
+    if rdsi_active_mask is None and validation_enabled:
         if core_valid:
             core_conflict_value = float(teacher_core_conflict.detach().cpu().item())
             core_conflict_limit = float(max(getattr(args, "rgftd_teacher_max_core_conflict", 0.20), 1e-6))
             core_safety_factor = max(0.0, min(1.0 - core_conflict_value / core_conflict_limit, 1.0))
         else:
             core_safety_factor = 1.0
-    else:
+    elif rdsi_active_mask is None:
         core_safety_factor = 1.0
     lambda_after_safety = lambda_pre_safety * core_safety_factor
-    lambda_effective = lambda_after_safety * float(spatial_loss_scale.cpu().item())
+    lambda_effective = lambda_after_safety * float(lambda_spatial_scale.cpu().item())
     if lambda_eff_cap > 0.0:
         lambda_effective = min(lambda_effective, lambda_eff_cap)
     profile["lambda_pre_safety"] = torch.tensor(lambda_pre_safety, device=device)
@@ -968,10 +2767,78 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     elif lambda_effective <= 0.0:
         return_reason = 3.0
     profile["return_reason"] = torch.tensor(return_reason, device=device)
+    teacher_release_map = active if return_reason <= 0.0 else torch.zeros_like(active, dtype=torch.bool)
+    profile["teacher_accept_ratio"] = (
+        teacher_release_map.float().sum() / risk_region_sum
+    ).detach()
+    profile["teacher_reject_ratio"] = (
+        (teacher_candidate_region & (~teacher_release_map)).float().sum() / risk_region_sum
+    ).detach()
+    profile["release_score_mean"] = _masked_mean(release_score, teacher_candidate_region).detach()
+    profile["release_score_top"] = _masked_mean(release_score, teacher_release_map).detach()
+    profile["teacher_reliable_score"] = _masked_mean(teacher_local_reliability, teacher_candidate_region).detach()
+    profile["student_risk_score"] = _masked_mean(student_local_risk, teacher_candidate_region).detach()
+    profile["knowledge_gap_score"] = _masked_mean(knowledge_gap_score, teacher_candidate_region).detach()
+    profile["selected_gap_mean"] = _masked_mean(knowledge_gap_score, teacher_release_map).detach()
+    profile["rejected_gap_mean"] = _masked_mean(
+        knowledge_gap_score,
+        teacher_candidate_region & (~teacher_release_map),
+    ).detach()
+    if rdsi_alpha_map is not None:
+        profile["rdsi_alpha_mean"] = _masked_mean(rdsi_alpha_map, teacher_release_map).detach()
+        profile["rdsi_alpha_top"] = _masked_mean(
+            rdsi_alpha_map,
+            teacher_release_map & (rdsi_alpha_map >= rdsi_alpha_map.mean()),
+        ).detach()
+    if rdsi_benefit_map is not None:
+        profile["rdsi_benefit_mean"] = _masked_mean(rdsi_benefit_map, teacher_release_map).detach()
+        profile["rdsi_benefit_top"] = _masked_mean(
+            rdsi_benefit_map,
+            teacher_release_map & (rdsi_benefit_map >= rdsi_benefit_map.mean()),
+        ).detach()
+    if rdsi_score_map is not None:
+        profile["rdsi_selected_score_mean"] = _masked_mean(rdsi_score_map, teacher_release_map).detach()
+        profile["rdsi_selected_score_top"] = _masked_mean(
+            rdsi_score_map,
+            teacher_release_map & (rdsi_score_map >= rdsi_score_map.mean()),
+        ).detach()
+    if rdsi_boundary_support_map is not None:
+        profile["rdsi_boundary_support_mean"] = _masked_mean(rdsi_boundary_support_map, teacher_release_map).detach()
+        profile["rdsi_boundary_support_top"] = _masked_mean(
+            rdsi_boundary_support_map,
+            teacher_release_map & (rdsi_boundary_support_map >= rdsi_boundary_support_map.mean()),
+        ).detach()
+    if rdsi_core_preserving_fg_map is not None:
+        profile["rdsi_core_preserving_fg_mean"] = _masked_mean(rdsi_core_preserving_fg_map, teacher_release_map).detach()
+        profile["rdsi_core_preserving_fg_top"] = _masked_mean(
+            rdsi_core_preserving_fg_map,
+            teacher_release_map & (rdsi_core_preserving_fg_map >= rdsi_core_preserving_fg_map.mean()),
+        ).detach()
+    if rdsi_core_damage_map is not None:
+        profile["rdsi_core_damage_mean"] = _masked_mean(rdsi_core_damage_map, teacher_candidate_region).detach()
+        profile["rdsi_core_damage_top"] = _masked_mean(rdsi_core_damage_map, teacher_release_map).detach()
+    if rdsi_seed_conflict_map is not None:
+        profile["rdsi_seed_conflict_mean"] = _masked_mean(rdsi_seed_conflict_map, teacher_candidate_region).detach()
+    if rdsi_unsafe_gap_map is not None:
+        profile["rdsi_unsafe_gap_mean"] = _masked_mean(rdsi_unsafe_gap_map, teacher_candidate_region).detach()
+        profile["rdsi_unsafe_gap_top"] = _masked_mean(rdsi_unsafe_gap_map, teacher_release_map).detach()
+    if rdsi_fg_excess_proxy_map is not None:
+        profile["rdsi_foreground_excess_proxy"] = _masked_mean(rdsi_fg_excess_proxy_map, teacher_candidate_region).detach()
+    profile["rdsi_raw_teacher_conf_mean"] = _masked_mean(teacher_conf, teacher_release_map).detach()
+    profile["rdsi_raw_teacher_fg_ratio"] = (
+        ((teacher_pred > 0) & teacher_release_map).float().sum() / risk_region_sum
+    ).detach()
+    if foreground_veto:
+        profile["reject_by_fg_ratio"] = (
+            teacher_candidate_region.float().sum() / risk_region_sum
+        ).detach()
+    else:
+        profile["reject_by_fg_ratio"] = teacher_conf.mean().detach() * 0.0
 
     if return_reason > 0.0:
         zero_loss = student_logits.sum() * 0.0
         profile["loss"] = zero_loss.detach()
+        profile["teacher_active_loss"] = zero_loss.detach()
         return zero_loss, lambda_effective, profile
 
     refined_target, refine_silent, refine_profile = _build_refined_teacher_target(
@@ -995,8 +2862,80 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     if refine_silent:
         zero_loss = student_logits.sum() * 0.0
         profile["return_reason"] = torch.tensor(4.0, device=device)
+        profile["teacher_accept_ratio"] = zero_loss.detach()
+        profile["teacher_reject_ratio"] = (
+            teacher_candidate_region.float().sum() / risk_region_sum
+        ).detach()
         profile["loss"] = zero_loss.detach()
+        profile["teacher_active_loss"] = zero_loss.detach()
         return zero_loss, lambda_effective, profile
+
+    if rdsi_alpha_map is not None:
+        alpha_map = rdsi_alpha_map.clamp(0.0, 1.0) * teacher_release_map.float()
+        intervention_alpha = alpha_map.unsqueeze(1)
+        if refined_target.shape[1] > 1:
+            raw_refined_target = refined_target
+            student_fg_mass = student_prob[:, 1:].sum(dim=1)
+            target_fg_mass = raw_refined_target[:, 1:].sum(dim=1)
+            raw_fg_delta = target_fg_mass - student_fg_mass
+            fg_repair_map = active_fg_repair_mask & teacher_release_map
+            bg_suppress_map = active_bg_suppress_mask & teacher_release_map
+            boundary_map = active_boundary_mask & teacher_release_map
+            allowed_fg_delta = (
+                raw_fg_delta.clamp_min(0.0) * fg_repair_map.float()
+                + raw_fg_delta.clamp_max(0.0) * bg_suppress_map.float()
+                + raw_fg_delta * boundary_map.float()
+            )
+            new_fg_mass = (student_fg_mass + alpha_map * allowed_fg_delta).clamp(1e-6, 1.0 - 1e-6)
+            target_fg_dist = raw_refined_target[:, 1:] / target_fg_mass.unsqueeze(1).clamp_min(1e-6)
+            student_fg_dist = student_prob[:, 1:] / student_fg_mass.unsqueeze(1).clamp_min(1e-6)
+            active_delta = allowed_fg_delta.abs() > 1e-8
+            fg_dist = torch.where(
+                (allowed_fg_delta >= 0.0).unsqueeze(1),
+                target_fg_dist,
+                student_fg_dist,
+            )
+            fg_dist = torch.where(active_delta.unsqueeze(1), fg_dist, student_fg_dist)
+            refined_target = student_prob.clone()
+            refined_target[:, 1:] = new_fg_mass.unsqueeze(1) * fg_dist
+            refined_target[:, 0] = 1.0 - new_fg_mass
+            refined_target = torch.where(
+                teacher_release_map.unsqueeze(1),
+                refined_target,
+                student_prob,
+            )
+            profile["rdsi_fg_repair_q_delta"] = _masked_mean(
+                new_fg_mass - student_fg_mass,
+                fg_repair_map,
+            ).detach()
+            profile["rdsi_bg_suppress_q_delta"] = _masked_mean(
+                new_fg_mass - student_fg_mass,
+                bg_suppress_map,
+            ).detach()
+            profile["rdsi_boundary_q_delta"] = _masked_mean(
+                new_fg_mass - student_fg_mass,
+                boundary_map,
+            ).detach()
+        else:
+            refined_target = student_prob + intervention_alpha * (refined_target - student_prob)
+            profile["rdsi_fg_repair_q_delta"] = intervention_alpha.sum().detach() * 0.0
+            profile["rdsi_bg_suppress_q_delta"] = intervention_alpha.sum().detach() * 0.0
+            profile["rdsi_boundary_q_delta"] = intervention_alpha.sum().detach() * 0.0
+        refined_target = refined_target.clamp_min(1e-6)
+        refined_target = refined_target / refined_target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        target_conf = refined_target.max(dim=1)[0]
+        target_entropy = _normalized_entropy(refined_target)
+        profile["rdsi_target_conf_mean"] = _masked_mean(target_conf, teacher_release_map).detach()
+        profile["rdsi_target_entropy_mean"] = _masked_mean(target_entropy, teacher_release_map).detach()
+        if refined_target.shape[1] > 1:
+            refined_fg_prob = refined_target[:, 1:].sum(dim=1)
+            student_fg_mass = student_prob[:, 1:].sum(dim=1)
+            profile["rdsi_q_fg_delta"] = _masked_mean(
+                refined_fg_prob - student_fg_mass,
+                teacher_release_map,
+            ).detach()
+        else:
+            profile["rdsi_q_fg_delta"] = intervention_alpha.sum().detach() * 0.0
 
     student_log_prob = F.log_softmax(student_logits / temperature, dim=1)
     per_pixel_kl = F.kl_div(student_log_prob, refined_target, reduction="none").sum(dim=1) * temperature * temperature
@@ -1005,28 +2944,70 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
         fg_teacher_weight = (class_weight_map * teacher_conf).clamp(0.0, 1.0)
     else:
         fg_teacher_weight = (0.5 * class_weight_map + 0.5 * teacher_fg_prob).clamp(0.0, 1.0)
-    fg_weight = (
-        (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
-        * active_fg_mask.float()
-        * fg_teacher_weight
-        * teacher_reliability
-        * spatial_weight
-    )
-    bg_suppression = ((bg_max_fg_prob - teacher_fg_prob) / max(bg_max_fg_prob, 1e-6)).clamp(0.0, 1.0)
-    bg_weight = (1.0 - wann_maps.reliability).clamp(0.0, 1.0) * active_bg_mask.float() * teacher_reliability * bg_suppression
+    if rdsi_active_mask is not None:
+        intervention_region_weight = active.float()
+    else:
+        intervention_region_weight = (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
+    if rdsi_active_mask is not None:
+        rdsi_alpha_weight = rdsi_alpha_map.clamp(0.0, 1.0) if rdsi_alpha_map is not None else torch.ones_like(teacher_conf)
+        rdsi_benefit_weight = rdsi_benefit_map.clamp(0.0, 1.0) if rdsi_benefit_map is not None else release_score
+        rdsi_reliable_weight = teacher_local_reliability.clamp(0.0, 1.0)
+        bg_suppression = ((bg_max_fg_prob - teacher_fg_prob) / max(bg_max_fg_prob, 1e-6)).clamp(0.0, 1.0)
+        rdsi_loss_weight = (
+            intervention_region_weight
+            * torch.maximum(release_score, rdsi_benefit_weight)
+            * torch.maximum(rdsi_alpha_weight, rdsi_benefit_weight)
+            * rdsi_reliable_weight
+        ).clamp(0.0, 1.0)
+        fg_weight = rdsi_loss_weight * active_fg_repair_mask.float()
+        bg_weight = rdsi_loss_weight * active_bg_suppress_mask.float()
+        boundary_weight_map = rdsi_loss_weight * active_boundary_mask.float()
+    else:
+        fg_weight = (
+            intervention_region_weight
+            * active_fg_mask.float()
+            * fg_teacher_weight
+            * release_score
+        )
+        bg_suppression = ((bg_max_fg_prob - teacher_fg_prob) / max(bg_max_fg_prob, 1e-6)).clamp(0.0, 1.0)
+        bg_weight = (
+            intervention_region_weight
+            * active_bg_mask.float()
+            * release_score
+            * bg_suppression
+        )
+        boundary_weight_map = torch.zeros_like(bg_weight)
     fg_denom = fg_weight.sum().clamp_min(1.0)
     bg_denom = bg_weight.sum().clamp_min(1.0)
+    boundary_denom = boundary_weight_map.sum().clamp_min(1.0)
     fg_loss = (per_pixel_kl * fg_weight).sum() / fg_denom
     if float(active_bg_pixels.detach().cpu().item()) > 0.0:
         bg_loss = (per_pixel_kl * bg_weight).sum() / bg_denom
-        bg_loss = bg_loss * background_balance_factor
     else:
         bg_loss = student_logits.sum() * 0.0
-    loss = (fg_loss + background_weight * bg_loss) / (1.0 + background_weight if float(active_bg_pixels.detach().cpu().item()) > 0.0 else 1.0)
+    if float(active_boundary_mask.float().sum().detach().cpu().item()) > 0.0:
+        boundary_loss = (per_pixel_kl * boundary_weight_map).sum() / boundary_denom
+    else:
+        boundary_loss = student_logits.sum() * 0.0
+    if rdsi_active_mask is not None:
+        distill_weight = fg_weight + background_weight * bg_weight + boundary_weight_map
+        loss = (per_pixel_kl * distill_weight).sum() / distill_weight.sum().clamp_min(1.0)
+    else:
+        bg_loss_balanced = bg_loss * background_balance_factor if float(active_bg_pixels.detach().cpu().item()) > 0.0 else bg_loss
+        loss = (
+            (fg_loss + background_weight * bg_loss_balanced)
+            / (1.0 + background_weight if float(active_bg_pixels.detach().cpu().item()) > 0.0 else 1.0)
+        )
 
     profile["loss"] = loss.detach()
+    profile["teacher_active_loss"] = (loss.detach() * torch.tensor(lambda_effective, device=device))
+    profile["rdsi_loss_raw"] = loss.detach()
+    profile["rdsi_loss_weighted"] = profile["teacher_active_loss"].detach()
+    profile["rdsi_fg_repair_loss"] = fg_loss.detach()
+    profile["rdsi_bg_suppress_loss"] = bg_loss.detach()
+    profile["rdsi_boundary_loss"] = boundary_loss.detach()
     profile["kl_mean"] = (per_pixel_kl * active_f).sum().detach() / active_sum.clamp_min(1.0)
-    distill_weight = fg_weight + background_weight * bg_weight
+    distill_weight = fg_weight + background_weight * bg_weight + boundary_weight_map
     profile["weight_mean"] = distill_weight.mean().detach()
     if float(active_bg_pixels.detach().cpu().item()) > 0.0:
         profile["background_suppression_mean"] = (
