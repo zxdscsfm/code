@@ -246,12 +246,17 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rdsi_sel_gap=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_teacher_gap', 0.0)),
             'rdsi_sel_risk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_student_risk', 0.0)),
             'rdsi_sel_spatial=%.6f' % _scalar_float(rgftd_profile.get('rdsi_selected_spatial_support', 0.0)),
+            'rdsi_transfer=%.6f' % _scalar_float(rgftd_profile.get('rdsi_transfer_compatibility_mean', 0.0)),
+            'rdsi_transfer_top=%.6f' % _scalar_float(rgftd_profile.get('rdsi_transfer_compatibility_top', 0.0)),
             'rdsi_gap=%.6f' % _scalar_float(rgftd_profile.get('rdsi_knowledge_gap_score', 0.0)),
             'rdsi_risk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_risk_region_ratio', 0.0)),
             'rdsi_hcore=%.6f' % _scalar_float(rgftd_profile.get('rdsi_hard_core_ratio', 0.0)),
             'rdsi_softcore=%.6f' % _scalar_float(rgftd_profile.get('rdsi_soft_core_ratio', 0.0)),
             'rdsi_fgdef=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_deficient_ratio', 0.0)),
             'rdsi_fgex=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_excessive_ratio', 0.0)),
+            'rdsi_fg_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_missing_need', 0.0)),
+            'rdsi_bg_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_excess_need', 0.0)),
+            'rdsi_bd_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_boundary_need', 0.0)),
             'rdsi_cand=%.6f' % _scalar_float(rgftd_profile.get('rdsi_candidate_ratio', 0.0)),
             'rdsi_accept=%.6f' % _scalar_float(rgftd_profile.get('rdsi_accept_ratio', 0.0)),
             'rdsi_reject=%.6f' % _scalar_float(rgftd_profile.get('rdsi_reject_ratio', 0.0)),
@@ -1294,19 +1299,15 @@ class MyClient(BaseClient):
                             and _scalar_float(wann_maps.profile.get('max_prob_low_r', 0.0)) >
                             float(getattr(self.args, 'rgftd_light_audit_low_maxp_thresh', 0.95))
                         )
-                        lambda_light = 0.0
-                        if (
+                        light_audit_active = (
                             float(lambda_rgftd_raw) <= 0.0
                             and int(getattr(self.args, 'rgftd_light_audit_enabled', 0)) == 1
                             and int(self.current_iter) >= int(getattr(self.args, 'rgftd_light_audit_start_iters', 0))
                             and light_audit_trigger
-                        ):
-                            lambda_light = float(getattr(self.args, 'rgftd_light_audit_lambda', 0.01))
-                            rgftd_teacher_args = copy.copy(rgftd_teacher_args)
-                            setattr(rgftd_teacher_args, 'rgftd_force_lambda', lambda_light)
-                            setattr(rgftd_teacher_args, 'rgftd_light_audit_active', 1)
-                            setattr(rgftd_teacher_args, 'rgftd_use_soft_band', 1)
-                        if float(lambda_rgftd_raw) > 0.0 or float(lambda_light) > 0.0:
+                        )
+                        if light_audit_active:
+                            rgftd_v3_status['v3_light_audit_active'] = 1.0
+                        if float(lambda_rgftd_raw) > 0.0:
                             rdsi_profile = None
                             if len(rgftd_teacher_state_items) > 0:
                                 if rgftd_pool_probe_model is None:
@@ -1332,6 +1333,8 @@ class MyClient(BaseClient):
                                         wann_maps,
                                         rgftd_teacher_args,
                                         self.current_iter,
+                                        student_feature=de1,
+                                        teacher_feature_list=teacher_feature_list,
                                     )
                                 loss_rgftd, lambda_rgftd, rgftd_profile = rdsi_feature_prototype_loss(
                                     de1,
@@ -2578,6 +2581,8 @@ def main():
                 'rgftd_rdsi_selected_teacher_gap',
                 'rgftd_rdsi_selected_student_risk',
                 'rgftd_rdsi_selected_spatial_support',
+                'rgftd_rdsi_transfer_compatibility_mean',
+                'rgftd_rdsi_transfer_compatibility_top',
                 'rgftd_rdsi_knowledge_gap_score',
                 'rgftd_rdsi_risk_region_ratio',
                 'rgftd_rdsi_hard_core_ratio',
