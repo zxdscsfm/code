@@ -43,7 +43,7 @@ def pseudo_label_generator_acdc(data, seed, beta=50.00, mode='bf', img_class='od
                                     out_range=(-1, 1))
             segmentation = random_walker(data, markers, beta, mode = 'bf', channel_axis=0)
             pseudo_label = segmentation - 1
-    if img_class=='faz' or img_class == 'polyp':
+    if img_class=='faz' or img_class == 'polyp' or img_class == 'isic':
         if 1 not in np.unique(seed):
             pseudo_label = np.zeros_like(seed)
         else:
@@ -68,9 +68,9 @@ class BaseDataSets(Dataset):
         self.img_class=img_class
         self.sup_type = sup_type
         self.transform = transform
-        if self.img_class == 'odoc' or self.img_class == 'faz':
+        if self.img_class == 'odoc' or self.img_class == 'odoc_binary' or self.img_class == 'faz':
             train_ids, val_ids = self._get_client_ids(client)
-        elif self.img_class =='polyp':
+        elif self.img_class =='polyp' or self.img_class == 'isic':
             train_ids, val_ids = self._get_client_ids_polyp(client)
         elif self.img_class =='prostate':
             train_ids, val_ids = self._get_client_ids_prostate(client)
@@ -231,7 +231,7 @@ class BaseDataSets(Dataset):
 
 
 def random_rot_flip(image, label, img_class):
-    if img_class == 'odoc' or img_class == 'polyp':
+    if img_class == 'odoc' or img_class == 'odoc_binary' or img_class == 'polyp' or img_class == 'isic':
         k = np.random.randint(0, 4)
         image = np.rot90(image, k, axes=(1, 2))
         label = np.rot90(label, k, axes=(0, 1))
@@ -263,7 +263,13 @@ def random_rotate(image, label,img_class='odoc'):
         label = ndimage.rotate(label, angle, axes=(0,1), order=0,reshape=False, mode="constant", cval=3)
         return image, label
 
-    if img_class=='polyp':
+    if img_class=='odoc_binary':
+        angle = np.random.randint(-45, 45)
+        image = ndimage.rotate(image, angle, axes=(1,2), order=0, reshape=False)
+        label = ndimage.rotate(label, angle, axes=(0,1), order=0,reshape=False, mode="constant", cval=2)
+        return image, label
+
+    if img_class=='polyp' or img_class == 'isic':
         angle = np.random.randint(-45, 45)
         image = ndimage.rotate(image, angle, axes=(1,2), order=0, reshape=False)
         label = ndimage.rotate(label, angle, axes=(0,1), order=0,reshape=False, mode="constant", cval=2)

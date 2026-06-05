@@ -1,7 +1,7 @@
 #!/bin/bash
-# FedRAP-RDSI-SS on POLYP with scribble-dominant heterogeneous weak labels.
+# WANN + RDSI-TED-ACB on POLYP with scribble-dominant heterogeneous weak labels.
 
-#SBATCH --job-name=RDSISS_POLY
+#SBATCH --job-name=ACB_POLY
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=5
@@ -22,8 +22,9 @@ CODE_DIR="${REPO_ROOT}/code_v4"
 
 cd "${CODE_DIR}"
 mkdir -p logs
+source "${CODE_DIR}/run_monitor_common.sh"
 
-RUN_PREFIX="${RUN_PREFIX:-rdsiss_polyp_r500_l10}"
+RUN_PREFIX="${RUN_PREFIX:-acb_polyp_r500_l10}"
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8634}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
@@ -201,7 +202,7 @@ BASE_ARGS="\
 --rgftd_stable_wann_mass_drop_thresh 0.05 \
 ${EXTRA_ARGS}"
 
-echo "Starting FedRAP-RDSI-SS POLYP run"
+echo "Starting WANN + RDSI-TED-ACB POLYP run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
@@ -210,6 +211,7 @@ echo "SUP_TYPES=${CLIENT1_SUP_TYPE},${CLIENT2_SUP_TYPE},${CLIENT3_SUP_TYPE},${CL
 
 python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role server --client client_all --sup_type mask --gpu 0 > "${LOG_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
+init_run_monitor "${SERVER_PID}" "client_all gpu=0" "${LOG_DIR}/server.log"
 
 echo "Waiting for server to listen on ${SERVER_ADDRESS}"
 SERVER_READY=0
@@ -222,6 +224,8 @@ for _ in $(seq 1 24); do
     if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
         echo "Server exited before opening port. Check ${LOG_DIR}/server.log"
         wait "${SERVER_PID}" || true
+        print_log_tail "${LOG_DIR}/server.log"
+        cleanup_monitored_processes
         exit 1
     fi
     sleep 5
@@ -229,13 +233,15 @@ done
 
 if [ "${SERVER_READY}" -ne 1 ]; then
     echo "Server did not open port ${SERVER_PORT} within 120 seconds"
+    print_log_tail "${LOG_DIR}/server.log"
+    cleanup_monitored_processes
     exit 1
 fi
 
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 0 --client client1 --sup_type "${CLIENT1_SUP_TYPE}" --gpu 1 > "${LOG_DIR}/client0.log" 2>&1 &
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 1 --client client2 --sup_type "${CLIENT2_SUP_TYPE}" --gpu 2 > "${LOG_DIR}/client1.log" 2>&1 &
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 2 --client client3 --sup_type "${CLIENT3_SUP_TYPE}" --gpu 3 > "${LOG_DIR}/client2.log" 2>&1 &
-python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role client --cid 3 --client client4 --sup_type "${CLIENT4_SUP_TYPE}" --gpu 4 > "${LOG_DIR}/client3.log" 2>&1 &
+launch_flower_client 0 client1 "${CLIENT1_SUP_TYPE}" 1 "${LOG_DIR}/client0.log"
+launch_flower_client 1 client2 "${CLIENT2_SUP_TYPE}" 2 "${LOG_DIR}/client1.log"
+launch_flower_client 2 client3 "${CLIENT3_SUP_TYPE}" 3 "${LOG_DIR}/client2.log"
+launch_flower_client 3 client4 "${CLIENT4_SUP_TYPE}" 4 "${LOG_DIR}/client3.log"
 
-wait
-echo "FedRAP-RDSI-SS POLYP run finished. EXP_NAME=${EXP_NAME}"
+monitor_flower_processes
+echo "WANN + RDSI-TED-ACB POLYP run finished. EXP_NAME=${EXP_NAME}"

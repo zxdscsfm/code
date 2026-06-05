@@ -133,12 +133,14 @@ class BaseClient(fl.client.Client):
         if val_metrics['val_mean_dice'] > self.best_performance:
             self.best_performance = val_metrics['val_mean_dice']
             state_dict = self.model.model.state_dict()
-            save_mode_path = os.path.join(self.args.snapshot_path, 'client_{}_async_iter_{}_dice_{}.pth'.format(
-                                        self.cid, self.current_iter, round(self.best_performance, 4)))
             save_best = os.path.join(self.args.snapshot_path, 'client_{}_async_{}_best_model.pth'.format(self.cid, self.args.model))
-            torch.save(state_dict, save_mode_path)
             torch.save(state_dict, save_best)
-            log(INFO, 'save model to {}'.format(save_mode_path))
+            log(INFO, 'save best model to {}'.format(save_best))
+            if int(getattr(self.args, 'keep_iter_checkpoints', 0)) == 1:
+                save_mode_path = os.path.join(self.args.snapshot_path, 'client_{}_async_iter_{}_dice_{}.pth'.format(
+                                            self.cid, self.current_iter, round(self.best_performance, 4)))
+                torch.save(state_dict, save_mode_path)
+                log(INFO, 'save model to {}'.format(save_mode_path))
 
         if (self.args.strategy in ['FedLC', 'FedALALC', 'FedAPLC', 'FedUni', 'FedUniV2', 'FedUniV2.1']) \
             and (int(getattr(self.args, 'tsne_iters', 0)) > 0) \
@@ -284,7 +286,7 @@ def evaluate_uncertainty(args, model, dataloader, amp=False):
         if args.img_class == 'faz' or args.img_class == 'prostate':
             volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-        elif args.img_class == 'odoc' or args.img_class == 'polyp':
+        elif args.img_class == 'odoc' or args.img_class == 'odoc_binary' or args.img_class == 'polyp' or args.img_class == 'isic':
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
@@ -460,10 +462,14 @@ class MyServer(Server):
                 for metric_name in self.train_scalar_metrics:
                     metric_key = 'client_{}_{}'.format(client_id, metric_name)
                     if metric_key not in metrics_prime:
-                        if metric_name.startswith('rgftd_v3_') or metric_name.startswith('rgftd_refine_'):
+                        if (
+                            metric_name.startswith('rgftd_v3_')
+                            or metric_name.startswith('rgftd_refine_')
+                            or metric_name.startswith('wann_')
+                        ):
                             warn_key = (client_id, metric_name)
                             if warn_key not in self._missing_train_metric_warnings:
-                                log(WARNING, 'Missing optional RGFTD metric %s; writing 0.0 to keep training alive', metric_key)
+                                log(WARNING, 'Missing optional train metric %s; writing 0.0 to keep training alive', metric_key)
                                 self._missing_train_metric_warnings.add(warn_key)
                             metric_value = 0.0
                         else:
@@ -581,12 +587,14 @@ class MyServer(Server):
                     log(INFO, 'best_performance: {}'.format(best_performance))
                     if self.args.strategy not in PERSONALIZED_FL:
                         state_dict = parameters_to_state_dict(self.parameters)
-                        save_mode_path = os.path.join(snapshot_path, 'iter_{}_dice_{}.pth'.format(
-                                                    iter_num, round(best_performance, 4)))
                         save_best = os.path.join(snapshot_path, '{}_best_model.pth'.format(self.args.model))
-                        torch.save(state_dict, save_mode_path)
                         torch.save(state_dict, save_best)
-                        log(INFO, 'save model to {}'.format(save_mode_path))
+                        log(INFO, 'save best model to {}'.format(save_best))
+                        if int(getattr(self.args, 'keep_iter_checkpoints', 0)) == 1:
+                            save_mode_path = os.path.join(snapshot_path, 'iter_{}_dice_{}.pth'.format(
+                                                        iter_num, round(best_performance, 4)))
+                            torch.save(state_dict, save_mode_path)
+                            log(INFO, 'save model to {}'.format(save_mode_path))
 
                     for client_id in client_id_list:
                         first_metric_name = 'client_{}_{}'.format(client_id, self.train_scalar_metrics[0])
@@ -602,9 +610,11 @@ class MyServer(Server):
                                 ))
                                 client_save_best = os.path.join(snapshot_path, 'client_{}_{}_best_model.pth'.format(
                                                                 client_id, self.args.model))
-                                torch.save(client_state_dict, client_save_mode_path)
                                 torch.save(client_state_dict, client_save_best)
-                                log(INFO, 'save model to {}'.format(client_save_mode_path))
+                                log(INFO, 'save best model to {}'.format(client_save_best))
+                                if int(getattr(self.args, 'keep_iter_checkpoints', 0)) == 1:
+                                    torch.save(client_state_dict, client_save_mode_path)
+                                    log(INFO, 'save model to {}'.format(client_save_mode_path))
 
             if iter_num > 0 and iter_num % 3000 == 0:
                 if self.args.strategy not in PERSONALIZED_FL:
@@ -1129,7 +1139,7 @@ def get_bn_stats(args, model, trainloader):
         if args.img_class == 'faz' or args.img_class == 'prostate':
             volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-        elif args.img_class == 'odoc' or args.img_class == 'polyp':
+        elif args.img_class == 'odoc' or args.img_class == 'odoc_binary' or args.img_class == 'polyp' or args.img_class == 'isic':
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
@@ -1139,7 +1149,7 @@ def get_bn_stats(args, model, trainloader):
             if args.img_class == 'faz' or args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-            elif args.args.img_class == 'odoc' or args.img_class == 'polyp':
+            elif args.img_class == 'odoc' or args.img_class == 'odoc_binary' or args.img_class == 'polyp' or args.img_class == 'isic':
                 volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
@@ -2000,7 +2010,7 @@ class MyModel(nn.Module):
                     if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
                         volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                         volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-                    elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+                    elif self.args.img_class == 'odoc' or self.args.img_class == 'odoc_binary' or self.args.img_class == 'polyp' or self.args.img_class == 'isic':
                         volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
                         volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 

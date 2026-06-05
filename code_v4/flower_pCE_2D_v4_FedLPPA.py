@@ -293,6 +293,17 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rdsi_safe_signal=%.6f' % _scalar_float(rgftd_profile.get('rdsi_safe_signal', 0.0)),
             'rdsi_unsafe_signal=%.6f' % _scalar_float(rgftd_profile.get('rdsi_unsafe_signal', 0.0)),
             'rdsi_budget_factor=%.6f' % _scalar_float(rgftd_profile.get('rdsi_safe_budget_factor', 0.0)),
+            'rdsi_budget_target=%.6f' % _scalar_float(rgftd_profile.get('rdsi_budget_target_ratio', 0.0)),
+            'rdsi_recv_fg_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_fg_need', 0.0)),
+            'rdsi_recv_bg_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_bg_need', 0.0)),
+            'rdsi_recv_bd_need=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_boundary_need', 0.0)),
+            'rdsi_recv_fg_prior=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_fg_prior', 0.0)),
+            'rdsi_recv_bg_prior=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_bg_prior', 0.0)),
+            'rdsi_recv_bd_prior=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_boundary_prior', 0.0)),
+            'rdsi_recv_fg_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_fg_budget_share', 0.0)),
+            'rdsi_recv_bg_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_bg_budget_share', 0.0)),
+            'rdsi_recv_bd_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_boundary_budget_share', 0.0)),
+            'rdsi_quality=%.6f' % _scalar_float(rgftd_profile.get('rdsi_quality_mean', 0.0)),
             'rdsi_eff_topk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_effective_topk_ratio', 0.0)),
             'rdsi_eff_minpx=%.1f' % _scalar_float(rgftd_profile.get('rdsi_effective_min_pixels', 0.0)),
             'rdsi_core_reopen=%.6f' % _scalar_float(rgftd_profile.get('rdsi_core_reopen_ratio', 0.0)),
@@ -499,7 +510,7 @@ class MyClient(BaseClient):
         if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
             volume_batch = sampled_batch['image'].unsqueeze(1).cuda()
             label_batch = sampled_batch['label'].cuda()
-        elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+        elif self.args.img_class == 'odoc' or self.args.img_class == 'odoc_binary' or self.args.img_class == 'polyp' or self.args.img_class == 'isic':
             volume_batch = sampled_batch['image'].cuda()
             label_batch = sampled_batch['label'].cuda()
         else:
@@ -1183,7 +1194,7 @@ class MyClient(BaseClient):
             if self.args.img_class == 'faz' or self.args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-            elif self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+            elif self.args.img_class == 'odoc' or self.args.img_class == 'odoc_binary' or self.args.img_class == 'polyp' or self.args.img_class == 'isic':
                 volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
@@ -1562,13 +1573,40 @@ class MyClient(BaseClient):
 
             # update model parameters
             optimizer.zero_grad()
-            if self.amp:
+            max_grad_norm = float(getattr(self.args, 'max_grad_norm', 0.0))
+            skip_update = not torch.isfinite(loss.detach()).all().item()
+            if skip_update:
+                log(logging.WARNING, 'client %d : iteration %d : non-finite loss detected before backward' % (
+                    self.cid, self.current_iter + 1
+                ))
+                loss = torch.nan_to_num(loss.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                loss_ce = torch.nan_to_num(loss_ce.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+            elif self.amp:
                 self.scaler.scale(loss).backward()
-                self.scaler.step(optimizer)
+                if max_grad_norm > 0.0:
+                    self.scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                    if not torch.isfinite(grad_norm.detach()).all().item():
+                        log(logging.WARNING, 'client %d : iteration %d : non-finite grad norm detected before optimizer step' % (
+                            self.cid, self.current_iter + 1
+                        ))
+                        optimizer.zero_grad()
+                        skip_update = True
+                if not skip_update:
+                    self.scaler.step(optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                optimizer.step()
+                if max_grad_norm > 0.0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                    if not torch.isfinite(grad_norm.detach()).all().item():
+                        log(logging.WARNING, 'client %d : iteration %d : non-finite grad norm detected before optimizer step' % (
+                            self.cid, self.current_iter + 1
+                        ))
+                        optimizer.zero_grad()
+                        skip_update = True
+                if not skip_update:
+                    optimizer.step()
                 
 
             self.current_iter = self.current_iter + 1
@@ -1593,7 +1631,7 @@ class MyClient(BaseClient):
         outputs = torch.argmax(torch.softmax(outputs, dim=1), dim=1, keepdim=True)
         outputs = outputs[1, ...] * 50
         labs = label_batch[1, ...].unsqueeze(0) * 50
-        if self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+        if self.args.img_class == 'odoc' or self.args.img_class == 'odoc_binary' or self.args.img_class == 'polyp' or self.args.img_class == 'isic':
             outputs, labs = outputs.repeat(3, 1, 1), labs.repeat(3, 1, 1)
 
         metrics_ = {
@@ -1642,7 +1680,7 @@ class MyClient(BaseClient):
             outputs_auxiliary = torch.argmax(torch.softmax(outputs_auxiliary, dim=1), dim=1, keepdim=True)
             outputs_auxiliary = outputs_auxiliary[1, ...] * 50
             pseudo_labs = pseudo_label[1, ...].unsqueeze(0) * 50
-            if self.args.img_class == 'odoc' or self.args.img_class == 'polyp':
+            if self.args.img_class == 'odoc' or self.args.img_class == 'odoc_binary' or self.args.img_class == 'polyp' or self.args.img_class == 'isic':
                 outputs_auxiliary, pseudo_labs = outputs_auxiliary.repeat(3, 1, 1), pseudo_labs.repeat(3, 1, 1)
             metrics_['client_{}_Prediction2'.format(self.cid)] = fl.common.ndarray_to_bytes(outputs_auxiliary.cpu().numpy())
             metrics_['client_{}_Pseudo'.format(self.cid)] = fl.common.ndarray_to_bytes(pseudo_labs.cpu().numpy())
@@ -1716,7 +1754,7 @@ def pretrain_model(args, writer, worker_init_fn):
             if args.img_class == 'faz' or args.img_class == 'prostate':
                 volume_batch, label_batch = sampled_batch['image'].unsqueeze(1), sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
-            elif args.img_class == 'odoc' or args.img_class == 'polyp':
+            elif args.img_class == 'odoc' or args.img_class == 'odoc_binary' or args.img_class == 'polyp' or args.img_class == 'isic':
                 volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
                 volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
     
@@ -1745,7 +1783,7 @@ def pretrain_model(args, writer, worker_init_fn):
                 outputs = torch.argmax(torch.softmax(outputs, dim=1), dim=1, keepdim=True)
                 outputs = outputs[1, ...] * 50
                 labs = label_batch[1, ...].unsqueeze(0) * 50
-                if args.img_class == 'odoc' or args.img_class == 'polyp':
+                if args.img_class == 'odoc' or args.img_class == 'odoc_binary' or args.img_class == 'polyp' or args.img_class == 'isic':
                     outputs, labs = outputs.repeat(3, 1, 1), labs.repeat(3, 1, 1)
 
                 image_list = np.array([image.cpu().numpy(), outputs.cpu().numpy(), labs.cpu().numpy()])
@@ -1857,6 +1895,8 @@ def main():
                         help='whether use amp training')
     parser.add_argument('--base_lr', type=float,  default=0.01,
                         help='segmentation network learning rate')
+    parser.add_argument('--max_grad_norm', type=float, default=0.0,
+                        help='clip gradient norm before optimizer step; <=0 disables clipping')
     parser.add_argument('--patch_size', type=list,  default=[256, 256],
                         help='patch size of network input')
     parser.add_argument('--img_class', type=str,
@@ -2060,6 +2100,8 @@ def main():
                         help='Enable RGFTD-v3 target-aware teacher routing')
     parser.add_argument('--rdsi_enabled', type=int, default=1,
                         help='Enable RDSI region-wise domain-specialist teacher selection inside RGFTD-v3')
+    parser.add_argument('--rdsi_class_aware', type=int, default=-1,
+                        help='Use class-aware RDSI scoring; -1 enables it automatically when num_classes > 2')
     parser.add_argument('--rdsi_teacher_sup_types', type=str, default='',
                         help='Comma-separated per-client weak-label types used only for RDSI teacher-type diagnostics')
     parser.add_argument('--rdsi_residual_alpha', type=float, default=0.35,
@@ -2078,6 +2120,12 @@ def main():
                         help='Maximum pixels selected by benefit-validated RDSI per image; <=0 means no cap')
     parser.add_argument('--rdsi_benefit_score_floor', type=float, default=1e-6,
                         help='Minimum benefit-validated RDSI score required before top-k selection')
+    parser.add_argument('--rdsi_budget_fraction', type=float, default=0.20,
+                        help='Fraction of the current RDSI risk region assigned to budgeted residual transfer')
+    parser.add_argument('--rdsi_budget_min_ratio', type=float, default=0.003,
+                        help='Minimum image-level active ratio for budgeted RDSI residual transfer when candidates exist')
+    parser.add_argument('--rdsi_budget_max_ratio', type=float, default=0.015,
+                        help='Maximum image-level active ratio for budgeted RDSI residual transfer')
     parser.add_argument('--rdsi_entropy_increase_margin', type=float, default=0.05,
                         help='Allowed teacher foreground entropy increase before RDSI benefit is suppressed')
     parser.add_argument('--rdsi_entropy_increase_scale', type=float, default=0.35,
@@ -2241,7 +2289,7 @@ def main():
         assert args.dual_init in ['random', 'adjacent', 'nearest', 'aggregated']
 
     assert args.role in ['server', 'client']
-    assert args.img_class in ['odoc', 'faz', 'polyp', 'prostate']
+    assert args.img_class in ['odoc', 'odoc_binary', 'faz', 'polyp', 'prostate', 'isic']
     valid_sup_types = ['mask', 'scribble', 'scribble_noisy', 'block', 'box', 'keypoint']
     assert args.sup_type in valid_sup_types or str(args.sup_type).startswith('sparse_scribble_')
     assert args.wann_enabled in [0, 1]
@@ -2342,6 +2390,9 @@ def main():
     assert args.rgftd_refine_min_roi_pixels >= 0.0
     assert args.rgftd_v3_enabled in [0, 1]
     assert args.rdsi_enabled in [0, 1]
+    assert args.rdsi_class_aware in [-1, 0, 1]
+    if args.rdsi_class_aware == -1:
+        args.rdsi_class_aware = 1 if args.num_classes > 2 else 0
     assert 0.0 <= args.rdsi_residual_alpha <= 1.0
     assert 0.0 <= args.rdsi_hard_core_conf_thresh <= 1.0
     assert 0.0 <= args.rdsi_hard_core_entropy_thresh <= 1.0
@@ -2351,6 +2402,8 @@ def main():
     assert args.rdsi_benefit_topk_max_pixels >= 0
     assert args.rdsi_benefit_topk_max_pixels == 0 or args.rdsi_benefit_topk_max_pixels >= args.rdsi_benefit_topk_min_pixels
     assert args.rdsi_benefit_score_floor >= 0.0
+    assert 0.0 <= args.rdsi_budget_fraction <= 1.0
+    assert 0.0 <= args.rdsi_budget_min_ratio <= args.rdsi_budget_max_ratio <= 1.0
     assert args.rdsi_entropy_increase_margin >= 0.0
     assert args.rdsi_entropy_increase_scale > 0.0
     assert args.rdsi_fg_excess_margin >= 0.0
@@ -2408,7 +2461,6 @@ def main():
     if args.rgftd_v3_enabled == 1:
         assert args.rgftd_enabled == 1
         assert args.rgftd_v3_teacher_pool_topk == 1
-        assert args.rgftd_teacher_validation_enabled == 1
 
     # Configure logger
     if args.role == 'server':
@@ -2628,6 +2680,8 @@ def main():
                 'rgftd_rdsi_safe_signal',
                 'rgftd_rdsi_unsafe_signal',
                 'rgftd_rdsi_safe_budget_factor',
+                'rgftd_rdsi_budget_target_ratio',
+                'rgftd_rdsi_quality_mean',
                 'rgftd_rdsi_effective_topk_ratio',
                 'rgftd_rdsi_effective_min_pixels',
                 'rgftd_rdsi_core_reopen_ratio',

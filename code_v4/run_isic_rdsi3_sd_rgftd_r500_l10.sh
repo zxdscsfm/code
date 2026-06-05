@@ -1,12 +1,12 @@
 #!/bin/bash
-# WANN + RDSI-TED-ACB on PROSTATE with scribble-dominant heterogeneous weak labels.
+# WANN + RDSI-TED-ACB on ISIC with scribble-dominant heterogeneous weak labels.
 
-#SBATCH --job-name=ACB_PROS
+#SBATCH --job-name=ACB_ISIC
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
-#SBATCH --ntasks=7
+#SBATCH --ntasks=5
 #SBATCH --cpus-per-task=2
-#SBATCH --gres=gpu:7
+#SBATCH --gres=gpu:5
 #SBATCH --mem=128G
 #SBATCH --output=logs/main_%j.log
 
@@ -24,21 +24,19 @@ cd "${CODE_DIR}"
 mkdir -p logs
 source "${CODE_DIR}/run_monitor_common.sh"
 
-RUN_PREFIX="${RUN_PREFIX:-acb_prostate_r500_l10}"
-SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8632}"
+RUN_PREFIX="${RUN_PREFIX:-acb_isic_r500_l10}"
+SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8636}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
 EVAL_ITERS="${EVAL_ITERS:-10}"
 TSNE_ITERS="${TSNE_ITERS:-0}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-12}"
-ROOT_PATH="${ROOT_PATH:-/data/jianbingshen/yanghongji/FedLPPA_Original/data/PROSTATE_h5_rdsi3_sd}"
+ROOT_PATH="${ROOT_PATH:-/data/jianbingshen/yanghongji/FedLPPA_Original/data/ISIC_h5_rdsi3_sd}"
 CLIENT1_SUP_TYPE="${CLIENT1_SUP_TYPE:-scribble}"
 CLIENT2_SUP_TYPE="${CLIENT2_SUP_TYPE:-keypoint}"
 CLIENT3_SUP_TYPE="${CLIENT3_SUP_TYPE:-scribble}"
 CLIENT4_SUP_TYPE="${CLIENT4_SUP_TYPE:-block}"
-CLIENT5_SUP_TYPE="${CLIENT5_SUP_TYPE:-scribble}"
-CLIENT6_SUP_TYPE="${CLIENT6_SUP_TYPE:-scribble}"
 WANN_PRED_START_ITER="${WANN_PRED_START_ITER:-800}"
 WANN_SOFT_RAMPUP_ITERS="${WANN_SOFT_RAMPUP_ITERS:-800}"
 WANN_CONS_RAMPUP_ITERS="${WANN_CONS_RAMPUP_ITERS:-800}"
@@ -48,15 +46,15 @@ RGFTD_V3_AUDIT_START_ITERS="${RGFTD_V3_AUDIT_START_ITERS:-800}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 RUN_TAG="${RUN_PREFIX}_$(date +%Y%m%d_%H%M%S)_seed${SEED}"
-EXP_NAME="prostate/FedLPPA_${RUN_TAG}"
+EXP_NAME="isic/FedLPPA_${RUN_TAG}"
 LOG_DIR="logs/run_${RUN_TAG}"
 mkdir -p "${LOG_DIR}"
 
 BASE_ARGS="\
 --root_path ${ROOT_PATH} \
 --num_classes 2 \
---in_chns 1 \
---img_class prostate \
+--in_chns 3 \
+--img_class ${IMG_CLASS:-isic} \
 --exp ${EXP_NAME} \
 --model unet_univ5 \
 --max_iterations ${MAX_ITERATIONS} \
@@ -69,7 +67,7 @@ BASE_ARGS="\
 --seed ${SEED} \
 --server_address ${SERVER_ADDRESS} \
 --strategy FedUniV2.1 \
---min_num_clients 6 \
+--min_num_clients 4 \
 --img_size 384 \
 --alpha 0.1 \
 --beta 0.5 \
@@ -171,7 +169,7 @@ BASE_ARGS="\
 --rgftd_refine_min_fg_mass 1.0 \
 --rgftd_refine_min_roi_pixels 1.0 \
 --rgftd_v3_enabled 1 \
---rdsi_teacher_sup_types "${CLIENT1_SUP_TYPE},${CLIENT2_SUP_TYPE},${CLIENT3_SUP_TYPE},${CLIENT4_SUP_TYPE},${CLIENT5_SUP_TYPE},${CLIENT6_SUP_TYPE}" \
+--rdsi_teacher_sup_types "${CLIENT1_SUP_TYPE},${CLIENT2_SUP_TYPE},${CLIENT3_SUP_TYPE},${CLIENT4_SUP_TYPE}" \
 --rgftd_v3_stable_teacher_enabled 0 \
 --rgftd_v3_server_ema_fallback -1 \
 --rgftd_v3_teacher_pool_topk 1 \
@@ -204,14 +202,12 @@ BASE_ARGS="\
 --rgftd_stable_wann_mass_drop_thresh 0.05 \
 ${EXTRA_ARGS}"
 
-echo "Starting WANN + RDSI-TED-ACB PROSTATE run"
+echo "Starting WANN + RDSI-TED-ACB ISIC run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
 echo "ROOT_PATH=${ROOT_PATH}"
-echo "SUP_TYPES=${CLIENT1_SUP_TYPE},${CLIENT2_SUP_TYPE},${CLIENT3_SUP_TYPE},${CLIENT4_SUP_TYPE},${CLIENT5_SUP_TYPE},${CLIENT6_SUP_TYPE}"
-echo "RELEASE_START=${RGFTD_WARMUP_ITERS}"
-echo "RELEASE_FULL=$((RGFTD_WARMUP_ITERS + RGFTD_RAMPUP_ITERS))"
+echo "SUP_TYPES=${CLIENT1_SUP_TYPE},${CLIENT2_SUP_TYPE},${CLIENT3_SUP_TYPE},${CLIENT4_SUP_TYPE}"
 
 python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role server --client client_all --sup_type mask --gpu 0 > "${LOG_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -246,8 +242,6 @@ launch_flower_client 0 client1 "${CLIENT1_SUP_TYPE}" 1 "${LOG_DIR}/client0.log"
 launch_flower_client 1 client2 "${CLIENT2_SUP_TYPE}" 2 "${LOG_DIR}/client1.log"
 launch_flower_client 2 client3 "${CLIENT3_SUP_TYPE}" 3 "${LOG_DIR}/client2.log"
 launch_flower_client 3 client4 "${CLIENT4_SUP_TYPE}" 4 "${LOG_DIR}/client3.log"
-launch_flower_client 4 client5 "${CLIENT5_SUP_TYPE}" 5 "${LOG_DIR}/client4.log"
-launch_flower_client 5 client6 "${CLIENT6_SUP_TYPE}" 6 "${LOG_DIR}/client5.log"
 
 monitor_flower_processes
-echo "WANN + RDSI-TED-ACB PROSTATE run finished. EXP_NAME=${EXP_NAME}"
+echo "WANN + RDSI-TED-ACB ISIC run finished. EXP_NAME=${EXP_NAME}"
