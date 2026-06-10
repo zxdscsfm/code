@@ -1,12 +1,12 @@
 #!/bin/bash
 # WANN + RDSI-TED-ACB on PROSTATE with scribble-dominant heterogeneous weak labels.
 
-#SBATCH --job-name=ACB_PROS
+#SBATCH --job-name=BRTAUTOFG_PROS
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=7
 #SBATCH --cpus-per-task=2
-#SBATCH --gres=gpu:7
+#SBATCH --gres=gpu:8
 #SBATCH --mem=128G
 #SBATCH --output=logs/main_%j.log
 
@@ -24,7 +24,7 @@ cd "${CODE_DIR}"
 mkdir -p logs
 source "${CODE_DIR}/run_monitor_common.sh"
 
-RUN_PREFIX="${RUN_PREFIX:-acb_prostate_r500_l10}"
+RUN_PREFIX="${RUN_PREFIX:-brt_autofg_recvbenefit_prostate_r500_l10}"
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8632}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
@@ -78,7 +78,7 @@ BASE_ARGS="\
 --dual_init aggregated \
 --label_prompt 1 \
 --disable_tensorboard 1 \
---save_code_snapshot 0 \
+--save_code_snapshot 1 \
 --save_checkpoint_copies 0 \
 --ala_max_epochs 500 \
 --wann_enabled 1 \
@@ -204,7 +204,7 @@ BASE_ARGS="\
 --rgftd_stable_wann_mass_drop_thresh 0.05 \
 ${EXTRA_ARGS}"
 
-echo "Starting WANN + RDSI-TED-ACB PROSTATE run"
+echo "Starting WANN + RDSI-TED-BRT-AutoFG PROSTATE run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
@@ -250,4 +250,4 @@ launch_flower_client 4 client5 "${CLIENT5_SUP_TYPE}" 5 "${LOG_DIR}/client4.log"
 launch_flower_client 5 client6 "${CLIENT6_SUP_TYPE}" 6 "${LOG_DIR}/client5.log"
 
 monitor_flower_processes
-echo "WANN + RDSI-TED-ACB PROSTATE run finished. EXP_NAME=${EXP_NAME}"
+echo "WANN + RDSI-TED-BRT-AutoFG PROSTATE run finished. EXP_NAME=${EXP_NAME}"

@@ -526,14 +526,24 @@ def _canonical_rdsi_sup_type(sup_type):
 
 
 def _rdsi_receiver_action_priors(args, ref):
-    """Return neutral action priors while preserving the receiver type for diagnostics."""
+    """Return action priors induced by the receiver client's weak-label type."""
     sup_type = _canonical_rdsi_sup_type(getattr(args, "sup_type", "unknown"))
-    neutral_prior = torch.tensor(1.0, device=ref.device, dtype=ref.dtype)
+    if sup_type == "keypoint":
+        fg_prior, bg_prior, boundary_prior = 1.80, 0.75, 1.15
+    elif sup_type == "block":
+        fg_prior, bg_prior, boundary_prior = 0.75, 1.35, 1.45
+    elif sup_type == "scribble":
+        fg_prior, bg_prior, boundary_prior = 0.85, 1.10, 1.20
+    else:
+        fg_prior, bg_prior, boundary_prior = 1.00, 1.00, 1.00
+    fg_prior *= max(0.0, float(getattr(args, "rdsi_receiver_fg_prior_scale", 1.0)))
+    bg_prior *= max(0.0, float(getattr(args, "rdsi_receiver_bg_prior_scale", 1.0)))
+    boundary_prior *= max(0.0, float(getattr(args, "rdsi_receiver_boundary_prior_scale", 1.0)))
     return (
         sup_type,
-        neutral_prior,
-        neutral_prior,
-        neutral_prior,
+        torch.tensor(fg_prior, device=ref.device, dtype=ref.dtype),
+        torch.tensor(bg_prior, device=ref.device, dtype=ref.dtype),
+        torch.tensor(boundary_prior, device=ref.device, dtype=ref.dtype),
     )
 
 
@@ -713,6 +723,9 @@ def select_rdsi_teacher_logits(
     fg_excess_scale = max(float(getattr(args, "rdsi_fg_excess_scale", 0.20)), 1e-6)
     residual_alpha_max = max(0.0, min(float(getattr(args, "rdsi_residual_alpha", 0.35)), 1.0))
     score_floor = max(float(getattr(args, "rdsi_benefit_score_floor", 1e-6)), 0.0)
+    benefit_topk_ratio = max(0.0, min(float(getattr(args, "rdsi_benefit_topk_ratio", getattr(args, "rgftd_active_fg_topk_ratio", 0.002))), 1.0))
+    benefit_topk_min_pixels = int(getattr(args, "rdsi_benefit_topk_min_pixels", getattr(args, "rgftd_active_fg_topk_min_pixels", min_fg_pixels)))
+    benefit_topk_max_pixels = int(getattr(args, "rdsi_benefit_topk_max_pixels", getattr(args, "rgftd_active_fg_topk_max_pixels", 0)))
     boundary_radius_arg = int(getattr(args, "rdsi_boundary_radius", -1))
     boundary_radius = max(1, teacher_fg_radius) if boundary_radius_arg < 0 else boundary_radius_arg
     transfer_compatibility_stack = _rdsi_transfer_compatibility_stack(
@@ -740,11 +753,16 @@ def select_rdsi_teacher_logits(
     core_damage_weight = max(0.0, float(getattr(args, "rdsi_core_damage_weight", 0.45)))
     unsafe_gap_weight = max(0.0, float(getattr(args, "rdsi_unsafe_gap_weight", 0.30)))
     fg_excess_weight = max(0.0, float(getattr(args, "rdsi_foreground_excess_weight", 0.25)))
+    safe_budget_gain = max(0.0, float(getattr(args, "rdsi_safe_budget_gain", 1.50)))
+    unsafe_budget_decay = max(0.0, float(getattr(args, "rdsi_unsafe_budget_decay", 1.00)))
     max_budget_factor = max(1.0, float(getattr(args, "rdsi_max_budget_factor", 4.0)))
     budget_fraction = max(0.0, min(float(getattr(args, "rdsi_budget_fraction", 0.20)), 1.0))
     budget_min_ratio = max(0.0, min(float(getattr(args, "rdsi_budget_min_ratio", 0.003)), 1.0))
     budget_max_ratio = max(0.0, min(float(getattr(args, "rdsi_budget_max_ratio", 0.015)), 1.0))
     budget_max_ratio = max(budget_min_ratio, budget_max_ratio)
+    fg_min_budget_share = max(0.0, min(float(getattr(args, "rdsi_fg_min_budget_share", 0.25)), 1.0))
+    quality_tau = float(getattr(args, "rdsi_quality_tau", 0.20))
+    quality_temp = max(float(getattr(args, "rdsi_quality_temp", 0.15)), 1e-6)
 
     fg_support = support_mask & (target_label > 0)
     seed_fg_support = seed_support_mask & (target_label > 0)
@@ -868,7 +886,7 @@ def select_rdsi_teacher_logits(
     ).clamp(0.0, 1.0)
     if receiver_sup_type == "keypoint":
         keypoint_extent_need = (
-            core_deficit_need
+            (receiver_fg_prior - 1.0).clamp_min(0.0)
             * (1.0 - student_fg_prob).clamp(0.0, 1.0)
             * risk_like_mask.float()
             * region.float()
@@ -879,6 +897,15 @@ def select_rdsi_teacher_logits(
     if receiver_sup_type == "keypoint":
         receiver_fg_context = receiver_fg_context | (risk_like_mask & (structural_fg_need > 0.0))
     receiver_fg_context = receiver_fg_context | (typed_support_context & (structural_fg_need > 0.0))
+    receiver_fg_score_weight = (
+        receiver_fg_prior * (0.5 + 0.5 * fg_missing_need)
+    ).clamp(0.0, 2.0)
+    receiver_bg_score_weight = (
+        receiver_bg_prior * (0.5 + 0.5 * fg_excess_need)
+    ).clamp(0.0, 2.0)
+    receiver_boundary_score_weight = (
+        receiver_boundary_prior * (0.5 + 0.5 * boundary_need)
+    ).clamp(0.0, 2.0)
     receiver_fg_budget_need = (receiver_fg_prior * fg_missing_need).clamp(0.0, 2.0)
     receiver_bg_budget_need = (receiver_bg_prior * fg_excess_need).clamp(0.0, 2.0)
     receiver_boundary_budget_need = (receiver_boundary_prior * boundary_need).clamp(0.0, 2.0)
@@ -1221,7 +1248,7 @@ def select_rdsi_teacher_logits(
             * boundary_base
             * region.float()
         ).clamp(0.0, 1.0)
-        fg_residual_need = (fg_residual * receiver_fg_context.float()).clamp(0.0, 1.0)
+        fg_residual_need = (fg_residual * typed_support_context.float()).clamp(0.0, 1.0)
         bg_residual_need = (bg_residual * risk_like_mask.float()).clamp(0.0, 1.0)
         boundary_residual_need = (boundary_residual * risk_like_mask.float()).clamp(0.0, 1.0)
         core_preserving_fg_support = (
@@ -1334,43 +1361,15 @@ def select_rdsi_teacher_logits(
             + 0.5 * fg_excess_weight * foreground_excess_proxy
         ) / max(common_negative_weight + 0.5 * fg_excess_weight, 1e-6)
 
-        def _receiver_counterfactual_benefit(positive, negative, receiver_need, transfer_need, candidate):
-            net_gain = (positive - negative).clamp_min(0.0)
-            gain_purity = (net_gain / (positive + negative).clamp_min(1e-6)).clamp(0.0, 1.0)
-            need_mass = torch.sqrt(
-                (
-                    receiver_need.clamp(0.0, 1.0)
-                    * transfer_need.clamp(0.0, 1.0)
-                ).clamp_min(0.0)
-            )
-            calibrated_gain = torch.sqrt((net_gain * gain_purity).clamp_min(0.0))
-            return (
-                calibrated_gain
-                * need_mass
-                * candidate.float()
-            ).clamp(0.0, 1.0)
-
-        fg_repair_score = _receiver_counterfactual_benefit(
-            fg_positive,
-            fg_negative,
-            receiver_fg_budget_need,
-            fg_transfer_need,
-            fg_repair_candidate,
-        )
-        bg_suppress_score = _receiver_counterfactual_benefit(
-            bg_positive,
-            bg_negative,
-            receiver_bg_budget_need,
-            bg_transfer_need,
-            bg_suppress_candidate,
-        )
-        boundary_score = _receiver_counterfactual_benefit(
-            boundary_positive,
-            boundary_negative,
-            receiver_boundary_budget_need,
-            boundary_transfer_need,
-            boundary_candidate,
-        )
+        fg_repair_score = torch.sigmoid(
+            (fg_positive - fg_negative - quality_tau) / quality_temp
+        ) * fg_repair_candidate.float() * receiver_fg_score_weight
+        bg_suppress_score = torch.sigmoid(
+            (bg_positive - bg_negative - quality_tau) / quality_temp
+        ) * bg_suppress_candidate.float() * receiver_bg_score_weight
+        boundary_score = torch.sigmoid(
+            (boundary_positive - boundary_negative - quality_tau) / quality_temp
+        ) * boundary_candidate.float() * receiver_boundary_score_weight
         fg_repair_score = fg_repair_score.clamp(0.0, 1.0)
         bg_suppress_score = bg_suppress_score.clamp(0.0, 1.0)
         boundary_score = boundary_score.clamp(0.0, 1.0)
@@ -1492,67 +1491,86 @@ def select_rdsi_teacher_logits(
     effective_topk_ratio = (target_budget_pixels / max(image_pixels, 1.0)).clamp(0.0, 1.0)
     effective_min_pixels = target_budget_pixels
     safe_budget_factor = (target_budget_pixels / region_pixels.clamp_min(1.0)).clamp(0.0, max_budget_factor)
-    fg_proto_score_raw, fg_proto_index = fg_repair_score_stack.max(dim=0)
+    fg_proto_score, fg_proto_index = fg_repair_score_stack.max(dim=0)
     fg_proto_candidate = fg_candidate_stack.gather(0, fg_proto_index.unsqueeze(0)).squeeze(0) > 0.5
+    fg_proto_need = fg_transfer_need_stack.gather(0, fg_proto_index.unsqueeze(0)).squeeze(0)
     bg_proto_score_raw, bg_proto_index_raw = bg_suppress_score_stack.max(dim=0)
     bg_proto_candidate_raw = bg_candidate_stack.gather(0, bg_proto_index_raw.unsqueeze(0)).squeeze(0) > 0.5
+    bg_proto_need_raw = bg_transfer_need_stack.gather(0, bg_proto_index_raw.unsqueeze(0)).squeeze(0)
+    bg_proto_score = bg_proto_score_raw
     bg_proto_index = bg_proto_index_raw
     bg_proto_candidate = bg_proto_candidate_raw
-    boundary_proto_score_raw, boundary_proto_index = boundary_score_stack.max(dim=0)
+    bg_proto_need = bg_proto_need_raw
+    boundary_proto_score, boundary_proto_index = boundary_score_stack.max(dim=0)
     boundary_proto_candidate = boundary_candidate_stack.gather(0, boundary_proto_index.unsqueeze(0)).squeeze(0) > 0.5
+    boundary_proto_need = boundary_transfer_need_stack.gather(0, boundary_proto_index.unsqueeze(0)).squeeze(0)
 
-    fg_proto_pre_mask = (fg_proto_score_raw > score_floor) & fg_proto_candidate & region
-    bg_proto_pre_mask = (bg_proto_score_raw > score_floor) & bg_proto_candidate & region
-    boundary_proto_pre_mask = (boundary_proto_score_raw > score_floor) & boundary_proto_candidate & region
+    fg_proto_pre_mask = (fg_proto_score > score_floor) & fg_proto_candidate & region
+    bg_proto_pre_mask = (bg_proto_score > score_floor) & bg_proto_candidate & region
+    boundary_proto_pre_mask = (boundary_proto_score > score_floor) & boundary_proto_candidate & region
     typed_candidate_mask = fg_proto_pre_mask | bg_proto_pre_mask | boundary_proto_pre_mask
-
-    def _action_calibrated_score(action_score, action_candidate):
-        action_score = (action_score * action_candidate.float()).clamp(0.0, 1.0)
-        calibrated = torch.zeros_like(action_score)
-        flat_score = action_score.flatten(1)
-        flat_candidate = action_candidate.flatten(1)
-        for batch_idx in range(action_score.shape[0]):
-            candidate_values = flat_score[batch_idx][flat_candidate[batch_idx] > 0.5]
-            candidate_values = candidate_values[candidate_values > score_floor]
-            if candidate_values.numel() == 0:
-                continue
-            budget_pixels = int(
-                max(
-                    1,
-                    math.ceil(float(target_budget_pixels[batch_idx].detach().cpu().item())),
-                )
-            )
-            topk = min(budget_pixels, int(candidate_values.numel()))
-            scale = candidate_values.topk(topk).values.mean().clamp_min(score_floor)
-            action_rank_score = (action_score[batch_idx] / scale).clamp(0.0, 1.0)
-            calibrated[batch_idx] = torch.sqrt(
-                (action_score[batch_idx] * action_rank_score).clamp_min(0.0)
-            ).clamp(0.0, 1.0)
-        return calibrated * action_candidate.float()
-
-    fg_proto_score = _action_calibrated_score(fg_proto_score_raw, fg_proto_pre_mask)
-    bg_proto_score = _action_calibrated_score(bg_proto_score_raw, bg_proto_pre_mask)
-    boundary_proto_score = _action_calibrated_score(boundary_proto_score_raw, boundary_proto_pre_mask)
     fg_action_score = fg_proto_score * fg_proto_pre_mask.float()
     bg_action_score = bg_proto_score * bg_proto_pre_mask.float()
     boundary_action_score = boundary_proto_score * boundary_proto_pre_mask.float()
 
-    typed_action_score = torch.maximum(
-        torch.maximum(fg_action_score, bg_action_score),
-        boundary_action_score,
+    fg_need_mass = (receiver_fg_budget_need * fg_proto_need * fg_action_score).flatten(1).sum(dim=1)
+    bg_need_mass = (receiver_bg_budget_need * bg_proto_need * bg_action_score).flatten(1).sum(dim=1)
+    boundary_need_mass = (
+        receiver_boundary_budget_need * boundary_proto_need * boundary_action_score
+    ).flatten(1).sum(dim=1)
+    typed_need_mass = (fg_need_mass + bg_need_mass + boundary_need_mass).clamp_min(1e-6)
+    raw_fg_budget_share = (fg_need_mass / typed_need_mass).clamp(0.0, 1.0)
+    raw_bg_budget_share = (bg_need_mass / typed_need_mass).clamp(0.0, 1.0)
+    raw_boundary_budget_share = (boundary_need_mass / typed_need_mass).clamp(0.0, 1.0)
+    has_fg_candidate = fg_proto_pre_mask.flatten(1).any(dim=1)
+    has_fg_budget_need = has_fg_candidate & (fg_need_mass > 1e-6)
+    receiver_prior_mean = (receiver_fg_prior + receiver_bg_prior + receiver_boundary_prior) / 3.0
+    receiver_fg_min_budget_share = (
+        fg_min_budget_share * receiver_fg_prior / receiver_prior_mean.clamp_min(1e-6)
+    ).clamp(0.0, 0.65)
+    fg_action_mass = fg_action_score.flatten(1).sum(dim=1).clamp_min(1.0)
+    fg_need_strength = (fg_need_mass / (2.0 * fg_action_mass)).clamp(0.0, 1.0)
+    adaptive_fg_min_budget_share = (
+        receiver_fg_min_budget_share * fg_need_strength.detach()
+    ).clamp(0.0, 0.65)
+    reserved_fg_budget_share = torch.maximum(
+        raw_fg_budget_share,
+        adaptive_fg_min_budget_share,
     ).clamp(0.0, 1.0)
-    typed_budget_mask = _topk_foreground_anchor(
-        typed_action_score,
-        typed_candidate_mask,
+    fg_budget_share = torch.where(has_fg_budget_need, reserved_fg_budget_share, raw_fg_budget_share)
+    remaining_budget_share = (1.0 - fg_budget_share).clamp(0.0, 1.0)
+    other_need_mass = (bg_need_mass + boundary_need_mass).clamp_min(1e-6)
+    bg_reserved_share = remaining_budget_share * (bg_need_mass / other_need_mass).clamp(0.0, 1.0)
+    boundary_reserved_share = remaining_budget_share * (boundary_need_mass / other_need_mass).clamp(0.0, 1.0)
+    bg_budget_share = torch.where(has_fg_budget_need, bg_reserved_share, raw_bg_budget_share)
+    boundary_budget_share = torch.where(has_fg_budget_need, boundary_reserved_share, raw_boundary_budget_share)
+
+    fg_budget_pixels = torch.ceil(target_budget_pixels * fg_budget_share)
+    bg_budget_pixels = torch.ceil(target_budget_pixels * bg_budget_share)
+    boundary_budget_pixels = torch.ceil(target_budget_pixels * boundary_budget_share)
+
+    fg_budget_mask = _topk_foreground_anchor(
+        fg_action_score,
+        fg_proto_pre_mask,
         topk_ratio=0.0,
-        min_pixels=target_budget_pixels,
-    ) & typed_candidate_mask
-    fg_is_best = (fg_action_score >= bg_action_score) & (fg_action_score >= boundary_action_score)
-    bg_is_best = (~fg_is_best) & (bg_action_score >= boundary_action_score)
-    boundary_is_best = (~fg_is_best) & (~bg_is_best)
-    fg_repair_active_mask = typed_budget_mask & fg_proto_pre_mask & fg_is_best
-    bg_suppress_active_mask = typed_budget_mask & bg_proto_pre_mask & bg_is_best
-    boundary_active_mask = typed_budget_mask & boundary_proto_pre_mask & boundary_is_best
+        min_pixels=fg_budget_pixels,
+    ) & fg_proto_pre_mask
+    bg_budget_mask = _topk_foreground_anchor(
+        bg_action_score,
+        bg_proto_pre_mask,
+        topk_ratio=0.0,
+        min_pixels=bg_budget_pixels,
+    ) & bg_proto_pre_mask
+    boundary_budget_mask = _topk_foreground_anchor(
+        boundary_action_score,
+        boundary_proto_pre_mask,
+        topk_ratio=0.0,
+        min_pixels=boundary_budget_pixels,
+    ) & boundary_proto_pre_mask
+
+    fg_repair_active_mask = fg_budget_mask
+    bg_suppress_active_mask = bg_budget_mask & (~fg_repair_active_mask)
+    boundary_active_mask = boundary_budget_mask & (~fg_repair_active_mask) & (~bg_suppress_active_mask)
     typed_active_mask = fg_repair_active_mask | bg_suppress_active_mask | boundary_active_mask
     foreground_active_mask = fg_repair_active_mask
     bg_suppress_direct_active_mask = bg_suppress_active_mask
@@ -1649,11 +1667,11 @@ def select_rdsi_teacher_logits(
     active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
     pre_cap_score = torch.where(
         fg_repair_active_mask,
-        fg_proto_score,
+        fg_proto_score + 2.0,
         torch.where(
             background_pair_active_mask,
-            background_pair_score,
-            torch.where(bg_suppress_direct_active_mask, bg_proto_score, boundary_proto_score),
+            background_pair_score + 1.0,
+            torch.where(bg_suppress_direct_active_mask, bg_proto_score + 1.0, boundary_proto_score),
         ),
     )
     budget_cap_mask = _topk_foreground_anchor(
@@ -1671,16 +1689,6 @@ def select_rdsi_teacher_logits(
     bg_suppress_active_mask = background_active_mask
     typed_active_mask = fg_repair_active_mask | bg_suppress_direct_active_mask | boundary_active_mask
     active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
-    selected_budget_pixels = active_mask.float().flatten(1).sum(dim=1).clamp_min(1.0)
-    fg_budget_share = (
-        fg_repair_active_mask.float().flatten(1).sum(dim=1) / selected_budget_pixels
-    ).clamp(0.0, 1.0)
-    bg_budget_share = (
-        bg_suppress_active_mask.float().flatten(1).sum(dim=1) / selected_budget_pixels
-    ).clamp(0.0, 1.0)
-    boundary_budget_share = (
-        boundary_active_mask.float().flatten(1).sum(dim=1) / selected_budget_pixels
-    ).clamp(0.0, 1.0)
 
     typed_selected_stack_index = torch.where(
         fg_repair_active_mask,
@@ -1748,6 +1756,7 @@ def select_rdsi_teacher_logits(
     def _gather_selected_map(stack):
         return stack.gather(0, selected_stack_index.unsqueeze(0)).squeeze(0).detach()
 
+    selected_benefit = _gather_selected_map(benefit_stack)
     selected_reliable = _gather_selected_map(reliable_stack)
     selected_gap = _gather_selected_map(gap_stack)
     selected_fg_lift = _gather_selected_map(fg_lift_stack)
@@ -1908,7 +1917,7 @@ def select_rdsi_teacher_logits(
     profile["rdsi_unsafe_signal"] = unsafe_signal.mean().detach()
     profile["rdsi_safe_budget_factor"] = safe_budget_factor.mean().detach()
     profile["rdsi_budget_target_ratio"] = effective_topk_ratio.mean().detach()
-    profile["rdsi_quality_mean"] = _masked_mean(typed_action_score, typed_candidate_mask).detach()
+    profile["rdsi_quality_mean"] = _masked_mean(best_score, candidate_any).detach()
     profile["rdsi_effective_topk_ratio"] = effective_topk_ratio.mean().detach()
     profile["rdsi_effective_min_pixels"] = effective_min_pixels.float().mean().detach()
     profile["rdsi_core_reopen_ratio"] = core_reopen_mask.float().mean().detach()
@@ -2797,12 +2806,7 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
                 teacher_local_reliability
                 * teacher_candidate_region.float()
             ).clamp(0.0, 1.0)
-        if (
-            rdsi_background_active_mask is not None
-            and rdsi_alpha_map is not None
-            and rdsi_score_map is None
-            and rdsi_benefit_map is None
-        ):
+        if rdsi_background_active_mask is not None and rdsi_alpha_map is not None:
             alpha_floor = max(float(getattr(args, "rdsi_residual_alpha", 0.35)), 1e-6)
             paired_bg_score = (rdsi_alpha_map / alpha_floor).clamp(0.0, 1.0)
             paired_bg_mask = rdsi_background_active_mask & teacher_candidate_region
@@ -3295,12 +3299,14 @@ def rgftd_loss(student_logits, teacher_logits, label, wann_maps, args, iter_num,
     else:
         intervention_region_weight = (1.0 - wann_maps.reliability).clamp(0.0, 1.0)
     if rdsi_active_mask is not None:
+        rdsi_alpha_weight = rdsi_alpha_map.clamp(0.0, 1.0) if rdsi_alpha_map is not None else torch.ones_like(teacher_conf)
         rdsi_benefit_weight = rdsi_benefit_map.clamp(0.0, 1.0) if rdsi_benefit_map is not None else release_score
         rdsi_reliable_weight = teacher_local_reliability.clamp(0.0, 1.0)
         bg_suppression = ((bg_max_fg_prob - teacher_fg_prob) / max(bg_max_fg_prob, 1e-6)).clamp(0.0, 1.0)
         rdsi_loss_weight = (
             intervention_region_weight
             * torch.maximum(release_score, rdsi_benefit_weight)
+            * torch.maximum(rdsi_alpha_weight, rdsi_benefit_weight)
             * rdsi_reliable_weight
         ).clamp(0.0, 1.0)
         fg_weight = rdsi_loss_weight * active_fg_repair_mask.float()

@@ -1,12 +1,12 @@
 #!/bin/bash
 # WANN + RDSI-TED-ACB on FAZ with scribble-dominant heterogeneous weak labels.
 
-#SBATCH --job-name=ACB_FAZ
+#SBATCH --job-name=BRTAUTOFG_FAZ
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=6
 #SBATCH --cpus-per-task=2
-#SBATCH --gres=gpu:6
+#SBATCH --gres=gpu:8
 #SBATCH --mem=128G
 #SBATCH --output=logs/main_%j.log
 
@@ -24,7 +24,7 @@ cd "${CODE_DIR}"
 mkdir -p logs
 source "${CODE_DIR}/run_monitor_common.sh"
 
-RUN_PREFIX="${RUN_PREFIX:-acb_faz_r500_l10}"
+RUN_PREFIX="${RUN_PREFIX:-brt_autofg_recvbenefit_faz_r500_l10}"
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8635}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
@@ -77,7 +77,7 @@ BASE_ARGS="\
 --dual_init aggregated \
 --label_prompt 1 \
 --disable_tensorboard 1 \
---save_code_snapshot 0 \
+--save_code_snapshot 1 \
 --save_checkpoint_copies 0 \
 --ala_max_epochs 500 \
 --wann_enabled 1 \
@@ -203,7 +203,7 @@ BASE_ARGS="\
 --rgftd_stable_wann_mass_drop_thresh 0.05 \
 ${EXTRA_ARGS}"
 
-echo "Starting WANN + RDSI-TED-ACB FAZ run"
+echo "Starting WANN + RDSI-TED-BRT-AutoFG FAZ run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
@@ -248,4 +248,4 @@ launch_flower_client 3 client4 "${CLIENT4_SUP_TYPE}" 4 "${LOG_DIR}/client3.log"
 launch_flower_client 4 client5 "${CLIENT5_SUP_TYPE}" 5 "${LOG_DIR}/client4.log"
 
 monitor_flower_processes
-echo "WANN + RDSI-TED-ACB FAZ run finished. EXP_NAME=${EXP_NAME}"
+echo "WANN + RDSI-TED-BRT-AutoFG FAZ run finished. EXP_NAME=${EXP_NAME}"

@@ -2126,6 +2126,18 @@ def main():
                         help='Minimum image-level active ratio for budgeted RDSI residual transfer when candidates exist')
     parser.add_argument('--rdsi_budget_max_ratio', type=float, default=0.015,
                         help='Maximum image-level active ratio for budgeted RDSI residual transfer')
+    parser.add_argument('--rdsi_fg_min_budget_share', type=float, default=0.25,
+                        help='Minimum typed budget share reserved for safe RDSI foreground repair candidates')
+    parser.add_argument('--rdsi_receiver_fg_prior_scale', type=float, default=1.0,
+                        help='Multiplicative scale for receiver-type RDSI foreground repair prior')
+    parser.add_argument('--rdsi_receiver_bg_prior_scale', type=float, default=1.0,
+                        help='Multiplicative scale for receiver-type RDSI background suppression prior')
+    parser.add_argument('--rdsi_receiver_boundary_prior_scale', type=float, default=1.0,
+                        help='Multiplicative scale for receiver-type RDSI boundary transfer prior')
+    parser.add_argument('--rdsi_quality_tau', type=float, default=0.20,
+                        help='Soft evidence offset used by RDSI budgeted transfer quality scoring')
+    parser.add_argument('--rdsi_quality_temp', type=float, default=0.15,
+                        help='Temperature used by RDSI budgeted transfer quality scoring')
     parser.add_argument('--rdsi_entropy_increase_margin', type=float, default=0.05,
                         help='Allowed teacher foreground entropy increase before RDSI benefit is suppressed')
     parser.add_argument('--rdsi_entropy_increase_scale', type=float, default=0.35,
@@ -2404,6 +2416,11 @@ def main():
     assert args.rdsi_benefit_score_floor >= 0.0
     assert 0.0 <= args.rdsi_budget_fraction <= 1.0
     assert 0.0 <= args.rdsi_budget_min_ratio <= args.rdsi_budget_max_ratio <= 1.0
+    assert 0.0 <= args.rdsi_fg_min_budget_share <= 1.0
+    assert args.rdsi_receiver_fg_prior_scale >= 0.0
+    assert args.rdsi_receiver_bg_prior_scale >= 0.0
+    assert args.rdsi_receiver_boundary_prior_scale >= 0.0
+    assert args.rdsi_quality_temp > 0.0
     assert args.rdsi_entropy_increase_margin >= 0.0
     assert args.rdsi_entropy_increase_scale > 0.0
     assert args.rdsi_fg_excess_margin >= 0.0

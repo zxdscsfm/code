@@ -1,12 +1,12 @@
 #!/bin/bash
 # WANN + RDSI-TED-ACB on ISIC with scribble-dominant heterogeneous weak labels.
 
-#SBATCH --job-name=ACB_ISIC
+#SBATCH --job-name=BRTAUTOFG_ISIC
 #SBATCH --partition=v100_batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=5
 #SBATCH --cpus-per-task=2
-#SBATCH --gres=gpu:5
+#SBATCH --gres=gpu:8
 #SBATCH --mem=128G
 #SBATCH --output=logs/main_%j.log
 
@@ -24,7 +24,7 @@ cd "${CODE_DIR}"
 mkdir -p logs
 source "${CODE_DIR}/run_monitor_common.sh"
 
-RUN_PREFIX="${RUN_PREFIX:-acb_isic_r500_l10}"
+RUN_PREFIX="${RUN_PREFIX:-brt_autofg_recvbenefit_isic_polycls_r500_l10}"
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8636}"
 SEED="${SEED:-2022}"
 ITERS="${ITERS:-10}"
@@ -54,7 +54,7 @@ BASE_ARGS="\
 --root_path ${ROOT_PATH} \
 --num_classes 2 \
 --in_chns 3 \
---img_class ${IMG_CLASS:-isic} \
+--img_class ${IMG_CLASS:-polyp} \
 --exp ${EXP_NAME} \
 --model unet_univ5 \
 --max_iterations ${MAX_ITERATIONS} \
@@ -76,7 +76,7 @@ BASE_ARGS="\
 --dual_init aggregated \
 --label_prompt 1 \
 --disable_tensorboard 1 \
---save_code_snapshot 0 \
+--save_code_snapshot 1 \
 --save_checkpoint_copies 0 \
 --ala_max_epochs 500 \
 --wann_enabled 1 \
@@ -202,7 +202,7 @@ BASE_ARGS="\
 --rgftd_stable_wann_mass_drop_thresh 0.05 \
 ${EXTRA_ARGS}"
 
-echo "Starting WANN + RDSI-TED-ACB ISIC run"
+echo "Starting WANN + RDSI-TED-BRT-AutoFG ISIC run"
 echo "EXP_NAME=${EXP_NAME}"
 echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
@@ -244,4 +244,4 @@ launch_flower_client 2 client3 "${CLIENT3_SUP_TYPE}" 3 "${LOG_DIR}/client2.log"
 launch_flower_client 3 client4 "${CLIENT4_SUP_TYPE}" 4 "${LOG_DIR}/client3.log"
 
 monitor_flower_processes
-echo "WANN + RDSI-TED-ACB ISIC run finished. EXP_NAME=${EXP_NAME}"
+echo "WANN + RDSI-TED-BRT-AutoFG ISIC run finished. EXP_NAME=${EXP_NAME}"
