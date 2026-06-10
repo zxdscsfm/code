@@ -17,7 +17,7 @@ source "${CONDA_PATH}/etc/profile.d/conda.sh"
 conda activate fed39v2
 export PYTHONUNBUFFERED=1
 
-REPO_ROOT="/data/jianbingshen/yanghongji/FedLPPA_Original"
+REPO_ROOT="/data/jianbingshen/yanghongji/FedLPPA_BRT_AutoFG_recvbenefit_20260610"
 CODE_DIR="${REPO_ROOT}/code_v4"
 
 cd "${CODE_DIR}"
