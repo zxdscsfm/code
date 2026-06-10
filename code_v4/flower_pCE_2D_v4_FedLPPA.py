@@ -66,6 +66,10 @@ from weak_annotation_reliability import (
     soft_band_loss as wann_soft_band_loss,
     weighted_ce_loss as wann_weighted_ce_loss,
 )
+from annotation_geometry_calibration import (
+    acg_loss,
+    zero_acg_profile,
+)
 from rgftd_reliability_distillation import (
     get_rgftd_lambda,
     rdsi_feature_prototype_loss,
@@ -191,7 +195,7 @@ def _rgftd_class_ids_from_profile(rgftd_profile):
     return sorted(set(class_ids))
 
 
-def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile):
+def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile, acg_profile=None):
     parts = [
         'client %d : iteration %d : WANN/RGFTD' % (cid, iter_num),
     ]
@@ -207,6 +211,57 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'wann_sparse_proto=%.1f' % _scalar_float(wann_profile.get('sparse_seed_protocol', 0.0)),
             'wann_block_proto=%.1f' % _scalar_float(wann_profile.get('block_like_protocol', 0.0)),
             'wann_low_maxp=%.4f' % _scalar_float(wann_profile.get('max_prob_low_r', 0.0)),
+        ])
+    if acg_profile is not None:
+        parts.extend([
+            'acg_enabled=%.1f' % _scalar_float(acg_profile.get('enabled', 0.0)),
+            'acg_lambda=%.6f' % _scalar_float(acg_profile.get('lambda', 0.0)),
+            'acg_loss=%.6f' % _scalar_float(acg_profile.get('loss', 0.0)),
+            'acg_core_miss=%.6f' % _scalar_float(acg_profile.get('core_miss_loss', 0.0)),
+            'acg_support_miss=%.6f' % _scalar_float(acg_profile.get('support_miss_loss', 0.0)),
+            'acg_range=%.6f' % _scalar_float(acg_profile.get('range_loss', 0.0)),
+            'acg_range_under=%.6f' % _scalar_float(acg_profile.get('range_under_loss', 0.0)),
+            'acg_range_over=%.6f' % _scalar_float(acg_profile.get('range_over_loss', 0.0)),
+            'acg_leak=%.6f' % _scalar_float(acg_profile.get('unsupported_leak_loss', 0.0)),
+            'acg_boundary=%.6f' % _scalar_float(acg_profile.get('boundary_loss', 0.0)),
+            'acg_shape=%.6f' % _scalar_float(acg_profile.get('shape_contrast_loss', 0.0)),
+            'acg_core_ratio=%.6f' % _scalar_float(acg_profile.get('core_ratio', 0.0)),
+            'acg_support_ratio=%.6f' % _scalar_float(acg_profile.get('support_ratio', 0.0)),
+            'acg_unsupported_ratio=%.6f' % _scalar_float(acg_profile.get('unsupported_ratio', 0.0)),
+            'acg_boundary_ratio=%.6f' % _scalar_float(acg_profile.get('boundary_ratio', 0.0)),
+            'acg_shape_ring_ratio=%.6f' % _scalar_float(acg_profile.get('shape_ring_ratio', 0.0)),
+            'acg_shape_anchor_ratio=%.6f' % _scalar_float(acg_profile.get('shape_anchor_ratio', 0.0)),
+            'acg_core_mass=%.6f' % _scalar_float(acg_profile.get('core_mass', 0.0)),
+            'acg_envelope_mass=%.6f' % _scalar_float(acg_profile.get('envelope_mass', 0.0)),
+            'acg_lower_mass=%.6f' % _scalar_float(acg_profile.get('lower_mass', 0.0)),
+            'acg_upper_mass=%.6f' % _scalar_float(acg_profile.get('upper_mass', 0.0)),
+            'acg_uncertain_mass=%.6f' % _scalar_float(acg_profile.get('uncertain_mass', 0.0)),
+            'acg_rel_mean=%.6f' % _scalar_float(acg_profile.get('reliability_mean', 0.0)),
+            'acg_pred_fg=%.6f' % _scalar_float(acg_profile.get('pred_fg_mass', 0.0)),
+            'acg_shape_ring_fg=%.6f' % _scalar_float(acg_profile.get('pred_fg_shape_ring_mean', 0.0)),
+            'acg_shape_anchor_fg=%.6f' % _scalar_float(acg_profile.get('pred_fg_shape_anchor_mean', 0.0)),
+            'acg_core_w=%.6f' % _scalar_float(acg_profile.get('core_weight_scale', 0.0)),
+            'acg_support_w=%.6f' % _scalar_float(acg_profile.get('support_weight_scale', 0.0)),
+            'acg_range_w=%.6f' % _scalar_float(acg_profile.get('range_weight_scale', 0.0)),
+            'acg_leak_w=%.6f' % _scalar_float(acg_profile.get('leak_weight_scale', 0.0)),
+            'acg_boundary_w=%.6f' % _scalar_float(acg_profile.get('boundary_weight_scale', 0.0)),
+            'acg_shape_w=%.6f' % _scalar_float(acg_profile.get('shape_weight_scale', 0.0)),
+            'acg_fg_share=%.6f' % _scalar_float(acg_profile.get('fg_violation_share', 0.0)),
+            'acg_range_share=%.6f' % _scalar_float(acg_profile.get('range_violation_share', 0.0)),
+            'acg_leak_share=%.6f' % _scalar_float(acg_profile.get('leak_violation_share', 0.0)),
+            'acg_boundary_share=%.6f' % _scalar_float(acg_profile.get('boundary_violation_share', 0.0)),
+            'acg_shape_share=%.6f' % _scalar_float(acg_profile.get('shape_violation_share', 0.0)),
+            'acg_nwr_fg_loss=%.6f' % _scalar_float(acg_profile.get('nwr_fg_loss', 0.0)),
+            'acg_nwr_bg_loss=%.6f' % _scalar_float(acg_profile.get('nwr_bg_loss', 0.0)),
+            'acg_nwr_fg_mass=%.6f' % _scalar_float(acg_profile.get('nwr_fg_weight_mass', 0.0)),
+            'acg_nwr_bg_mass=%.6f' % _scalar_float(acg_profile.get('nwr_bg_weight_mass', 0.0)),
+            'acg_nwr_fg_ratio=%.6f' % _scalar_float(acg_profile.get('nwr_fg_region_ratio', 0.0)),
+            'acg_nwr_bg_ratio=%.6f' % _scalar_float(acg_profile.get('nwr_bg_region_ratio', 0.0)),
+            'acg_nwr_regions=%.1f' % _scalar_float(acg_profile.get('nwr_region_count', 0.0)),
+            'acg_nwr_fg_prior=%.6f' % _scalar_float(acg_profile.get('nwr_fg_prior', 0.0)),
+            'acg_nwr_bg_prior=%.6f' % _scalar_float(acg_profile.get('nwr_bg_prior', 0.0)),
+            'acg_nwr_pred_fg=%.6f' % _scalar_float(acg_profile.get('nwr_pred_fg_on_fg', 0.0)),
+            'acg_nwr_pred_bg=%.6f' % _scalar_float(acg_profile.get('nwr_pred_fg_on_bg', 0.0)),
         ])
     if rgftd_profile is not None:
         parts.extend([
@@ -303,6 +358,16 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'rdsi_recv_fg_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_fg_budget_share', 0.0)),
             'rdsi_recv_bg_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_bg_budget_share', 0.0)),
             'rdsi_recv_bd_share=%.6f' % _scalar_float(rgftd_profile.get('rdsi_receiver_boundary_budget_share', 0.0)),
+            'rdsi_fg_budget_demand=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_budget_demand', 0.0)),
+            'rdsi_bg_budget_demand=%.6f' % _scalar_float(rgftd_profile.get('rdsi_bg_budget_demand', 0.0)),
+            'rdsi_bd_budget_demand=%.6f' % _scalar_float(rgftd_profile.get('rdsi_boundary_budget_demand', 0.0)),
+            'rdsi_fg_budget_alloc=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_budget_alloc', 0.0)),
+            'rdsi_bg_budget_alloc=%.6f' % _scalar_float(rgftd_profile.get('rdsi_bg_budget_alloc', 0.0)),
+            'rdsi_bd_budget_alloc=%.6f' % _scalar_float(rgftd_profile.get('rdsi_boundary_budget_alloc', 0.0)),
+            'rdsi_fg_budget_unused=%.6f' % _scalar_float(rgftd_profile.get('rdsi_fg_budget_unused', 0.0)),
+            'rdsi_bg_budget_unused=%.6f' % _scalar_float(rgftd_profile.get('rdsi_bg_budget_unused', 0.0)),
+            'rdsi_bd_budget_unused=%.6f' % _scalar_float(rgftd_profile.get('rdsi_boundary_budget_unused', 0.0)),
+            'rdsi_budget_reflow=%.6f' % _scalar_float(rgftd_profile.get('rdsi_budget_reflow_ratio', 0.0)),
             'rdsi_quality=%.6f' % _scalar_float(rgftd_profile.get('rdsi_quality_mean', 0.0)),
             'rdsi_eff_topk=%.6f' % _scalar_float(rgftd_profile.get('rdsi_effective_topk_ratio', 0.0)),
             'rdsi_eff_minpx=%.1f' % _scalar_float(rgftd_profile.get('rdsi_effective_min_pixels', 0.0)),
@@ -1294,6 +1359,18 @@ class MyClient(BaseClient):
                         outputs, outputs_auxiliary, label_batch, wann_maps, ignore_index=self.args.num_classes
                     )
                     loss_cons = wann_consistency_loss(outputs, outputs_auxiliary, wann_maps.ignore_mask)
+                    loss_acg = outputs.sum() * 0.0
+                    lambda_acg = 0.0
+                    acg_profile = zero_acg_profile(outputs.device)
+                    if int(getattr(self.args, 'acg_enabled', 0)) == 1:
+                        loss_acg, lambda_acg, acg_profile = acg_loss(
+                            outputs,
+                            outputs_auxiliary,
+                            wann_maps,
+                            self.args,
+                            self.current_iter,
+                        )
+                        loss_hard = loss_acg
                     loss_ce = loss_hard + lambda_soft * loss_soft + lambda_cons * loss_cons
                     loss_rgftd = outputs.sum() * 0.0
                     loss_rgftd_seg = outputs.sum() * 0.0
@@ -1336,7 +1413,7 @@ class MyClient(BaseClient):
                                         teacher_feature_list.append(_rdsi_feature(teacher_out).detach())
                                         teacher_ids.append(teacher_id)
                                     rgftd_teacher_args = copy.copy(rgftd_teacher_args)
-                                    _, rdsi_profile = select_rdsi_teacher_logits(
+                                    selected_logits, rdsi_profile = select_rdsi_teacher_logits(
                                         outputs,
                                         teacher_logits_list,
                                         teacher_ids,
@@ -1347,15 +1424,47 @@ class MyClient(BaseClient):
                                         student_feature=de1,
                                         teacher_feature_list=teacher_feature_list,
                                     )
-                                loss_rgftd, lambda_rgftd, rgftd_profile = rdsi_feature_prototype_loss(
+                                loss_rgftd_seg, lambda_rgftd_seg, rgftd_profile_seg = rgftd_loss(
+                                    outputs,
+                                    selected_logits,
+                                    label_batch,
+                                    wann_maps,
+                                    rgftd_teacher_args,
+                                    self.current_iter,
+                                    image=volume_batch,
+                                )
+                                loss_rgftd_aux, lambda_rgftd_aux, rgftd_profile_aux = rgftd_loss(
+                                    outputs_auxiliary,
+                                    selected_logits,
+                                    label_batch,
+                                    wann_maps,
+                                    rgftd_teacher_args,
+                                    self.current_iter,
+                                    image=volume_batch,
+                                )
+                                loss_rgftd_proto, lambda_rgftd_proto, rgftd_profile_proto = rdsi_feature_prototype_loss(
                                     de1,
                                     teacher_feature_list,
                                     rgftd_teacher_args,
                                     self.current_iter,
                                 )
-                                loss_rgftd_seg = loss_rgftd
-                                loss_rgftd_aux = outputs.sum() * 0.0
-                                loss_rgftd_weighted = float(lambda_rgftd) * loss_rgftd
+                                loss_rgftd = 0.5 * (loss_rgftd_seg + loss_rgftd_aux) + loss_rgftd_proto
+                                loss_rgftd_weighted = (
+                                    0.5 * (
+                                        float(lambda_rgftd_seg) * loss_rgftd_seg
+                                        + float(lambda_rgftd_aux) * loss_rgftd_aux
+                                    )
+                                    + float(lambda_rgftd_proto) * loss_rgftd_proto
+                                )
+                                lambda_rgftd = (
+                                    float(lambda_rgftd_seg)
+                                    + float(lambda_rgftd_aux)
+                                    + float(lambda_rgftd_proto)
+                                ) / 3.0
+                                rgftd_profile = _average_rgftd_profiles(rgftd_profile_seg, rgftd_profile_aux)
+                                for proto_key, proto_value in rgftd_profile_proto.items():
+                                    if str(proto_key).startswith('rdsi_proto'):
+                                        rgftd_profile[proto_key] = proto_value
                             else:
                                 with torch.no_grad():
                                     teacher_out = rgftd_teacher_model(volume_batch)
@@ -1427,6 +1536,9 @@ class MyClient(BaseClient):
                     loss_hard = torch.tensor(0.0).cuda()
                     loss_soft = torch.tensor(0.0).cuda()
                     loss_cons = torch.tensor(0.0).cuda()
+                    loss_acg = torch.tensor(0.0).cuda()
+                    lambda_acg = 0.0
+                    acg_profile = zero_acg_profile(loss_acg.device)
                     loss_rgftd = torch.tensor(0.0).cuda()
                     loss_rgftd_seg = torch.tensor(0.0).cuda()
                     loss_rgftd_aux = torch.tensor(0.0).cuda()
@@ -1618,6 +1730,7 @@ class MyClient(BaseClient):
                     wann_maps,
                     lambda_rgftd_raw,
                     rgftd_profile,
+                    acg_profile,
                 ))
 
             lr_ = self.args.base_lr * (1.0 - self.current_iter / self.args.max_iterations) ** 0.9
@@ -1697,6 +1810,12 @@ class MyClient(BaseClient):
             metrics_['client_{}_wann_lambda_cons'.format(self.cid)] = float(lambda_cons)
             for key, value in wann_maps.profile.items():
                 metrics_['client_{}_wann_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
+
+        if int(getattr(self.args, 'acg_enabled', 0)) == 1:
+            metrics_['client_{}_acg_loss'.format(self.cid)] = float(loss_acg.detach().cpu().item())
+            metrics_['client_{}_acg_lambda'.format(self.cid)] = float(lambda_acg)
+            for key, value in acg_profile.items():
+                metrics_['client_{}_acg_{}'.format(self.cid, key)] = float(value.detach().cpu().item())
 
         if int(getattr(self.args, 'rgftd_enabled', 0)) == 1:
             metrics_['client_{}_rgftd_loss'.format(self.cid)] = float(loss_rgftd.detach().cpu().item())
@@ -1966,6 +2085,12 @@ def main():
                         help='Target core ratio used to scale soft supervision when WANN core is deficient')
     parser.add_argument('--wann_core_deficit_soft_boost', type=float, default=0.0,
                         help='Multiplier slope for soft-band supervision when WANN hard core is deficient')
+    parser.add_argument('--acg_enabled', type=int, default=0,
+                        help='Enable annotation geometry calibration via normalized weak risk')
+    parser.add_argument('--acg_lambda', type=float, default=0.08,
+                        help='Legacy compatibility argument; ACG-NWR replaces hard weak risk when enabled')
+    parser.add_argument('--acg_warmup_iters', type=int, default=800,
+                        help='Legacy compatibility argument for previous ACG variants')
     parser.add_argument('--rgftd_enabled', type=int, default=0,
                         help='Enable reliability-gated federated teacher distillation')
     parser.add_argument('--rgftd_lambda', type=float, default=0.1,
@@ -2323,6 +2448,11 @@ def main():
     assert 0.0 <= args.wann_low_confident_thresh <= 1.0
     assert 0.0 <= args.wann_target_core_ratio <= 1.0
     assert args.wann_core_deficit_soft_boost >= 0.0
+    assert args.acg_enabled in [0, 1]
+    assert args.acg_lambda >= 0.0
+    assert args.acg_warmup_iters >= 0
+    if args.acg_enabled == 1:
+        assert args.wann_enabled == 1
     assert args.rgftd_enabled in [0, 1]
     if args.rgftd_enabled == 1:
         assert args.wann_enabled == 1
@@ -2591,6 +2721,62 @@ def main():
                 'wann_update_cos_loo',
                 'wann_update_conflict',
             ]
+        if args.acg_enabled == 1:
+            train_scalar_metrics += [
+                'acg_loss',
+                'acg_lambda',
+                'acg_enabled',
+                'acg_core_miss_loss',
+                'acg_support_miss_loss',
+                'acg_range_loss',
+                'acg_range_under_loss',
+                'acg_range_over_loss',
+                'acg_unsupported_leak_loss',
+                'acg_boundary_loss',
+                'acg_boundary_cons_loss',
+                'acg_boundary_smooth_loss',
+                'acg_shape_contrast_loss',
+                'acg_core_ratio',
+                'acg_support_ratio',
+                'acg_unsupported_ratio',
+                'acg_boundary_ratio',
+                'acg_shape_ring_ratio',
+                'acg_shape_anchor_ratio',
+                'acg_core_mass',
+                'acg_envelope_mass',
+                'acg_lower_mass',
+                'acg_upper_mass',
+                'acg_uncertain_mass',
+                'acg_reliability_mean',
+                'acg_pred_fg_mass',
+                'acg_pred_fg_core_mean',
+                'acg_pred_fg_support_mean',
+                'acg_pred_fg_unsupported_mean',
+                'acg_pred_fg_shape_ring_mean',
+                'acg_pred_fg_shape_anchor_mean',
+                'acg_core_weight_scale',
+                'acg_support_weight_scale',
+                'acg_range_weight_scale',
+                'acg_leak_weight_scale',
+                'acg_boundary_weight_scale',
+                'acg_shape_weight_scale',
+                'acg_fg_violation_share',
+                'acg_range_violation_share',
+                'acg_leak_violation_share',
+                'acg_boundary_violation_share',
+                'acg_shape_violation_share',
+                'acg_nwr_fg_loss',
+                'acg_nwr_bg_loss',
+                'acg_nwr_fg_weight_mass',
+                'acg_nwr_bg_weight_mass',
+                'acg_nwr_fg_region_ratio',
+                'acg_nwr_bg_region_ratio',
+                'acg_nwr_region_count',
+                'acg_nwr_fg_prior',
+                'acg_nwr_bg_prior',
+                'acg_nwr_pred_fg_on_fg',
+                'acg_nwr_pred_fg_on_bg',
+            ]
         if args.rgftd_enabled == 1:
             train_scalar_metrics += [
                 'rgftd_loss',
@@ -2681,6 +2867,16 @@ def main():
                 'rgftd_rdsi_unsafe_signal',
                 'rgftd_rdsi_safe_budget_factor',
                 'rgftd_rdsi_budget_target_ratio',
+                'rgftd_rdsi_fg_budget_demand',
+                'rgftd_rdsi_bg_budget_demand',
+                'rgftd_rdsi_boundary_budget_demand',
+                'rgftd_rdsi_fg_budget_alloc',
+                'rgftd_rdsi_bg_budget_alloc',
+                'rgftd_rdsi_boundary_budget_alloc',
+                'rgftd_rdsi_fg_budget_unused',
+                'rgftd_rdsi_bg_budget_unused',
+                'rgftd_rdsi_boundary_budget_unused',
+                'rgftd_rdsi_budget_reflow_ratio',
                 'rgftd_rdsi_quality_mean',
                 'rgftd_rdsi_effective_topk_ratio',
                 'rgftd_rdsi_effective_min_pixels',

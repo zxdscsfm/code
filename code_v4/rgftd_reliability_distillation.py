@@ -57,6 +57,16 @@ RGFTD_PROFILE_KEYS = [
     "rdsi_receiver_fg_budget_share",
     "rdsi_receiver_bg_budget_share",
     "rdsi_receiver_boundary_budget_share",
+    "rdsi_fg_budget_demand",
+    "rdsi_bg_budget_demand",
+    "rdsi_boundary_budget_demand",
+    "rdsi_fg_budget_alloc",
+    "rdsi_bg_budget_alloc",
+    "rdsi_boundary_budget_alloc",
+    "rdsi_fg_budget_unused",
+    "rdsi_bg_budget_unused",
+    "rdsi_boundary_budget_unused",
+    "rdsi_budget_reflow_ratio",
     "rdsi_candidate_ratio",
     "rdsi_accept_ratio",
     "rdsi_reject_ratio",
@@ -938,6 +948,16 @@ def select_rdsi_teacher_logits(
         profile["rdsi_receiver_fg_budget_share"] = zero_map.mean().detach()
         profile["rdsi_receiver_bg_budget_share"] = zero_map.mean().detach()
         profile["rdsi_receiver_boundary_budget_share"] = zero_map.mean().detach()
+        profile["rdsi_fg_budget_demand"] = zero_map.mean().detach()
+        profile["rdsi_bg_budget_demand"] = zero_map.mean().detach()
+        profile["rdsi_boundary_budget_demand"] = zero_map.mean().detach()
+        profile["rdsi_fg_budget_alloc"] = zero_map.mean().detach()
+        profile["rdsi_bg_budget_alloc"] = zero_map.mean().detach()
+        profile["rdsi_boundary_budget_alloc"] = zero_map.mean().detach()
+        profile["rdsi_fg_budget_unused"] = zero_map.mean().detach()
+        profile["rdsi_bg_budget_unused"] = zero_map.mean().detach()
+        profile["rdsi_boundary_budget_unused"] = zero_map.mean().detach()
+        profile["rdsi_budget_reflow_ratio"] = zero_map.mean().detach()
         profile["rdsi_accept_ratio"] = zero_map.mean().detach()
         profile["rdsi_reject_ratio"] = zero_map.mean().detach()
         profile["rdsi_fg_repair_active_ratio"] = zero_map.mean().detach()
@@ -1541,22 +1561,292 @@ def select_rdsi_teacher_logits(
         torch.maximum(fg_action_score, bg_action_score),
         boundary_action_score,
     ).clamp(0.0, 1.0)
-    typed_budget_mask = _topk_foreground_anchor(
-        typed_action_score,
-        typed_candidate_mask,
+
+    def _batch_masked_mean(value, mask):
+        mask_f = mask.float()
+        denom = mask_f.flatten(1).sum(dim=1).clamp_min(1.0)
+        return (value * mask_f).flatten(1).sum(dim=1) / denom
+
+    def _batch_mask_count(mask):
+        return mask.float().flatten(1).sum(dim=1)
+
+    def _safe_complement(*values):
+        unsafe = values[0]
+        for value in values[1:]:
+            unsafe = torch.maximum(unsafe, value)
+        return (1.0 - unsafe.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+
+    fg_safety_map = _safe_complement(
+        fg_excess_proxy_stack.max(dim=0).values,
+        core_damage_stack.max(dim=0).values,
+        seed_conflict_stack.max(dim=0).values,
+    )
+    bg_safety_map = _safe_complement(
+        core_damage_stack.max(dim=0).values,
+        seed_conflict_stack.max(dim=0).values,
+    )
+    boundary_safety_map = _safe_complement(
+        0.5 * fg_excess_proxy_stack.max(dim=0).values,
+        core_damage_stack.max(dim=0).values,
+        seed_conflict_stack.max(dim=0).values,
+    )
+    fg_need_mass = _batch_masked_mean(receiver_fg_budget_need, fg_proto_pre_mask)
+    bg_need_mass = _batch_masked_mean(receiver_bg_budget_need, bg_proto_pre_mask)
+    boundary_need_mass = _batch_masked_mean(receiver_boundary_budget_need, boundary_proto_pre_mask)
+    fg_safe_mass = _batch_masked_mean(fg_safety_map, fg_proto_pre_mask)
+    bg_safe_mass = _batch_masked_mean(bg_safety_map, bg_proto_pre_mask)
+    boundary_safe_mass = _batch_masked_mean(boundary_safety_map, boundary_proto_pre_mask)
+    fg_has_candidate = fg_proto_pre_mask.flatten(1).any(dim=1)
+    bg_has_candidate = bg_proto_pre_mask.flatten(1).any(dim=1)
+    boundary_has_candidate = boundary_proto_pre_mask.flatten(1).any(dim=1)
+    fg_demand = torch.where(fg_has_candidate, fg_need_mass * fg_safe_mass, torch.zeros_like(fg_need_mass))
+    bg_demand = torch.where(bg_has_candidate, bg_need_mass * bg_safe_mass, torch.zeros_like(bg_need_mass))
+    boundary_demand = torch.where(
+        boundary_has_candidate,
+        boundary_need_mass * boundary_safe_mass,
+        torch.zeros_like(boundary_need_mass),
+    )
+    demand_total = fg_demand + bg_demand + boundary_demand
+
+    fg_candidate_mass = _batch_mask_count(fg_proto_pre_mask)
+    bg_candidate_mass = _batch_mask_count(bg_proto_pre_mask)
+    boundary_candidate_mass = _batch_mask_count(boundary_proto_pre_mask)
+    candidate_mass_total = fg_candidate_mass + bg_candidate_mass + boundary_candidate_mass
+    fallback_total = candidate_mass_total.clamp_min(1.0)
+    fg_fallback_share = fg_candidate_mass / fallback_total
+    bg_fallback_share = bg_candidate_mass / fallback_total
+    boundary_fallback_share = boundary_candidate_mass / fallback_total
+    has_demand = demand_total > 1e-8
+    fg_share = torch.where(has_demand, fg_demand / demand_total.clamp_min(1e-8), fg_fallback_share)
+    bg_share = torch.where(has_demand, bg_demand / demand_total.clamp_min(1e-8), bg_fallback_share)
+    boundary_share = torch.where(
+        has_demand,
+        boundary_demand / demand_total.clamp_min(1e-8),
+        boundary_fallback_share,
+    )
+
+    fg_min_share_if_safe = min(
+        0.15,
+        max(0.05, 0.5 * budget_min_ratio / max(budget_max_ratio, 1e-6)),
+    )
+    fg_safe_for_min = (
+        (fg_demand > 1e-8)
+        & (fg_safe_mass >= 0.5)
+        & fg_has_candidate
+        & (target_budget_pixels >= 1.0)
+    )
+    fg_min_share_tensor = torch.full_like(fg_share, float(fg_min_share_if_safe))
+    fg_share_with_min = torch.where(
+        fg_safe_for_min,
+        torch.maximum(fg_share, fg_min_share_tensor),
+        fg_share,
+    ).clamp(0.0, 1.0)
+    remaining_share = (1.0 - fg_share_with_min).clamp(0.0, 1.0)
+    other_share_sum = (bg_share + boundary_share).clamp_min(1e-8)
+    bg_share = torch.where(
+        fg_share_with_min > fg_share,
+        remaining_share * bg_share / other_share_sum,
+        bg_share,
+    )
+    boundary_share = torch.where(
+        fg_share_with_min > fg_share,
+        remaining_share * boundary_share / other_share_sum,
+        boundary_share,
+    )
+    fg_share = fg_share_with_min
+    share_sum = (fg_share + bg_share + boundary_share).clamp_min(1e-8)
+    fg_share = fg_share / share_sum
+    bg_share = bg_share / share_sum
+    boundary_share = boundary_share / share_sum
+
+    typed_budget_float = torch.stack(
+        [fg_share, bg_share, boundary_share],
+        dim=0,
+    ) * target_budget_pixels.unsqueeze(0)
+    typed_budget_floor = torch.floor(typed_budget_float)
+    typed_budget_fraction = typed_budget_float - typed_budget_floor
+    fg_budget_pixels = []
+    bg_budget_pixels = []
+    boundary_budget_pixels = []
+    for batch_idx in range(target_budget_pixels.shape[0]):
+        total_budget = int(math.floor(float(target_budget_pixels[batch_idx].detach().cpu().item())))
+        floors = [
+            int(typed_budget_floor[0, batch_idx].detach().cpu().item()),
+            int(typed_budget_floor[1, batch_idx].detach().cpu().item()),
+            int(typed_budget_floor[2, batch_idx].detach().cpu().item()),
+        ]
+        candidate_flags = [
+            bool(fg_has_candidate[batch_idx].detach().cpu().item()),
+            bool(bg_has_candidate[batch_idx].detach().cpu().item()),
+            bool(boundary_has_candidate[batch_idx].detach().cpu().item()),
+        ]
+        floors = [floor if has_flag else 0 for floor, has_flag in zip(floors, candidate_flags)]
+        remainder = max(0, total_budget - sum(floors))
+        fractions = [
+            float(typed_budget_fraction[0, batch_idx].detach().cpu().item()),
+            float(typed_budget_fraction[1, batch_idx].detach().cpu().item()),
+            float(typed_budget_fraction[2, batch_idx].detach().cpu().item()),
+        ]
+        order = sorted(range(3), key=lambda idx: (fractions[idx], 1 if idx == 0 else 0, 1 if idx == 2 else 0), reverse=True)
+        for action_idx in order:
+            if remainder <= 0:
+                break
+            if candidate_flags[action_idx]:
+                floors[action_idx] += 1
+                remainder -= 1
+        fg_budget_pixels.append(floors[0])
+        bg_budget_pixels.append(floors[1])
+        boundary_budget_pixels.append(floors[2])
+    fg_budget_pixels = torch.tensor(fg_budget_pixels, device=device, dtype=target_budget_pixels.dtype)
+    bg_budget_pixels = torch.tensor(bg_budget_pixels, device=device, dtype=target_budget_pixels.dtype)
+    boundary_budget_pixels = torch.tensor(boundary_budget_pixels, device=device, dtype=target_budget_pixels.dtype)
+
+    fg_repair_active_mask = _topk_foreground_anchor(
+        fg_action_score,
+        fg_proto_pre_mask,
         topk_ratio=0.0,
-        min_pixels=target_budget_pixels,
-    ) & typed_candidate_mask
-    fg_is_best = (fg_action_score >= bg_action_score) & (fg_action_score >= boundary_action_score)
-    bg_is_best = (~fg_is_best) & (bg_action_score >= boundary_action_score)
-    boundary_is_best = (~fg_is_best) & (~bg_is_best)
-    fg_repair_active_mask = typed_budget_mask & fg_proto_pre_mask & fg_is_best
-    bg_suppress_active_mask = typed_budget_mask & bg_proto_pre_mask & bg_is_best
-    boundary_active_mask = typed_budget_mask & boundary_proto_pre_mask & boundary_is_best
+        min_pixels=fg_budget_pixels,
+    ) & fg_proto_pre_mask
+    bg_suppress_active_mask = _topk_foreground_anchor(
+        bg_action_score,
+        bg_proto_pre_mask & (~fg_repair_active_mask),
+        topk_ratio=0.0,
+        min_pixels=bg_budget_pixels,
+    ) & bg_proto_pre_mask & (~fg_repair_active_mask)
+    boundary_active_mask = _topk_foreground_anchor(
+        boundary_action_score,
+        boundary_proto_pre_mask & (~fg_repair_active_mask) & (~bg_suppress_active_mask),
+        topk_ratio=0.0,
+        min_pixels=boundary_budget_pixels,
+    ) & boundary_proto_pre_mask & (~fg_repair_active_mask) & (~bg_suppress_active_mask)
     typed_active_mask = fg_repair_active_mask | bg_suppress_active_mask | boundary_active_mask
     foreground_active_mask = fg_repair_active_mask
     bg_suppress_direct_active_mask = bg_suppress_active_mask
     background_active_mask = bg_suppress_direct_active_mask
+    active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
+
+    def _topk_extra_action(score, valid_mask, extra_pixels):
+        extra_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+        flat_score = score.flatten(1)
+        flat_valid = valid_mask.flatten(1)
+        flat_extra = extra_mask.flatten(1)
+        for batch_idx in range(score.shape[0]):
+            extra = int(math.floor(float(extra_pixels[batch_idx].detach().cpu().item())))
+            if extra <= 0:
+                continue
+            valid_count = int(flat_valid[batch_idx].sum().detach().cpu().item())
+            if valid_count <= 0:
+                continue
+            k = min(extra, valid_count)
+            masked_score = flat_score[batch_idx].masked_fill(~flat_valid[batch_idx], -1.0)
+            topk_index = torch.topk(masked_score, k=k, largest=True).indices
+            flat_extra[batch_idx, topk_index] = True
+        return extra_mask & valid_mask
+
+    initial_fg_pixels = _batch_mask_count(fg_repair_active_mask)
+    initial_bg_pixels = _batch_mask_count(bg_suppress_direct_active_mask)
+    initial_boundary_pixels = _batch_mask_count(boundary_active_mask)
+    fg_budget_unused_pixels = (fg_budget_pixels - initial_fg_pixels).clamp_min(0.0)
+    bg_budget_unused_pixels = (bg_budget_pixels - initial_bg_pixels).clamp_min(0.0)
+    boundary_budget_unused_pixels = (boundary_budget_pixels - initial_boundary_pixels).clamp_min(0.0)
+    reflow_added_pixels = torch.zeros_like(target_budget_pixels)
+
+    def _typed_reflow_capacity(action_share, action_mask):
+        desired_pixels = (action_share * target_budget_pixels).clamp_min(0.0)
+        return (desired_pixels - _batch_mask_count(action_mask)).clamp_min(0.0)
+
+    def _limited_reflow_pixels(source_unused_pixels, action_share, action_mask):
+        return torch.minimum(source_unused_pixels, _typed_reflow_capacity(action_share, action_mask))
+
+    def _soft_limited_reflow_pixels(source_unused_pixels, action_share, action_mask, action_safety_mass):
+        base_capacity = _typed_reflow_capacity(action_share, action_mask)
+        safe_overflow_capacity = (
+            action_share * target_budget_pixels * action_safety_mass.clamp(0.0, 1.0)
+        ).clamp_min(0.0)
+        return torch.minimum(source_unused_pixels, base_capacity + safe_overflow_capacity)
+
+    def _add_reflow_action(action_score, action_candidate, extra_pixels, occupied_mask):
+        add_mask = _topk_extra_action(
+            action_score,
+            action_candidate & (~occupied_mask),
+            extra_pixels,
+        )
+        add_count = _batch_mask_count(add_mask)
+        return add_mask, add_count
+
+    occupied_mask = active_mask
+    boundary_from_fg, boundary_from_fg_count = _add_reflow_action(
+        boundary_action_score,
+        boundary_proto_pre_mask,
+        _soft_limited_reflow_pixels(fg_budget_unused_pixels, boundary_share, boundary_active_mask, boundary_safe_mass),
+        occupied_mask,
+    )
+    boundary_active_mask = boundary_active_mask | boundary_from_fg
+    occupied_mask = occupied_mask | boundary_from_fg
+    reflow_added_pixels = reflow_added_pixels + boundary_from_fg_count
+    fg_unused_after_boundary = (fg_budget_unused_pixels - boundary_from_fg_count).clamp_min(0.0)
+    bg_from_fg, bg_from_fg_count = _add_reflow_action(
+        bg_action_score,
+        bg_proto_pre_mask,
+        _limited_reflow_pixels(fg_unused_after_boundary, bg_share, bg_suppress_direct_active_mask),
+        occupied_mask,
+    )
+    bg_suppress_direct_active_mask = bg_suppress_direct_active_mask | bg_from_fg
+    occupied_mask = occupied_mask | bg_from_fg
+    reflow_added_pixels = reflow_added_pixels + bg_from_fg_count
+
+    boundary_from_bg, boundary_from_bg_count = _add_reflow_action(
+        boundary_action_score,
+        boundary_proto_pre_mask,
+        _soft_limited_reflow_pixels(bg_budget_unused_pixels, boundary_share, boundary_active_mask, boundary_safe_mass),
+        occupied_mask,
+    )
+    boundary_active_mask = boundary_active_mask | boundary_from_bg
+    occupied_mask = occupied_mask | boundary_from_bg
+    reflow_added_pixels = reflow_added_pixels + boundary_from_bg_count
+    bg_unused_after_boundary = (bg_budget_unused_pixels - boundary_from_bg_count).clamp_min(0.0)
+    fg_reflow_safe_pixels = torch.where(
+        fg_safe_for_min,
+        _soft_limited_reflow_pixels(bg_unused_after_boundary, fg_share, fg_repair_active_mask, fg_safe_mass),
+        torch.zeros_like(bg_unused_after_boundary),
+    )
+    fg_from_bg, fg_from_bg_count = _add_reflow_action(
+        fg_action_score,
+        fg_proto_pre_mask,
+        fg_reflow_safe_pixels,
+        occupied_mask,
+    )
+    fg_repair_active_mask = fg_repair_active_mask | fg_from_bg
+    occupied_mask = occupied_mask | fg_from_bg
+    reflow_added_pixels = reflow_added_pixels + fg_from_bg_count
+
+    fg_from_boundary, fg_from_boundary_count = _add_reflow_action(
+        fg_action_score,
+        fg_proto_pre_mask,
+        torch.where(
+            fg_safe_for_min,
+            _soft_limited_reflow_pixels(boundary_budget_unused_pixels, fg_share, fg_repair_active_mask, fg_safe_mass),
+            torch.zeros_like(boundary_budget_unused_pixels),
+        ),
+        occupied_mask,
+    )
+    fg_repair_active_mask = fg_repair_active_mask | fg_from_boundary
+    occupied_mask = occupied_mask | fg_from_boundary
+    reflow_added_pixels = reflow_added_pixels + fg_from_boundary_count
+    boundary_unused_after_fg = (boundary_budget_unused_pixels - fg_from_boundary_count).clamp_min(0.0)
+    bg_from_boundary, bg_from_boundary_count = _add_reflow_action(
+        bg_action_score,
+        bg_proto_pre_mask,
+        _limited_reflow_pixels(boundary_unused_after_fg, bg_share, bg_suppress_direct_active_mask),
+        occupied_mask,
+    )
+    bg_suppress_direct_active_mask = bg_suppress_direct_active_mask | bg_from_boundary
+    reflow_added_pixels = reflow_added_pixels + bg_from_boundary_count
+
+    foreground_active_mask = fg_repair_active_mask
+    background_active_mask = bg_suppress_direct_active_mask
+    bg_suppress_active_mask = background_active_mask
+    typed_active_mask = fg_repair_active_mask | bg_suppress_direct_active_mask | boundary_active_mask
     active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
 
     background_pair_score_items = []
@@ -1644,28 +1934,11 @@ def select_rdsi_teacher_logits(
             min_pixels=0,
             max_pixels=max_bg_pixels,
         ) & raw_background_pair_mask
+    background_pair_pixels = _batch_mask_count(background_pair_active_mask)
+    reflow_added_pixels = reflow_added_pixels + background_pair_pixels
     background_active_mask = bg_suppress_direct_active_mask | background_pair_active_mask
     bg_suppress_active_mask = background_active_mask
     active_mask = foreground_active_mask | background_active_mask | boundary_active_mask
-    pre_cap_score = torch.where(
-        fg_repair_active_mask,
-        fg_proto_score,
-        torch.where(
-            background_pair_active_mask,
-            background_pair_score,
-            torch.where(bg_suppress_direct_active_mask, bg_proto_score, boundary_proto_score),
-        ),
-    )
-    budget_cap_mask = _topk_foreground_anchor(
-        pre_cap_score,
-        active_mask,
-        topk_ratio=0.0,
-        min_pixels=target_budget_pixels,
-    ) & active_mask
-    fg_repair_active_mask = fg_repair_active_mask & budget_cap_mask
-    bg_suppress_direct_active_mask = bg_suppress_direct_active_mask & budget_cap_mask
-    background_pair_active_mask = background_pair_active_mask & budget_cap_mask
-    boundary_active_mask = boundary_active_mask & budget_cap_mask
     foreground_active_mask = fg_repair_active_mask
     background_active_mask = bg_suppress_direct_active_mask | background_pair_active_mask
     bg_suppress_active_mask = background_active_mask
@@ -1828,6 +2101,17 @@ def select_rdsi_teacher_logits(
     profile["rdsi_receiver_fg_budget_share"] = fg_budget_share.mean().detach()
     profile["rdsi_receiver_bg_budget_share"] = bg_budget_share.mean().detach()
     profile["rdsi_receiver_boundary_budget_share"] = boundary_budget_share.mean().detach()
+    budget_denom = target_budget_pixels.clamp_min(1.0)
+    profile["rdsi_fg_budget_demand"] = fg_demand.mean().detach()
+    profile["rdsi_bg_budget_demand"] = bg_demand.mean().detach()
+    profile["rdsi_boundary_budget_demand"] = boundary_demand.mean().detach()
+    profile["rdsi_fg_budget_alloc"] = (fg_budget_pixels / budget_denom).mean().detach()
+    profile["rdsi_bg_budget_alloc"] = (bg_budget_pixels / budget_denom).mean().detach()
+    profile["rdsi_boundary_budget_alloc"] = (boundary_budget_pixels / budget_denom).mean().detach()
+    profile["rdsi_fg_budget_unused"] = (fg_budget_unused_pixels / budget_denom).mean().detach()
+    profile["rdsi_bg_budget_unused"] = (bg_budget_unused_pixels / budget_denom).mean().detach()
+    profile["rdsi_boundary_budget_unused"] = (boundary_budget_unused_pixels / budget_denom).mean().detach()
+    profile["rdsi_budget_reflow_ratio"] = (reflow_added_pixels / budget_denom).mean().detach()
     profile["rdsi_candidate_ratio"] = (candidate_any.float().sum() / region_sum).detach()
     profile["rdsi_accept_ratio"] = (active_mask.float().sum() / region_sum).detach()
     profile["rdsi_reject_ratio"] = ((candidate_any & (~active_mask)).float().sum() / region_sum).detach()

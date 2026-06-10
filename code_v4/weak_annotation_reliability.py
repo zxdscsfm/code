@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 @dataclass
 class WannMaps:
+    target_label: torch.Tensor
     core_mask: torch.Tensor
     soft_band: torch.Tensor
     ignore_mask: torch.Tensor
@@ -369,6 +370,7 @@ def build_wann_maps(image, label, logits, aux_logits, sup_type, img_class, num_c
     }
 
     maps = WannMaps(
+        target_label=target_label,
         core_mask=core_mask,
         soft_band=soft_band,
         ignore_mask=ignore_mask,
@@ -381,7 +383,6 @@ def build_wann_maps(image, label, logits, aux_logits, sup_type, img_class, num_c
         candidate_mask=(support_dilated | risk_mask),
         profile=profile,
     )
-    maps.target_label = target_label
     maps.class_aware = torch.tensor(1.0 if class_aware else 0.0, device=label.device)
     maps.low_confident_mask = low_confident_mask
     maps.low_agree_mask = low_agree_mask
