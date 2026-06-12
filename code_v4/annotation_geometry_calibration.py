@@ -94,15 +94,25 @@ def zero_acg_profile(device):
         "boundary_violation_share": zero,
         "shape_violation_share": zero,
         "nwr_fg_loss": zero,
+        "nwr_seed_fg_loss": zero,
+        "nwr_context_fg_loss": zero,
         "nwr_bg_loss": zero,
         "nwr_fg_weight_mass": zero,
+        "nwr_seed_fg_weight_mass": zero,
+        "nwr_context_fg_weight_mass": zero,
         "nwr_bg_weight_mass": zero,
         "nwr_fg_region_ratio": zero,
+        "nwr_seed_fg_region_ratio": zero,
+        "nwr_context_fg_region_ratio": zero,
         "nwr_bg_region_ratio": zero,
         "nwr_region_count": zero,
         "nwr_fg_prior": zero,
+        "nwr_seed_fg_prior": zero,
+        "nwr_context_fg_prior": zero,
         "nwr_bg_prior": zero,
         "nwr_pred_fg_on_fg": zero,
+        "nwr_pred_fg_on_seed_fg": zero,
+        "nwr_pred_fg_on_context_fg": zero,
         "nwr_pred_fg_on_bg": zero,
     }
 
@@ -115,22 +125,49 @@ def _normalized_region_mean(value, region, weight):
     return torch.where(denom > 0.0, numer / denom.clamp_min(1e-6), value.sum() * 0.0), denom
 
 
-def _normalized_ce_components(cur_logits, target_label, num_classes, target_fg, target_bg, geometry_weight):
+def _normalized_acg_components(cur_logits, target_label, num_classes, seed_fg, context_fg, target_fg, target_bg, geometry_weight):
     safe_target = target_label.clamp(0, max(int(num_classes) - 1, 0))
     ce_map = F.cross_entropy(cur_logits, safe_target, reduction="none")
     ce_map = torch.nan_to_num(ce_map, nan=0.0, posinf=0.0, neginf=0.0)
+    seed_fg_loss, seed_fg_weight_mass = _normalized_region_mean(ce_map, seed_fg, geometry_weight)
+    context_fg_loss, context_fg_weight_mass = _normalized_region_mean(ce_map, context_fg, geometry_weight)
     fg_loss, fg_weight_mass = _normalized_region_mean(ce_map, target_fg, geometry_weight)
     bg_loss, bg_weight_mass = _normalized_region_mean(ce_map, target_bg, geometry_weight)
-    fg_present = (fg_weight_mass > 0.0).float()
+    seed_fg_present = (seed_fg_weight_mass > 0.0).float()
+    context_fg_present = (context_fg_weight_mass > 0.0).float()
     bg_present = (bg_weight_mass > 0.0).float()
-    region_count = (fg_present + bg_present).clamp_min(1.0)
-    fg_prior_score = torch.sqrt(fg_weight_mass.clamp_min(0.0)) * fg_present
+    region_count = (seed_fg_present + context_fg_present + bg_present).clamp_min(1.0)
+    seed_fg_prior_score = torch.sqrt(seed_fg_weight_mass.clamp_min(0.0)) * seed_fg_present
+    context_fg_prior_score = torch.sqrt(context_fg_weight_mass.clamp_min(0.0)) * context_fg_present
     bg_prior_score = torch.sqrt(bg_weight_mass.clamp_min(0.0)) * bg_present
-    prior_sum = fg_prior_score + bg_prior_score
-    fg_prior = torch.where(prior_sum > 0.0, fg_prior_score / prior_sum.clamp_min(1e-6), fg_present * 0.0)
+    prior_sum = seed_fg_prior_score + context_fg_prior_score + bg_prior_score
+    seed_fg_prior = torch.where(prior_sum > 0.0, seed_fg_prior_score / prior_sum.clamp_min(1e-6), seed_fg_present * 0.0)
+    context_fg_prior = torch.where(prior_sum > 0.0, context_fg_prior_score / prior_sum.clamp_min(1e-6), context_fg_present * 0.0)
     bg_prior = torch.where(prior_sum > 0.0, bg_prior_score / prior_sum.clamp_min(1e-6), bg_present * 0.0)
-    total_loss = fg_prior * fg_loss + bg_prior * bg_loss
-    return total_loss, fg_loss, bg_loss, fg_weight_mass, bg_weight_mass, region_count, fg_prior, bg_prior
+    fg_prior = seed_fg_prior + context_fg_prior
+    calibrated_fg_loss = torch.where(
+        fg_prior > 0.0,
+        (seed_fg_prior * seed_fg_loss + context_fg_prior * context_fg_loss) / fg_prior.clamp_min(1e-6),
+        fg_loss,
+    )
+    total_loss = seed_fg_prior * seed_fg_loss + context_fg_prior * context_fg_loss + bg_prior * bg_loss
+    return {
+        "total_loss": total_loss,
+        "fg_loss": calibrated_fg_loss,
+        "raw_fg_loss": fg_loss,
+        "seed_fg_loss": seed_fg_loss,
+        "context_fg_loss": context_fg_loss,
+        "bg_loss": bg_loss,
+        "fg_weight_mass": fg_weight_mass,
+        "seed_fg_weight_mass": seed_fg_weight_mass,
+        "context_fg_weight_mass": context_fg_weight_mass,
+        "bg_weight_mass": bg_weight_mass,
+        "region_count": region_count,
+        "fg_prior": fg_prior,
+        "seed_fg_prior": seed_fg_prior,
+        "context_fg_prior": context_fg_prior,
+        "bg_prior": bg_prior,
+    }
 
 
 def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
@@ -148,37 +185,54 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
         fg_prob = prob[:, 1:int(num_classes)].sum(dim=1)
     fg_prob = torch.nan_to_num(fg_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-    target_label = getattr(wann_maps, "target_label", None)
-    if target_label is None:
-        target_label = torch.zeros_like(fg_prob, dtype=torch.long)
-    target_label = target_label.long()
+    target_label = wann_maps.target_label.long()
     valid_target = target_label != int(num_classes)
     target_fg = valid_target & (target_label > 0) & (target_label < int(num_classes))
     target_bg = valid_target & (target_label == 0)
+    seed_fg = target_fg & wann_maps.seed_support_mask.bool()
+    context_fg = target_fg & (~seed_fg)
 
     core_weight = torch.nan_to_num(wann_maps.core_weight.detach(), nan=0.0, posinf=0.0, neginf=0.0)
     soft_weight = torch.nan_to_num(wann_maps.soft_weight.detach(), nan=0.0, posinf=0.0, neginf=0.0)
     geometry_weight = torch.maximum(core_weight, soft_weight).clamp_min(0.0)
 
-    total_loss, fg_loss, bg_loss, fg_weight_mass, bg_weight_mass, region_count, fg_prior, bg_prior = _normalized_ce_components(
-        logits, target_label, num_classes, target_fg, target_bg, geometry_weight
+    acg_parts = _normalized_acg_components(
+        logits, target_label, num_classes, seed_fg, context_fg, target_fg, target_bg, geometry_weight
     )
     if aux_logits is not None:
-        aux_loss, aux_fg_loss, aux_bg_loss, _, _, _, _, _ = _normalized_ce_components(
-            aux_logits, target_label, num_classes, target_fg, target_bg, geometry_weight
+        aux_parts = _normalized_acg_components(
+            aux_logits, target_label, num_classes, seed_fg, context_fg, target_fg, target_bg, geometry_weight
         )
-        total_loss = 0.5 * (total_loss + aux_loss)
-        fg_loss = 0.5 * (fg_loss + aux_fg_loss)
-        bg_loss = 0.5 * (bg_loss + aux_bg_loss)
+        for key in ["total_loss", "fg_loss", "raw_fg_loss", "seed_fg_loss", "context_fg_loss", "bg_loss"]:
+            acg_parts[key] = 0.5 * (acg_parts[key] + aux_parts[key])
+
+    total_loss = acg_parts["total_loss"]
+    fg_loss = acg_parts["fg_loss"]
+    seed_fg_loss = acg_parts["seed_fg_loss"]
+    context_fg_loss = acg_parts["context_fg_loss"]
+    bg_loss = acg_parts["bg_loss"]
+    fg_weight_mass = acg_parts["fg_weight_mass"]
+    seed_fg_weight_mass = acg_parts["seed_fg_weight_mass"]
+    context_fg_weight_mass = acg_parts["context_fg_weight_mass"]
+    bg_weight_mass = acg_parts["bg_weight_mass"]
+    region_count = acg_parts["region_count"]
+    fg_prior = acg_parts["fg_prior"]
+    seed_fg_prior = acg_parts["seed_fg_prior"]
+    context_fg_prior = acg_parts["context_fg_prior"]
+    bg_prior = acg_parts["bg_prior"]
 
     pred_fg_mass = fg_prob.flatten(1).mean(dim=1)
     reliability = torch.nan_to_num(wann_maps.reliability.detach(), nan=0.0, posinf=0.0, neginf=0.0)
     reliability_mean = reliability.flatten(1).mean(dim=1)
     fg_region_ratio = target_fg.float().mean()
+    seed_fg_region_ratio = seed_fg.float().mean()
+    context_fg_region_ratio = context_fg.float().mean()
     bg_region_ratio = target_bg.float().mean()
     fg_weight_density = fg_weight_mass / float(max(target_fg.numel(), 1))
     bg_weight_density = bg_weight_mass / float(max(target_bg.numel(), 1))
     pred_fg_on_fg = _safe_weighted_mean(fg_prob.detach(), target_fg, geometry_weight).detach()
+    pred_fg_on_seed_fg = _safe_weighted_mean(fg_prob.detach(), seed_fg, geometry_weight).detach()
+    pred_fg_on_context_fg = _safe_weighted_mean(fg_prob.detach(), context_fg, geometry_weight).detach()
     pred_fg_on_bg = _safe_weighted_mean(fg_prob.detach(), target_bg, geometry_weight).detach()
 
     lambda_acg = 1.0
@@ -200,15 +254,25 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
         "pred_fg_core_mean": pred_fg_on_fg.detach(),
         "pred_fg_support_mean": pred_fg_on_bg.detach(),
         "nwr_fg_loss": fg_loss.detach(),
+        "nwr_seed_fg_loss": seed_fg_loss.detach(),
+        "nwr_context_fg_loss": context_fg_loss.detach(),
         "nwr_bg_loss": bg_loss.detach(),
         "nwr_fg_weight_mass": fg_weight_mass.detach(),
+        "nwr_seed_fg_weight_mass": seed_fg_weight_mass.detach(),
+        "nwr_context_fg_weight_mass": context_fg_weight_mass.detach(),
         "nwr_bg_weight_mass": bg_weight_mass.detach(),
         "nwr_fg_region_ratio": fg_region_ratio.detach(),
+        "nwr_seed_fg_region_ratio": seed_fg_region_ratio.detach(),
+        "nwr_context_fg_region_ratio": context_fg_region_ratio.detach(),
         "nwr_bg_region_ratio": bg_region_ratio.detach(),
         "nwr_region_count": region_count.detach(),
         "nwr_fg_prior": fg_prior.detach(),
+        "nwr_seed_fg_prior": seed_fg_prior.detach(),
+        "nwr_context_fg_prior": context_fg_prior.detach(),
         "nwr_bg_prior": bg_prior.detach(),
         "nwr_pred_fg_on_fg": pred_fg_on_fg.detach(),
+        "nwr_pred_fg_on_seed_fg": pred_fg_on_seed_fg.detach(),
+        "nwr_pred_fg_on_context_fg": pred_fg_on_context_fg.detach(),
         "nwr_pred_fg_on_bg": pred_fg_on_bg.detach(),
     })
     return total_loss, lambda_acg, profile
