@@ -98,7 +98,9 @@ def zero_acg_profile(device):
         "nwr_context_fg_loss": zero,
         "nwr_bg_loss": zero,
         "nwr_context_fg_target": zero,
+        "nwr_context_fg_upper_target": zero,
         "nwr_context_fg_margin_gap": zero,
+        "nwr_context_fg_over_gap": zero,
         "nwr_fg_weight_mass": zero,
         "nwr_seed_fg_weight_mass": zero,
         "nwr_context_fg_weight_mass": zero,
@@ -142,13 +144,22 @@ def _context_soft_foreground_loss(cur_logits, num_classes, context_fg, geometry_
     margin_floor = float(getattr(args, "acg_context_margin_floor", 0.35))
     margin_ceiling = float(getattr(args, "acg_context_margin_ceiling", 0.85))
     margin_ceiling = max(margin_floor, margin_ceiling)
-    target = rel.clamp(margin_floor, margin_ceiling)
-    gap = (target - fg_prob).clamp_min(0.0)
-    loss_map = gap.detach() * (-torch.log(fg_prob.clamp_min(1e-6)))
+    band_width = float(getattr(args, "acg_context_band_width", 0.15))
+    over_weight = float(getattr(args, "acg_context_band_over_weight", 0.25))
+    lower_target = rel.clamp(margin_floor, margin_ceiling)
+    upper_target = (lower_target + band_width).clamp(max=margin_ceiling)
+    under_gap = (lower_target - fg_prob).clamp_min(0.0)
+    over_gap = (fg_prob - upper_target).clamp_min(0.0)
+    loss_map = (
+        under_gap.detach() * (-torch.log(fg_prob.clamp_min(1e-6)))
+        + over_weight * over_gap.detach() * (-torch.log((1.0 - fg_prob).clamp_min(1e-6)))
+    )
     context_loss, context_weight_mass = _normalized_region_mean(loss_map, context_fg, geometry_weight)
-    context_target, _ = _normalized_region_mean(target, context_fg, geometry_weight)
-    context_gap, _ = _normalized_region_mean(gap, context_fg, geometry_weight)
-    return context_loss, context_weight_mass, context_target, context_gap
+    context_target, _ = _normalized_region_mean(lower_target, context_fg, geometry_weight)
+    context_upper_target, _ = _normalized_region_mean(upper_target, context_fg, geometry_weight)
+    context_gap, _ = _normalized_region_mean(under_gap, context_fg, geometry_weight)
+    context_over_gap, _ = _normalized_region_mean(over_gap, context_fg, geometry_weight)
+    return context_loss, context_weight_mass, context_target, context_upper_target, context_gap, context_over_gap
 
 
 def _normalized_acg_components(
@@ -169,9 +180,18 @@ def _normalized_acg_components(
     seed_fg_loss, seed_fg_weight_mass = _normalized_region_mean(ce_map, seed_fg, geometry_weight)
     context_fg_loss, context_fg_weight_mass = _normalized_region_mean(ce_map, context_fg, geometry_weight)
     context_fg_target = context_fg_loss.detach() * 0.0
+    context_fg_upper_target = context_fg_loss.detach() * 0.0
     context_fg_margin_gap = context_fg_loss.detach() * 0.0
+    context_fg_over_gap = context_fg_loss.detach() * 0.0
     if int(getattr(args, "acg_context_soft_foreground", 0)) == 1:
-        context_fg_loss, context_fg_weight_mass, context_fg_target, context_fg_margin_gap = (
+        (
+            context_fg_loss,
+            context_fg_weight_mass,
+            context_fg_target,
+            context_fg_upper_target,
+            context_fg_margin_gap,
+            context_fg_over_gap,
+        ) = (
             _context_soft_foreground_loss(cur_logits, num_classes, context_fg, geometry_weight, reliability, args)
         )
     fg_loss, fg_weight_mass = _normalized_region_mean(ce_map, target_fg, geometry_weight)
@@ -202,7 +222,9 @@ def _normalized_acg_components(
         "context_fg_loss": context_fg_loss,
         "bg_loss": bg_loss,
         "context_fg_target": context_fg_target,
+        "context_fg_upper_target": context_fg_upper_target,
         "context_fg_margin_gap": context_fg_margin_gap,
+        "context_fg_over_gap": context_fg_over_gap,
         "fg_weight_mass": fg_weight_mass,
         "seed_fg_weight_mass": seed_fg_weight_mass,
         "context_fg_weight_mass": context_fg_weight_mass,
@@ -257,7 +279,9 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
             "context_fg_loss",
             "bg_loss",
             "context_fg_target",
+            "context_fg_upper_target",
             "context_fg_margin_gap",
+            "context_fg_over_gap",
         ]:
             acg_parts[key] = 0.5 * (acg_parts[key] + aux_parts[key])
 
@@ -267,7 +291,9 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
     context_fg_loss = acg_parts["context_fg_loss"]
     bg_loss = acg_parts["bg_loss"]
     context_fg_target = acg_parts["context_fg_target"]
+    context_fg_upper_target = acg_parts["context_fg_upper_target"]
     context_fg_margin_gap = acg_parts["context_fg_margin_gap"]
+    context_fg_over_gap = acg_parts["context_fg_over_gap"]
     fg_weight_mass = acg_parts["fg_weight_mass"]
     seed_fg_weight_mass = acg_parts["seed_fg_weight_mass"]
     context_fg_weight_mass = acg_parts["context_fg_weight_mass"]
@@ -314,7 +340,9 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
         "nwr_context_fg_loss": context_fg_loss.detach(),
         "nwr_bg_loss": bg_loss.detach(),
         "nwr_context_fg_target": context_fg_target.detach(),
+        "nwr_context_fg_upper_target": context_fg_upper_target.detach(),
         "nwr_context_fg_margin_gap": context_fg_margin_gap.detach(),
+        "nwr_context_fg_over_gap": context_fg_over_gap.detach(),
         "nwr_fg_weight_mass": fg_weight_mass.detach(),
         "nwr_seed_fg_weight_mass": seed_fg_weight_mass.detach(),
         "nwr_context_fg_weight_mass": context_fg_weight_mass.detach(),

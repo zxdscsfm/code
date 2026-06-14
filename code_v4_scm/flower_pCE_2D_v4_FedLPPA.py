@@ -256,8 +256,14 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
             'acg_nwr_context_fg_loss=%.6f' % _scalar_float(acg_profile.get('nwr_context_fg_loss', 0.0)),
             'acg_nwr_bg_loss=%.6f' % _scalar_float(acg_profile.get('nwr_bg_loss', 0.0)),
             'acg_nwr_context_fg_target=%.6f' % _scalar_float(acg_profile.get('nwr_context_fg_target', 0.0)),
+            'acg_nwr_context_fg_upper_target=%.6f' % _scalar_float(
+                acg_profile.get('nwr_context_fg_upper_target', 0.0)
+            ),
             'acg_nwr_context_fg_margin_gap=%.6f' % _scalar_float(
                 acg_profile.get('nwr_context_fg_margin_gap', 0.0)
+            ),
+            'acg_nwr_context_fg_over_gap=%.6f' % _scalar_float(
+                acg_profile.get('nwr_context_fg_over_gap', 0.0)
             ),
             'acg_nwr_fg_mass=%.6f' % _scalar_float(acg_profile.get('nwr_fg_weight_mass', 0.0)),
             'acg_nwr_seed_fg_mass=%.6f' % _scalar_float(acg_profile.get('nwr_seed_fg_weight_mass', 0.0)),
@@ -2111,6 +2117,10 @@ def main():
                         help='Minimum foreground probability target for ACG context foreground')
     parser.add_argument('--acg_context_margin_ceiling', type=float, default=0.85,
                         help='Maximum foreground probability target for ACG context foreground')
+    parser.add_argument('--acg_context_band_width', type=float, default=0.15,
+                        help='Reliability-bounded context foreground band width above the lower target')
+    parser.add_argument('--acg_context_band_over_weight', type=float, default=0.25,
+                        help='Relative penalty for context foreground probability above the reliability band')
     parser.add_argument('--rgftd_enabled', type=int, default=0,
                         help='Enable reliability-gated federated teacher distillation')
     parser.add_argument('--rgftd_lambda', type=float, default=0.1,
@@ -2475,6 +2485,8 @@ def main():
     assert 0.0 <= args.acg_context_margin_floor <= 1.0
     assert 0.0 <= args.acg_context_margin_ceiling <= 1.0
     assert args.acg_context_margin_floor <= args.acg_context_margin_ceiling
+    assert args.acg_context_band_width >= 0.0
+    assert args.acg_context_band_over_weight >= 0.0
     if args.acg_enabled == 1:
         assert args.wann_enabled == 1
     assert args.rgftd_enabled in [0, 1]
@@ -2794,7 +2806,9 @@ def main():
                 'acg_nwr_context_fg_loss',
                 'acg_nwr_bg_loss',
                 'acg_nwr_context_fg_target',
+                'acg_nwr_context_fg_upper_target',
                 'acg_nwr_context_fg_margin_gap',
+                'acg_nwr_context_fg_over_gap',
                 'acg_nwr_fg_weight_mass',
                 'acg_nwr_seed_fg_weight_mass',
                 'acg_nwr_context_fg_weight_mass',

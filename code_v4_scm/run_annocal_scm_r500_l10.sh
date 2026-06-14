@@ -184,6 +184,8 @@ BASE_ARGS="\
 --acg_context_soft_foreground 1 \
 --acg_context_margin_floor 0.35 \
 --acg_context_margin_ceiling 0.85 \
+--acg_context_band_width 0.15 \
+--acg_context_band_over_weight 0.25 \
 --rgftd_enabled 0 \
 --rgftd_v3_enabled 0 \
 ${EXTRA_ARGS}"
