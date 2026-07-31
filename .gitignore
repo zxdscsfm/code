@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local experiment artifacts
+logs/
+model/
+models/
+checkpoints/
+snapshot*/
+runs/
+wandb/
+*.pth
+*.pt
+*.ckpt
+*.log
+*.out
+*.err
+
+# Data are not redistributed in this repository.
+data/
+datasets/
+*_h5/
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.npy
+*.npz
+
+# Local machine configuration
+.env
+local_*.sh
+*.local
