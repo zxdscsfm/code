@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from weak_annotation_reliability import WannMaps
+
 
 def _zero_like_scalar(logits):
     return logits.sum() * 0.0
@@ -130,6 +132,10 @@ def zero_acg_profile(device):
         "agc_from_connected_ratio": zero,
         "agc_completed_context_ratio": zero,
         "agc_pred_fg_on_completed_context": zero,
+        "agc_spatial_rule_id": zero,
+        "agc_disable_cap": zero,
+        "agc_disable_conf_gate": zero,
+        "agc_complete_as_seed": zero,
     }
 
 
@@ -218,13 +224,17 @@ def _build_agc_completion(fg_prob, target_fg, target_bg, seed_fg, context_fg, wa
         "agc_from_connected_ratio": zero,
         "agc_completed_context_ratio": context_fg.float().mean().detach(),
         "agc_pred_fg_on_completed_context": _safe_weighted_mean(fg_prob.detach(), context_fg).detach(),
+        "agc_spatial_rule_id": zero,
+        "agc_disable_cap": torch.tensor(float(int(getattr(args, "agc_disable_cap", 0)) == 1), device=device),
+        "agc_disable_conf_gate": torch.tensor(float(int(getattr(args, "agc_disable_conf_gate", 0)) == 1), device=device),
+        "agc_complete_as_seed": torch.tensor(float(int(getattr(args, "agc_complete_as_seed", 0)) == 1), device=device),
     }
     if int(getattr(args, "agc_enabled", 0)) != 1:
-        return context_fg, target_fg, None, None, profile
+        return seed_fg, context_fg, target_fg, None, None, profile
 
     ramp = _agc_ramp(iter_num, args)
     if ramp <= 0.0:
-        return context_fg, target_fg, None, None, profile
+        return seed_fg, context_fg, target_fg, None, None, profile
 
     mode = str(getattr(args, "agc_mode", "conservative")).lower()
     if mode == "moderate":
@@ -246,21 +256,53 @@ def _build_agc_completion(fg_prob, target_fg, target_bg, seed_fg, context_fg, wa
     support_fg = wann_maps.support_mask.bool() & target_fg
     anchor_fg = seed_fg | support_fg
     pred_candidate = fg_prob.detach() >= tau
-    connected = _connected_to_anchor(pred_candidate, anchor_fg, int(getattr(args, "agc_connect_steps", 64)))
-    if require_mode == "or":
+    confidence_gate = torch.ones_like(pred_candidate, dtype=torch.bool)
+    if int(getattr(args, "agc_disable_conf_gate", 0)) != 1:
+        confidence_gate = pred_candidate
+    connected_source = pred_candidate
+    if int(getattr(args, "agc_disable_conf_gate", 0)) == 1:
+        connected_source = torch.ones_like(pred_candidate, dtype=torch.bool)
+    connected = _connected_to_anchor(connected_source, anchor_fg, int(getattr(args, "agc_connect_steps", 64)))
+    spatial_rule = str(getattr(args, "agc_spatial_rule", "mode")).lower()
+    spatial_rule_id = 0.0
+    if spatial_rule == "confidence_only":
+        spatial_safe = torch.ones_like(pred_candidate, dtype=torch.bool)
+        spatial_rule_id = 1.0
+    elif spatial_rule == "candidate_only":
+        spatial_safe = candidate
+        spatial_rule_id = 2.0
+    elif spatial_rule == "connected_only":
+        spatial_safe = connected
+        spatial_rule_id = 3.0
+    elif spatial_rule == "candidate_or_connected":
+        spatial_safe = candidate | connected
+        spatial_rule_id = 4.0
+    elif spatial_rule == "candidate_and_connected":
+        spatial_safe = candidate & connected
+        spatial_rule_id = 5.0
+    elif require_mode == "or":
         spatial_safe = candidate | connected
     else:
         spatial_safe = candidate & connected
 
     hard_bg = target_bg & wann_maps.seed_support_mask.bool()
-    safe = pred_candidate & spatial_safe & (~target_fg) & (~hard_bg)
+    safe = confidence_gate & spatial_safe & (~target_fg) & (~hard_bg)
     target_pixels = float(target_fg.detach().sum().item())
-    safe, pre_cap_pixels, cap_hit = _topk_mask_per_image(
-        fg_prob.detach(), safe, max_target_mult, max_image_ratio, target_fg
-    )
+    if int(getattr(args, "agc_disable_cap", 0)) == 1:
+        pre_cap_pixels = int(safe.detach().sum().item())
+        cap_hit = False
+    else:
+        safe, pre_cap_pixels, cap_hit = _topk_mask_per_image(
+            fg_prob.detach(), safe, max_target_mult, max_image_ratio, target_fg
+        )
 
-    completed_context = context_fg | safe
-    completed_target_fg = seed_fg | completed_context
+    if int(getattr(args, "agc_complete_as_seed", 0)) == 1:
+        completed_seed = seed_fg | safe
+        completed_context = context_fg
+    else:
+        completed_seed = seed_fg
+        completed_context = context_fg | safe
+    completed_target_fg = completed_seed | completed_context
     completion_weight_map = torch.zeros_like(fg_prob.detach())
     completion_reliability_map = torch.zeros_like(fg_prob.detach())
     if safe.any():
@@ -279,8 +321,96 @@ def _build_agc_completion(fg_prob, target_fg, target_bg, seed_fg, context_fg, wa
         "agc_from_connected_ratio": _safe_weighted_mean(connected.float(), safe).detach(),
         "agc_completed_context_ratio": completed_context.float().mean().detach(),
         "agc_pred_fg_on_completed_context": _safe_weighted_mean(fg_prob.detach(), completed_context).detach(),
+        "agc_spatial_rule_id": torch.tensor(float(spatial_rule_id), device=device),
+        "agc_disable_cap": torch.tensor(float(int(getattr(args, "agc_disable_cap", 0)) == 1), device=device),
+        "agc_disable_conf_gate": torch.tensor(float(int(getattr(args, "agc_disable_conf_gate", 0)) == 1), device=device),
+        "agc_complete_as_seed": torch.tensor(float(int(getattr(args, "agc_complete_as_seed", 0)) == 1), device=device),
     })
-    return completed_context, completed_target_fg, completion_weight_map, completion_reliability_map, profile
+    return completed_seed, completed_context, completed_target_fg, completion_weight_map, completion_reliability_map, profile
+
+
+def complete_wann_maps_with_agc(logits, wann_maps, args, iter_num):
+    """Apply AGC completion to WANN maps without switching to NWR/ACG loss."""
+    if wann_maps is None or int(getattr(args, "agc_enabled", 0)) != 1:
+        return wann_maps, zero_acg_profile(logits.device)
+
+    num_classes = int(getattr(args, "num_classes", logits.shape[1]))
+    prob = torch.softmax(logits, dim=1)
+    if num_classes <= 1:
+        fg_prob = prob[:, 0]
+    else:
+        fg_prob = prob[:, 1:int(num_classes)].sum(dim=1)
+    fg_prob = torch.nan_to_num(fg_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    target_label = wann_maps.target_label.long()
+    valid_target = target_label != int(num_classes)
+    target_fg = valid_target & (target_label > 0) & (target_label < int(num_classes))
+    target_bg = valid_target & (target_label == 0)
+    seed_fg = target_fg & wann_maps.seed_support_mask.bool()
+    context_fg = target_fg & (~seed_fg)
+
+    _, _, completed_target_fg, agc_weight_map, agc_reliability_map, agc_profile = _build_agc_completion(
+        fg_prob, target_fg, target_bg, seed_fg, context_fg, wann_maps, args, iter_num
+    )
+    completed_pixels = completed_target_fg & (~target_fg)
+    if not completed_pixels.any():
+        profile = dict(wann_maps.profile)
+        for key, value in agc_profile.items():
+            profile[key] = value
+        return WannMaps(
+            target_label=wann_maps.target_label,
+            core_mask=wann_maps.core_mask,
+            soft_band=wann_maps.soft_band,
+            ignore_mask=wann_maps.ignore_mask,
+            reliability=wann_maps.reliability,
+            core_weight=wann_maps.core_weight,
+            soft_weight=wann_maps.soft_weight,
+            valid_mask=wann_maps.valid_mask,
+            support_mask=wann_maps.support_mask,
+            seed_support_mask=wann_maps.seed_support_mask,
+            candidate_mask=wann_maps.candidate_mask,
+            profile=profile,
+        ), agc_profile
+
+    completed_label = wann_maps.target_label.clone()
+    completed_label[completed_pixels] = 1
+    completed_core_mask = wann_maps.core_mask | completed_pixels
+    completed_support_mask = wann_maps.support_mask | completed_pixels
+    completed_ignore_mask = wann_maps.ignore_mask & (~completed_pixels)
+
+    completed_core_weight = wann_maps.core_weight
+    if agc_weight_map is not None:
+        completed_core_weight = torch.maximum(
+            completed_core_weight,
+            torch.nan_to_num(agc_weight_map, nan=0.0, posinf=0.0, neginf=0.0),
+        )
+
+    completed_reliability = wann_maps.reliability
+    if agc_reliability_map is not None:
+        completed_reliability = torch.maximum(
+            completed_reliability,
+            torch.nan_to_num(agc_reliability_map, nan=0.0, posinf=0.0, neginf=0.0),
+        ).clamp(0.0, 1.0)
+
+    profile = dict(wann_maps.profile)
+    for key, value in agc_profile.items():
+        profile[key] = value
+    profile["agc_only_completed_ratio"] = completed_pixels.float().mean().detach()
+
+    return WannMaps(
+        target_label=completed_label,
+        core_mask=completed_core_mask,
+        soft_band=wann_maps.soft_band,
+        ignore_mask=completed_ignore_mask,
+        reliability=completed_reliability,
+        core_weight=completed_core_weight,
+        soft_weight=wann_maps.soft_weight,
+        valid_mask=wann_maps.valid_mask,
+        support_mask=completed_support_mask,
+        seed_support_mask=wann_maps.seed_support_mask,
+        candidate_mask=wann_maps.candidate_mask,
+        profile=profile,
+    ), agc_profile
 
 
 def _context_soft_foreground_loss(cur_logits, num_classes, context_fg, geometry_weight, reliability, args):
@@ -429,6 +559,7 @@ def acg_loss(logits, aux_logits, wann_maps, args, iter_num):
     reliability = torch.nan_to_num(wann_maps.reliability.detach(), nan=0.0, posinf=0.0, neginf=0.0)
 
     (
+        seed_fg,
         context_fg,
         target_fg,
         agc_weight_map,

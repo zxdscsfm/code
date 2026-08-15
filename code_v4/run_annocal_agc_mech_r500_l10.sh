@@ -3,14 +3,13 @@
 
 set -euo pipefail
 
-CONDA_PATH="${CONDA_PATH:-$HOME/anaconda3}"
-CONDA_ENV="${CONDA_ENV:-fed39v2}"
+export CONDA_PATH="/data/jianbingshen/yanghongji/anaconda3"
 source "${CONDA_PATH}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV}"
+conda activate fed39v2
 export PYTHONUNBUFFERED=1
 
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-CODE_DIR="${REPO_ROOT}/code_v4"
+REPO_ROOT="/data/jianbingshen/yanghongji/FedLPPA_Original"
+CODE_DIR="${CODE_DIR:-/home/yc47942/fl_run/code_v6_learnable_nwr}"
 
 cd "${CODE_DIR}"
 mkdir -p logs
@@ -122,7 +121,7 @@ else
     AGC_TAG="agcc"
 fi
 
-RUN_PREFIX="${RUN_PREFIX:-annocal_${AGC_TAG}_${DATASET}_r500_l10}"
+RUN_PREFIX="${RUN_PREFIX:-annocal_learnnwr_${AGC_TAG}_${DATASET}_r500_l10}"
 case "${DATASET}_${AGC_MODE}" in
     prostate_conservative)
         DEFAULT_SERVER_ADDRESS="127.0.0.1:8951"
@@ -191,6 +190,14 @@ TSNE_ITERS="${TSNE_ITERS:-0}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-12}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+GPU_COUNT="${GPU_COUNT:-3}"
+
+case "${GPU_COUNT}" in
+    2) CLIENT_GPU_MAP=(0 0 0 1 1 1) ;;
+    3) CLIENT_GPU_MAP=(0 0 1 1 2 2) ;;
+    4) CLIENT_GPU_MAP=(1 1 2 2 3 3) ;;
+    *) echo "GPU_COUNT must be 2, 3, or 4"; exit 1 ;;
+esac
 
 RUN_TAG="${RUN_PREFIX}_$(date +%Y%m%d_%H%M%S)_seed${SEED}"
 EXP_NAME="${DATASET}/FedLPPA_${RUN_TAG}"
@@ -226,6 +233,13 @@ BASE_ARGS="\
 --save_code_snapshot 0 \
 --save_checkpoint_copies 0 \
 --ala_max_epochs ${ALA_MAX_EPOCHS:-500} \
+--disable_ala ${DISABLE_ALA:-1} \
+--learnable_nwr_enabled ${LEARNABLE_NWR_ENABLED:-1} \
+--learnable_nwr_hidden_dim ${LEARNABLE_NWR_HIDDEN_DIM:-16} \
+--learnable_nwr_lr ${LEARNABLE_NWR_LR:-0.001} \
+--learnable_nwr_tau ${LEARNABLE_NWR_TAU:-1.0} \
+--learnable_nwr_meta_temp ${LEARNABLE_NWR_META_TEMP:-0.05} \
+--learnable_nwr_meta_fraction ${LEARNABLE_NWR_META_FRACTION:-0.1} \
 --wann_enabled 1 \
 --wann_core_thresh 0.65 \
 --wann_soft_thresh 0.25 \
@@ -292,6 +306,7 @@ echo "LOG_DIR=${LOG_DIR}"
 echo "SERVER_ADDRESS=${SERVER_ADDRESS}"
 echo "ROOT_PATH=${ROOT_PATH}"
 echo "SUP_TYPES=${SUP_TYPES[*]}"
+echo "GPU_COUNT=${GPU_COUNT}"
 
 python -u flower_pCE_2D_v4_FedLPPA.py ${BASE_ARGS} --role server --client client_all --sup_type mask --gpu 0 > "${LOG_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -323,7 +338,7 @@ if [ "${SERVER_READY}" -ne 1 ]; then
 fi
 
 for idx in "${!CLIENTS[@]}"; do
-    launch_flower_client "${idx}" "${CLIENTS[$idx]}" "${SUP_TYPES[$idx]}" "$((idx + 1))" "${LOG_DIR}/client${idx}.log"
+    launch_flower_client "${idx}" "${CLIENTS[$idx]}" "${SUP_TYPES[$idx]}" "${CLIENT_GPU_MAP[$idx]}" "${LOG_DIR}/client${idx}.log"
 done
 
 monitor_flower_processes

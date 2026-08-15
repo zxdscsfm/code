@@ -18,7 +18,7 @@ from tensorboardX import SummaryWriter
 from torch.nn import BCEWithLogitsLoss
 from torch.nn.modules.loss import CrossEntropyLoss, KLDivLoss, MSELoss, L1Loss
 from info_nce import InfoNCE
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 import flwr as fl
@@ -560,8 +560,9 @@ def _format_wann_rgftd_log(cid, iter_num, wann_maps, lambda_rgftd, rgftd_profile
 
 class MyClient(BaseClient):
 
-    def __init__(self, args, model, trainloader, valloader, amp=False):
+    def __init__(self, args, model, trainloader, valloader, meta_valloader=None, amp=False):
         super(MyClient, self).__init__(args, model, trainloader, valloader)
+        self.meta_valloader = meta_valloader
         self.amp = amp
         if self.amp:
             self.scaler = GradScaler()
@@ -584,6 +585,33 @@ class MyClient(BaseClient):
         self.rgftd_stable_last_wann_lowmaxp = None
         self.rgftd_stable_snapshot_arrays = None
         self.rgftd_stable_pending_upload = False
+
+    def _validate(self, config):
+        if config.get('stage', '') == 'learnable_nwr_meta':
+            return self._validate_learnable_nwr_meta(config)
+        return super()._validate(config)
+
+    def _validate_learnable_nwr_meta(self, config):
+        del config
+        if self.meta_valloader is None:
+            raise RuntimeError('learnable NWR meta-validation loader is required')
+        self.model.eval()
+        ce_loss = CrossEntropyLoss(ignore_index=self.args.num_classes, reduction='sum')
+        total_loss = 0.0
+        total_pixels = 0.0
+        with torch.no_grad():
+            for sampled_batch in self.meta_valloader:
+                volume_batch, label_batch = self._move_batch_to_cuda(sampled_batch)
+                logits = _primary_logits(self.model(volume_batch))
+                valid = label_batch != self.args.num_classes
+                loss = ce_loss(logits, label_batch.long())
+                total_loss += float(loss.detach().cpu().item())
+                total_pixels += float(valid.float().sum().detach().cpu().item())
+        meta_loss = total_loss / max(total_pixels, 1.0)
+        metrics_ = {
+            'client_{}_learnable_nwr_meta_loss'.format(self.cid): meta_loss,
+        }
+        return meta_loss, metrics_
 
     def _rgftd_v3_enabled(self):
         return (
@@ -2017,16 +2045,26 @@ def main():
                         help='Whether use label prompt for FedUniV2/FedUniV2.1')
     parser.add_argument('--ala_max_epochs', type=int, default=0,
                         help='Maximum ALA initialization epochs; <=0 keeps the original unbounded behavior')
+    parser.add_argument('--disable_ala', type=int, default=0,
+                        help='Skip ALA/FedALA local interpolation when set to 1')
     parser.add_argument('--disable_tensorboard', type=int, default=0,
                         help='Disable TensorBoard event writing when set to 1')
+    parser.add_argument('--learnable_nwr_enabled', type=int, default=0,
+                        help='Enable direct learnable NWR client aggregation')
+    parser.add_argument('--learnable_nwr_hidden_dim', type=int, default=16,
+                        help='Hidden dimension of the shared learnable NWR MLP')
+    parser.add_argument('--learnable_nwr_lr', type=float, default=1e-3,
+                        help='Learning rate for the server-side learnable NWR MLP')
+    parser.add_argument('--learnable_nwr_tau', type=float, default=1.0,
+                        help='Softmax temperature for direct learnable NWR aggregation weights')
+    parser.add_argument('--learnable_nwr_meta_temp', type=float, default=0.05,
+                        help='Temperature for converting marginal meta-loss contributions into learnable NWR targets')
+    parser.add_argument('--learnable_nwr_meta_fraction', type=float, default=0.1,
+                        help='Fraction of each client training set reserved for learnable NWR meta-validation')
     parser.add_argument('--save_code_snapshot', type=int, default=1,
                         help='Copy code into snapshot_path/code when set to 1')
     parser.add_argument('--save_checkpoint_copies', type=int, default=1,
                         help='Save per-iteration checkpoint copies when set to 1; best_model files are still updated')
-    parser.add_argument('--save_best_models', type=int, default=1,
-                        help='Save server and personalized client best_model files when set to 1')
-    parser.add_argument('--save_final_models', type=int, default=1,
-                        help='Save server and personalized client final model files when set to 1')
     # client
     parser.add_argument('--cid', type=int, default=0, help='Client CID (no default)')
 
@@ -2464,8 +2502,8 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
 
-    model_root = os.environ.get('ANNOCAL_MODEL_ROOT', './model')
-    snapshot_path = os.path.join(model_root, args.exp)
+    snapshot_path = '../model/{}'.format(
+        args.exp)
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     setattr(args, 'snapshot_path', snapshot_path)
@@ -2516,6 +2554,13 @@ def main():
     assert args.sup_type in valid_sup_types or str(args.sup_type).startswith('sparse_scribble_')
     assert args.wann_enabled in [0, 1]
     assert args.ala_max_epochs >= 0
+    assert args.disable_ala in [0, 1]
+    assert args.learnable_nwr_enabled in [0, 1]
+    assert args.learnable_nwr_hidden_dim > 0
+    assert args.learnable_nwr_lr > 0.0
+    assert args.learnable_nwr_tau > 0.0
+    assert args.learnable_nwr_meta_temp > 0.0
+    assert 0.0 < args.learnable_nwr_meta_fraction < 1.0
     assert 0.0 <= args.wann_soft_thresh <= args.wann_core_thresh <= args.wann_r_max
     assert 0.0 <= args.wann_core_min_weight <= args.wann_r_max
     assert 0.0 <= args.wann_dilated_support_score <= 1.0
@@ -2738,11 +2783,34 @@ def main():
     log(INFO, 'Arguments: {}'.format(args))
 
     # Load model and data
-    db_train = BaseDataSets(base_dir=args.root_path, split='train', transform=transforms.Compose([
+    db_train_full = BaseDataSets(base_dir=args.root_path, split='train', transform=transforms.Compose([
         RandomGenerator(args.patch_size, img_class=args.img_class)
     ]), client=args.client, sup_type=args.sup_type, img_class=args.img_class)
+    db_meta_full = BaseDataSets(
+        base_dir=args.root_path,
+        split='train',
+        transform=None,
+        client=args.client,
+        sup_type=args.sup_type,
+        img_class=args.img_class,
+    )
     db_val = BaseDataSets(base_dir=args.root_path,
                           client=args.client, split='val', img_class=args.img_class)
+
+    if args.learnable_nwr_enabled == 1:
+        indices = list(range(len(db_train_full)))
+        split_rng = random.Random(args.seed + int(args.cid) * 1009)
+        split_rng.shuffle(indices)
+        meta_count = int(round(len(indices) * args.learnable_nwr_meta_fraction))
+        assert 0 < meta_count < len(indices)
+        meta_indices = sorted(indices[:meta_count])
+        train_indices = sorted(indices[meta_count:])
+        db_train = Subset(db_train_full, train_indices)
+        db_meta = Subset(db_meta_full, meta_indices)
+        print('learnable NWR meta split: train {} meta {}'.format(len(db_train), len(db_meta)))
+    else:
+        db_train = db_train_full
+        db_meta = None
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -2750,6 +2818,9 @@ def main():
     drop_last = True if args.strategy in ['FedUni', 'FedUniV2', 'FedUniV2.1'] else False
     trainloader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True,
                              num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn, drop_last=drop_last)
+    meta_valloader = None
+    if db_meta is not None:
+        meta_valloader = DataLoader(db_meta, batch_size=1, shuffle=False, num_workers=0)
     valloader = DataLoader(db_val, batch_size=1, shuffle=False,
                            num_workers=0)
 
@@ -3206,7 +3277,7 @@ def main():
             config=ServerConfig(num_rounds=args.max_iterations, round_timeout=None)
         )
     else:
-        client = MyClient(args, model, trainloader, valloader, amp=(args.amp == 1))
+        client = MyClient(args, model, trainloader, valloader, meta_valloader=meta_valloader, amp=(args.amp == 1))
         fl.client.start_client(server_address=args.server_address, client=client)
 
 

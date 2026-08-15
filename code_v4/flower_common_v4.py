@@ -96,10 +96,14 @@ class BaseClient(fl.client.Client):
         self.model.set_weights(weights, config)
         loss, metrics_ = self._validate(config)
 
+        num_examples = len(self.valloader)
+        if config.get('stage', '') == 'learnable_nwr_meta' and hasattr(self, 'meta_valloader'):
+            num_examples = len(self.meta_valloader.dataset)
+
         return EvaluateRes(
             status=Status('OK', 'Success'),
             loss=loss,
-            num_examples=len(self.valloader),
+            num_examples=num_examples,
             metrics=metrics_
         )
 
@@ -241,6 +245,21 @@ def tsne(n_components, data, label, site_labels):
 VAL_METRICS = ['dice', 'hd95', 'recall', 'precision', 'jc', 'specificity', 'ravd']
 
 
+class LearnableNWRMLP(nn.Module):
+    def __init__(self, in_dim=8, hidden_dim=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, features):
+        return self.net(features).squeeze(-1)
+
+
 def _unpack_rgftd_stable_snapshot(blob):
     with np.load(io.BytesIO(blob)) as payload:
         keys = sorted(payload.files, key=lambda item: int(item.split('_')[-1]))
@@ -332,6 +351,20 @@ class MyServer(Server):
         self.rgftd_stable_teacher_valids = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
         self.rgftd_stable_teacher_scores = np.zeros(int(getattr(args, 'min_num_clients', 0)), dtype=np.float32)
         self._missing_train_metric_warnings = set()
+        self.learnable_nwr = None
+        self.learnable_nwr_optimizer = None
+        self.learnable_nwr_last_fit = None
+        self.learnable_nwr_last_losses = {}
+        self.learnable_nwr_last_protocols = {}
+        if self._learnable_nwr_enabled():
+            self.learnable_nwr = LearnableNWRMLP(
+                in_dim=8,
+                hidden_dim=int(getattr(args, 'learnable_nwr_hidden_dim', 16)),
+            )
+            self.learnable_nwr_optimizer = torch.optim.Adam(
+                self.learnable_nwr.parameters(),
+                lr=float(getattr(args, 'learnable_nwr_lr', 1e-3)),
+            )
 
     # pylint: disable=too-many-locals
     def fit(self, num_rounds, timeout):
@@ -446,6 +479,12 @@ class MyServer(Server):
             parameters_prime, metrics_prime, (results_prime, failtures_prime) = res_fit
             if getattr(self.args, 'wann_enabled', 0) == 1:
                 self._append_wann_update_diagnostics(metrics_prime, results_prime, parameters_before_fit)
+            if self._learnable_nwr_enabled() and self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
+                parameters_prime = self._aggregate_with_learnable_nwr(
+                    iter_num,
+                    results_prime,
+                    metrics_prime,
+                )
             self.parameters = parameters_prime
             if self._rgftd_enabled():
                 if self._rgftd_v3_enabled():
@@ -581,6 +620,8 @@ class MyServer(Server):
 
                 val_mean_dice = mean_metrics['val_mean_dice']
                 log(INFO, metric_log)
+                if self._learnable_nwr_enabled() and self.args.strategy in ['FedUniV2', 'FedUniV2.1']:
+                    self._update_learnable_nwr_from_meta(iter_num, timeout)
 
                 if val_mean_dice > best_performance:
                     best_performance = val_mean_dice
@@ -778,6 +819,155 @@ class MyServer(Server):
     def _rgftd_v3_stable_enabled(self):
         return self._rgftd_v3_enabled() and int(getattr(self.args, 'rgftd_v3_stable_teacher_enabled', 0)) == 1
 
+    def _learnable_nwr_enabled(self):
+        return int(getattr(self.args, 'learnable_nwr_enabled', 0)) == 1
+
+    def _collect_client_fit_items(self, results_prime):
+        items = []
+        for _, fit_res in results_prime:
+            client_id = self._client_id_from_fit_metrics(fit_res.metrics)
+            if client_id is not None:
+                items.append((client_id, fit_res))
+        items.sort(key=lambda item: item[0])
+        return items
+
+    def _build_learnable_nwr_inputs(self, iter_num, client_items, metrics_prime):
+        feature_rows = []
+        for client_id, fit_res in client_items:
+            n_i = float(fit_res.num_examples)
+            q_i = float(metrics_prime['client_{}_wann_effective_supervision_mass'.format(client_id)])
+            loss_i = float(metrics_prime['client_{}_total_loss'.format(client_id)])
+            last_loss = self.learnable_nwr_last_losses.get(client_id, loss_i)
+            delta_loss = loss_i - float(last_loss)
+            update_norm = float(metrics_prime['client_{}_wann_update_norm'.format(client_id)])
+            update_alignment = float(metrics_prime['client_{}_wann_update_cos_loo'.format(client_id)])
+            progress = float(iter_num) / max(float(self.args.max_iterations), 1.0)
+            sparse_protocol = float(metrics_prime.get('client_{}_wann_sparse_seed_protocol'.format(client_id), 0.0))
+            block_protocol = float(metrics_prime.get('client_{}_wann_block_like_protocol'.format(client_id), 0.0))
+            protocol_id = sparse_protocol + 2.0 * block_protocol
+            feature_rows.append([
+                math.log(max(n_i, 1.0)) / 10.0,
+                q_i,
+                protocol_id,
+                loss_i,
+                delta_loss,
+                math.log1p(max(update_norm, 0.0)) / 12.0,
+                update_alignment,
+                progress,
+            ])
+        features = torch.tensor(feature_rows, dtype=torch.float32)
+        return features
+
+    def _learnable_nwr_alpha(self, features):
+        tau = float(getattr(self.args, 'learnable_nwr_tau', 1.0))
+        logits = self.learnable_nwr(features)
+        alpha = torch.softmax(logits / tau, dim=0)
+        return alpha, logits
+
+    def _weighted_aggregate_arrays(self, client_arrays, alpha_np):
+        aggregated_arrays = []
+        for layer_arrays in zip(*client_arrays):
+            layer_sum = np.zeros_like(layer_arrays[0], dtype=np.float64)
+            for weight, layer in zip(alpha_np, layer_arrays):
+                layer_sum += layer.astype(np.float64) * weight
+            if np.issubdtype(layer_arrays[0].dtype, np.floating):
+                aggregated_arrays.append(layer_sum.astype(layer_arrays[0].dtype))
+            else:
+                aggregated_arrays.append(np.rint(layer_sum).astype(layer_arrays[0].dtype))
+        return aggregated_arrays
+
+    def _aggregate_with_learnable_nwr(self, iter_num, results_prime, metrics_prime):
+        client_items = self._collect_client_fit_items(results_prime)
+        features = self._build_learnable_nwr_inputs(iter_num, client_items, metrics_prime)
+        self.learnable_nwr.eval()
+        with torch.no_grad():
+            alpha, logits = self._learnable_nwr_alpha(features)
+        alpha_np = alpha.cpu().numpy().astype(np.float64)
+        client_arrays = [parameters_to_ndarrays(fit_res.parameters) for _, fit_res in client_items]
+        aggregated_arrays = self._weighted_aggregate_arrays(client_arrays, alpha_np)
+
+        minus_arrays = {}
+        logits_np = logits.detach().cpu().numpy().astype(np.float64)
+        tau = float(getattr(self.args, 'learnable_nwr_tau', 1.0))
+        for leave_idx, (client_id, _) in enumerate(client_items):
+            keep_logits = np.delete(logits_np, leave_idx)
+            keep_logits = keep_logits / tau
+            keep_logits = keep_logits - np.max(keep_logits)
+            keep_alpha = np.exp(keep_logits)
+            keep_alpha = keep_alpha / np.sum(keep_alpha)
+            keep_arrays = [arrays for idx, arrays in enumerate(client_arrays) if idx != leave_idx]
+            minus_arrays[client_id] = self._weighted_aggregate_arrays(keep_arrays, keep_alpha)
+
+        for idx, (client_id, _) in enumerate(client_items):
+            self.writer.add_scalar('learnable_nwr/client_{}_alpha'.format(client_id), float(alpha[idx]), iter_num)
+            self.writer.add_scalar('learnable_nwr/client_{}_score'.format(client_id), float(logits[idx]), iter_num)
+            self.learnable_nwr_last_losses[client_id] = float(metrics_prime['client_{}_total_loss'.format(client_id)])
+        self.writer.add_scalar('learnable_nwr/alpha_entropy', float(-(alpha * torch.log(alpha + 1e-12)).sum()), iter_num)
+        self.learnable_nwr_last_fit = {
+            'features': features,
+            'client_ids': [client_id for client_id, _ in client_items],
+            'theta_all': aggregated_arrays,
+            'theta_minus': minus_arrays,
+        }
+        log(INFO, 'iteration %s : learnable_nwr score=%s alpha=%s',
+            iter_num,
+            logits.detach().cpu().numpy().round(6).tolist(),
+            alpha.detach().cpu().numpy().round(6).tolist())
+        return ndarrays_to_parameters(aggregated_arrays)
+
+    def _evaluate_learnable_nwr_meta_loss(self, iter_num, arrays, timeout):
+        original_parameters = self.parameters
+        original_config_fn = getattr(self.strategy, 'on_evaluate_config_fn', None)
+        self.parameters = ndarrays_to_parameters(arrays)
+        self.strategy.on_evaluate_config_fn = lambda server_round: {
+            'iter_global': server_round,
+            'iters': self.args.iters,
+            'eval_iters': self.args.eval_iters,
+            'batch_size': self.args.batch_size,
+            'stage': 'learnable_nwr_meta',
+        }
+        try:
+            result = self.evaluate_round(server_round=iter_num, timeout=timeout)
+        finally:
+            self.parameters = original_parameters
+            self.strategy.on_evaluate_config_fn = original_config_fn
+        if result is None or result[0] is None:
+            raise RuntimeError('learnable NWR meta evaluation did not return a loss')
+        return float(result[0])
+
+    def _update_learnable_nwr_from_meta(self, iter_num, timeout):
+        fit_state = self.learnable_nwr_last_fit
+        if fit_state is None:
+            return
+        client_ids = fit_state['client_ids']
+        loss_all = self._evaluate_learnable_nwr_meta_loss(iter_num, fit_state['theta_all'], timeout)
+        contributions = [
+            self._evaluate_learnable_nwr_meta_loss(iter_num, fit_state['theta_minus'][client_id], timeout) - loss_all
+            for client_id in client_ids
+        ]
+        target_temp = float(getattr(self.args, 'learnable_nwr_meta_temp', 0.05))
+        target = torch.softmax(torch.tensor(contributions, dtype=torch.float32) / target_temp, dim=0)
+        features = fit_state['features']
+        self.learnable_nwr.train()
+        alpha, logits = self._learnable_nwr_alpha(features)
+        loss_meta = F.kl_div(torch.log(alpha + 1e-12), target, reduction='batchmean')
+        loss = loss_meta
+        self.learnable_nwr_optimizer.zero_grad()
+        loss.backward()
+        self.learnable_nwr_optimizer.step()
+        self.writer.add_scalar('learnable_nwr/loss', float(loss.detach()), iter_num)
+        self.writer.add_scalar('learnable_nwr/loss_meta', float(loss_meta.detach()), iter_num)
+        self.writer.add_scalar('learnable_nwr/meta_loss_all', loss_all, iter_num)
+        for client_id, contribution in zip(client_ids, contributions):
+            self.writer.add_scalar('learnable_nwr/client_{}_marginal_contribution'.format(client_id), contribution, iter_num)
+        log(INFO, 'iteration %s : learnable_nwr loss=%s target=%s contribution=%s meta_loss_all=%s score=%s',
+            iter_num,
+            float(loss.detach()),
+            target.detach().cpu().numpy().round(6).tolist(),
+            np.round(np.array(contributions), 6).tolist(),
+            loss_all,
+            logits.detach().cpu().numpy().round(6).tolist())
+
     def _extract_global_ndarrays_for_rgftd(self, parameters):
         arrays = parameters_to_ndarrays(parameters)
         num_weights = len(self.state_dict_keys)
@@ -957,6 +1147,22 @@ def fit_metrics_aggregation_fn(fit_metrics):
 def get_evaluate_metrics_aggregation_fn(args, val_metrics):
     def evaluate_metrics_aggregation_fn(evaluate_metrics):
         metrics = { k: v for _, client_metrics in evaluate_metrics for k, v in client_metrics.items() }
+        meta_weights = {}
+        for client_id in range(args.min_num_clients):
+            meta_metric_name = 'client_{}_learnable_nwr_meta_loss'.format(client_id)
+            for client_num_examples, client_metrics in evaluate_metrics:
+                if meta_metric_name in client_metrics.keys():
+                    meta_weights['client_{}'.format(client_id)] = client_num_examples
+        if meta_weights:
+            num_total_examples = sum([client_num_examples for client_num_examples in meta_weights.values()])
+            metrics['learnable_nwr_meta_loss'] = sum([
+                meta_weights['client_{}'.format(client_id)]
+                * metrics['client_{}_learnable_nwr_meta_loss'.format(client_id)]
+                for client_id in range(args.min_num_clients)
+                if 'client_{}'.format(client_id) in meta_weights
+            ]) / num_total_examples
+            return metrics
+
         weights = {}
         for client_id in range(args.min_num_clients):
             first_metric_name = 'client_{}_val_mean_{}'.format(client_id, val_metrics[0])
@@ -1937,6 +2143,12 @@ class MyModel(nn.Module):
                     server_state_dict = OrderedDict(server_state_dict_temp)
 
             self.model.load_state_dict(server_state_dict, strict=False)
+            if int(getattr(self.args, 'disable_ala', 0)) == 1:
+                self.ala_last_epochs = 0
+                self.ala_last_std = 0.0
+                self.ala_hit_max_epochs = 0
+                self.start_phase = False
+                return
             temp_model = copy.deepcopy(self.model)
             # Local Personalization 
             # p_keywords = ['out_conv', 'up4', 'up3', 'up2','up1','down4','down3']
